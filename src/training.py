@@ -463,6 +463,27 @@ def run_cross_validated_task(task: TaskConfig, config: TrainingConfig) -> None:
         if runtime.is_main_process:
             checkpoint_root.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
+            preprocessed_train_path = output_dir / "preprocessed_train.csv"
+            preprocessed_validation_path = (
+                output_dir / "preprocessed_validation.csv"
+            )
+            train_df.to_csv(
+                preprocessed_train_path,
+                index=False,
+                encoding="utf-8-sig",
+                lineterminator="\n",
+            )
+            test_df.to_csv(
+                preprocessed_validation_path,
+                index=False,
+                encoding="utf-8-sig",
+                lineterminator="\n",
+            )
+            log(f"Preprocessed train CSV: {preprocessed_train_path}", runtime)
+            log(
+                f"Preprocessed validation CSV: {preprocessed_validation_path}",
+                runtime,
+            )
         synchronize(runtime)
 
         test_probability_sum = np.zeros(

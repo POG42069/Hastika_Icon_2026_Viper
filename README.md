@@ -102,6 +102,8 @@ outputs/task_a/predictions.csv
 outputs/task_a/task_a_submission.zip
 outputs/task_a/oof_predictions.csv
 outputs/task_a/run_summary.json
+outputs/task_a/preprocessed_train.csv
+outputs/task_a/preprocessed_validation.csv
 ```
 
 File cần nộp lên track Task A là `task_a_submission.zip`.
@@ -125,6 +127,8 @@ outputs/task_b/predictions.csv
 outputs/task_b/task_b_submission.zip
 outputs/task_b/oof_predictions.csv
 outputs/task_b/run_summary.json
+outputs/task_b/preprocessed_train.csv
+outputs/task_b/preprocessed_validation.csv
 ```
 
 File cần nộp lên track Task B là `task_b_submission.zip`.
@@ -185,6 +189,11 @@ Pipeline mặc định:
 - giữ emoji, dấu câu, stopword và dạng biến thể của từ để tránh mất ngữ cảnh.
 
 Các lựa chọn nằm trong `PreprocessConfig` của `config.py`.
+
+Mỗi lần chạy một task, pipeline cũng lưu hai file để kiểm tra dữ liệu sau tiền
+xử lý. `preprocessed_train.csv` chứa dữ liệu train cùng cột `clean_text` và
+`label_id`; `preprocessed_validation.csv` chứa dữ liệu cần dự đoán cùng cột
+`clean_text`. Hai file nằm trong thư mục output riêng của task tương ứng.
 
 ## 9. Chạy kiểm thử nhanh
 
