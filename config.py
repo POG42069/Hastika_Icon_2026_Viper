@@ -1,8 +1,8 @@
-"""Central configuration for both HASTIKA training pipelines.
+"""Central configuration for both HASTIKA BERT training pipelines.
 
-Edit this file when changing epochs, learning rate, per-GPU batch size,
-preprocessing options, paths, or model settings.  The two entry points do not
-contain hidden training hyperparameters.
+Edit this file when changing the holdout ratio, epochs, learning rate,
+per-GPU batch size, preprocessing options, paths, or model settings. The two
+entry points do not contain hidden training hyperparameters.
 """
 
 from __future__ import annotations
@@ -17,26 +17,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 @dataclass(frozen=True)
 class PreprocessConfig:
-    """Options for conservative social-media text normalization."""
+    """Options for the closest reproducible version of the paper pipeline."""
 
     fix_unicode: bool = True
     decode_html_entities: bool = True
-    replace_urls: bool = True
-    replace_mentions: bool = True
-    keep_hashtag_text: bool = True
+    lowercase: bool = True
+    remove_html: bool = True
+    remove_urls: bool = True
+    remove_mentions: bool = True
+    remove_hashtags: bool = True
+    remove_non_alphanumeric: bool = True
+    remove_stopwords: bool = True
+    lemmatize_english: bool = True
     normalize_repeated_characters: bool = True
     max_repeated_characters: int = 2
-    lowercase: bool = False
-    remove_stopwords: bool = False
-    lemmatize: bool = False
+    normalize_repeated_words: bool = True
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
     """Hyperparameters shared by Task A and Task B."""
 
-    model_name: str = "google/muril-base-cased"
-    num_folds: int = 5
+    model_name: str = "google-bert/bert-base-uncased"
+    validation_size: float = 0.20
     max_epochs: int = 5
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
@@ -70,10 +73,9 @@ class TaskConfig:
 
     task_name: str
     train_filename: str
-    test_filename: str
+    prediction_filename: str
     label_column: str
     labels: tuple[str, ...]
-    use_class_weights: bool
     checkpoint_subdir: str
     output_subdir: str
     submission_zip_name: str
@@ -92,10 +94,9 @@ TRAINING = TrainingConfig()
 TASK_A = TaskConfig(
     task_name="Task A - Binary Hate Speech Detection",
     train_filename="binary_train.csv",
-    test_filename="binary_validation_inputs.csv",
+    prediction_filename="binary_validation_inputs.csv",
     label_column="Label",
     labels=("Non-Hate", "Hate"),
-    use_class_weights=False,
     checkpoint_subdir="task_a",
     output_subdir="task_a",
     submission_zip_name="task_a_submission.zip",
@@ -104,7 +105,7 @@ TASK_A = TaskConfig(
 TASK_B = TaskConfig(
     task_name="Task B - Fine-Grained Hate Speech Classification",
     train_filename="multiclass_train.csv",
-    test_filename="multiclass_validation_inputs.csv",
+    prediction_filename="multiclass_validation_inputs.csv",
     label_column="Hate Category",
     labels=(
         "Gender",
@@ -114,7 +115,6 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    use_class_weights=True,
     checkpoint_subdir="task_b",
     output_subdir="task_b",
     submission_zip_name="task_b_submission.zip",

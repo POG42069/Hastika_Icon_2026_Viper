@@ -1,0 +1,25 @@
+# Project-authored, versioned approximation of common Kannada function words.
+# The HASTIKA paper does not publish its original Kannada stopword list.
+ಮತ್ತು
+ಈ
+ಒಂದು
+ನಲ್ಲಿ
+ರಲ್ಲಿ
+ಹಾಗೂ
+ಹಾಗು
+ಎಂದು
+ಅಥವಾ
+ಇದು
+ಮೇಲೆ
+ಆದರೆ
+ನಂತರ
+ಮೂಲಕ
+ಕೆಲವು
+ಅನೇಕ
+ಬಗ್ಗೆ
+ಇತರ
+ಸಹ
+ಇದೆ
+ಅದು
+ಇದರ
+ಇದನ್ನು

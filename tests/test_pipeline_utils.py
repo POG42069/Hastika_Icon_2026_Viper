@@ -1,4 +1,4 @@
-"""Fast tests for preprocessing and organizer submission formatting."""
+"""Fast tests for paper-style preprocessing and submission formatting."""
 
 from __future__ import annotations
 
@@ -10,30 +10,38 @@ from pathlib import Path
 import pandas as pd
 
 from config import PreprocessConfig
-from src.preprocessing import normalize_text
+from src.preprocessing import ensure_nltk_resources, normalize_text
 from src.submission import write_submission
 
 
 class PreprocessingTests(unittest.TestCase):
-    """Verify conservative text cleaning behavior."""
+    """Verify the reproducible approximation of the paper preprocessing."""
 
-    def test_normalization_preserves_case_and_hashtag_content(self) -> None:
-        """MuRIL-cased input should keep case, emoji, and hashtag words."""
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Download the small NLTK corpora once before preprocessing tests."""
 
-        text = "HeLLo #Kannada!!! @person https://example.com <br> 😊"
+        ensure_nltk_resources(download_missing=True)
+
+    def test_normalization_removes_published_noise(self) -> None:
+        """Case, HTML, URL, hashtag, mention, emoji and punctuation are removed."""
+
+        text = "HeLLo #Kannada!!! @person https://example.com <br> 😊 CARS"
         cleaned = normalize_text(text, PreprocessConfig())
-        self.assertIn("HeLLo", cleaned)
-        self.assertIn("Kannada", cleaned)
-        self.assertNotIn("#", cleaned)
-        self.assertIn("USER", cleaned)
-        self.assertIn("URL", cleaned)
-        self.assertIn("😊", cleaned)
+        self.assertEqual(cleaned, "hello car")
 
-    def test_repeated_characters_are_limited(self) -> None:
-        """Three or more repeated characters should be shortened to two."""
+    def test_stopwords_protected_context_and_kannada_are_handled(self) -> None:
+        """Remove configured stopwords but retain paper examples and Kannada text."""
 
-        cleaned = normalize_text("soooo goood!!!!!", PreprocessConfig())
-        self.assertEqual(cleaned, "soo good!!")
+        text = "The mattu ಮತ್ತು Devru not ಕನ್ನಡ"
+        cleaned = normalize_text(text, PreprocessConfig())
+        self.assertEqual(cleaned, "devru not ಕನ್ನಡ")
+
+    def test_repeated_characters_and_words_are_normalized(self) -> None:
+        """Limit long character runs and collapse adjacent repeated tokens."""
+
+        cleaned = normalize_text("soooo goood goood!!!!!", PreprocessConfig())
+        self.assertEqual(cleaned, "soo good")
 
 
 class SubmissionTests(unittest.TestCase):

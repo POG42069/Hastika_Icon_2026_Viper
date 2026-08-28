@@ -45,7 +45,7 @@ def main() -> None:
         )
         prediction_dataset = EncodedTextDataset(texts, tokenizer, max_length=8)
         train_loader, sampler = create_train_loader(
-            labeled_dataset, collator, config, runtime, fold_seed=42
+            labeled_dataset, collator, config, runtime, shuffle_seed=42
         )
         eval_loader = create_eval_loader(labeled_dataset, collator, config, runtime)
         prediction_loader = create_eval_loader(

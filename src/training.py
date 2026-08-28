@@ -1,4 +1,4 @@
-"""Shared, explicit 5-fold training engine for HASTIKA Task A and Task B."""
+"""Shared single-holdout BERT engine for HASTIKA Task A and Task B."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
@@ -47,6 +47,7 @@ from src.distributed import (
     initialize_runtime,
     synchronize,
 )
+from src.preprocessing import ensure_nltk_resources
 from src.submission import write_submission
 
 
@@ -111,24 +112,12 @@ def build_optimizer(model: nn.Module, config: TrainingConfig) -> AdamW:
     return AdamW(parameter_groups, lr=config.learning_rate)
 
 
-def compute_class_weights(labels: np.ndarray, num_labels: int) -> torch.Tensor:
-    """Compute balanced weights N / (K * N_c) from one fold's train split."""
-
-    counts = np.bincount(labels, minlength=num_labels).astype(np.float64)
-    if np.any(counts == 0):
-        raise ValueError(
-            f"At least one class is missing from a training fold: {counts.tolist()}"
-        )
-    weights = len(labels) / (num_labels * counts)
-    return torch.tensor(weights, dtype=torch.float32)
-
-
 def create_train_loader(
     dataset: EncodedTextDataset,
     collator: ClassificationCollator,
     config: TrainingConfig,
     runtime: RuntimeContext,
-    fold_seed: int,
+    shuffle_seed: int,
 ) -> tuple[DataLoader, DistributedSampler | None]:
     """Create a shuffled loader with exactly one per-GPU batch per worker."""
 
@@ -139,11 +128,11 @@ def create_train_loader(
             num_replicas=runtime.world_size,
             rank=runtime.rank,
             shuffle=True,
-            seed=fold_seed,
+            seed=shuffle_seed,
             drop_last=False,
         )
     generator = torch.Generator()
-    generator.manual_seed(fold_seed)
+    generator.manual_seed(shuffle_seed)
     loader = DataLoader(
         dataset,
         batch_size=config.train_batch_size_per_gpu,
@@ -392,7 +381,7 @@ def save_model_state(model: nn.Module, path: Path) -> None:
 
 
 def load_model_state(model: nn.Module, path: Path, device: torch.device) -> None:
-    """Load a best-fold checkpoint on every DDP worker."""
+    """Load the best holdout checkpoint on every DDP worker."""
 
     try:
         state = torch.load(path, map_location="cpu", weights_only=True)
@@ -403,32 +392,131 @@ def load_model_state(model: nn.Module, path: Path, device: torch.device) -> None
     del state
 
 
-def write_oof_predictions(
-    train_df: pd.DataFrame,
+def prepare_nltk_resources(runtime: RuntimeContext) -> None:
+    """Download NLTK data once and propagate failures to every DDP worker."""
+
+    download_error: str | None = None
+    if runtime.is_main_process:
+        try:
+            ensure_nltk_resources(download_missing=True)
+        except Exception as error:  # pragma: no cover - network dependent.
+            download_error = str(error)
+    download_errors = [
+        str(item)
+        for item in gather_python_objects(download_error, runtime)
+        if item is not None
+    ]
+    if download_errors:
+        raise RuntimeError(download_errors[0])
+    synchronize(runtime)
+
+    local_error: str | None = None
+    try:
+        ensure_nltk_resources(download_missing=False)
+    except Exception as error:
+        local_error = str(error)
+    availability_errors = [
+        str(item)
+        for item in gather_python_objects(local_error, runtime)
+        if item is not None
+    ]
+    if availability_errors:
+        raise RuntimeError(availability_errors[0])
+
+
+def stratified_holdout_indices(
+    labels: np.ndarray,
+    validation_size: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create one deterministic, stratified train/validation partition."""
+
+    if not 0.0 < validation_size < 1.0:
+        raise ValueError("validation_size must be strictly between 0 and 1")
+    all_indices = np.arange(len(labels), dtype=np.int64)
+    train_indices, validation_indices = train_test_split(
+        all_indices,
+        test_size=validation_size,
+        random_state=seed,
+        shuffle=True,
+        stratify=labels,
+    )
+    return (
+        np.asarray(train_indices, dtype=np.int64),
+        np.asarray(validation_indices, dtype=np.int64),
+    )
+
+
+def write_validation_predictions(
+    validation_df: pd.DataFrame,
     task: TaskConfig,
-    oof_probabilities: np.ndarray,
+    probabilities: np.ndarray,
     output_dir: Path,
 ) -> Path:
-    """Store out-of-fold probabilities for error analysis and reproducibility."""
+    """Write true labels, predictions and probabilities for holdout analysis."""
 
-    predicted_ids = oof_probabilities.argmax(axis=1)
+    predicted_ids = probabilities.argmax(axis=1)
     output = pd.DataFrame(
         {
-            "id": train_df["id"].astype(str),
-            "true_label": train_df[task.label_column],
+            "id": validation_df["id"].astype(str).tolist(),
+            "true_label": validation_df[task.label_column].tolist(),
             "predicted_label": [task.labels[index] for index in predicted_ids],
         }
     )
     for label_index, label in enumerate(task.labels):
         safe_name = label.lower().replace("-", "_").replace(" ", "_")
-        output[f"prob_{safe_name}"] = oof_probabilities[:, label_index]
-    path = output_dir / "oof_predictions.csv"
+        output[f"prob_{safe_name}"] = probabilities[:, label_index]
+    path = output_dir / "validation_predictions.csv"
     output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
     return path
 
 
-def run_cross_validated_task(task: TaskConfig, config: TrainingConfig) -> None:
-    """Execute preprocessing, 5-fold training, ensemble, and submission output."""
+def write_split_manifest(
+    train_df: pd.DataFrame,
+    train_indices: np.ndarray,
+    validation_indices: np.ndarray,
+    output_dir: Path,
+) -> Path:
+    """Record the exact seeded split without copying comment text or labels."""
+
+    assignments = np.full(len(train_df), "", dtype=object)
+    assignments[train_indices] = "train"
+    assignments[validation_indices] = "validation"
+    if np.any(assignments == ""):
+        raise RuntimeError("The holdout split did not assign every labeled row.")
+    output = pd.DataFrame(
+        {"id": train_df["id"].astype(str).tolist(), "split": assignments.tolist()}
+    )
+    path = output_dir / "split_manifest.csv"
+    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
+    return path
+
+
+def _label_distribution(frame: pd.DataFrame, task: TaskConfig) -> dict[str, int]:
+    """Return counts in the task's stable label order for JSON metadata."""
+
+    counts = frame[task.label_column].value_counts()
+    return {label: int(counts.get(label, 0)) for label in task.labels}
+
+
+def is_better_checkpoint(
+    current_metric: float,
+    current_loss: float,
+    best_metric: float,
+    best_loss: float,
+) -> bool:
+    """Prefer higher Macro-F1, then lower loss; exact ties keep the earlier epoch."""
+
+    if current_metric > best_metric:
+        return True
+    metric_tied = math.isclose(
+        current_metric, best_metric, rel_tol=0.0, abs_tol=1e-12
+    )
+    return metric_tied and current_loss < best_loss
+
+
+def run_holdout_task(task: TaskConfig, config: TrainingConfig) -> None:
+    """Train on one 80% split, select on 20%, then create a submission."""
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     runtime = initialize_runtime()
@@ -442,236 +530,199 @@ def run_cross_validated_task(task: TaskConfig, config: TrainingConfig) -> None:
             runtime,
         )
 
-        train_df, test_df = load_task_frames(task, config.preprocess)
+        prepare_nltk_resources(runtime)
+        train_df, prediction_df = load_task_frames(task, config.preprocess)
         log(
-            f"Loaded {len(train_df)} training rows and {len(test_df)} prediction rows.",
+            f"Loaded {len(train_df)} labeled rows and "
+            f"{len(prediction_df)} prediction rows.",
+            runtime,
+        )
+
+        labels = train_df["label_id"].to_numpy(dtype=np.int64)
+        train_indices, validation_indices = stratified_holdout_indices(
+            labels, config.validation_size, config.seed
+        )
+        holdout_train = train_df.iloc[train_indices]
+        holdout_validation = train_df.iloc[validation_indices]
+        log(
+            f"Stratified holdout: train={len(holdout_train)}, "
+            f"validation={len(holdout_validation)}.",
             runtime,
         )
 
         tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
         collator = ClassificationCollator(tokenizer, config.pad_to_multiple_of)
-        labels = train_df["label_id"].to_numpy(dtype=np.int64)
-        splitter = StratifiedKFold(
-            n_splits=config.num_folds,
-            shuffle=True,
-            random_state=config.seed,
+        train_dataset = EncodedTextDataset(
+            holdout_train["clean_text"].tolist(),
+            tokenizer,
+            config.max_length,
+            holdout_train["label_id"].tolist(),
         )
-        folds = list(splitter.split(np.zeros(len(labels)), labels))
+        validation_dataset = EncodedTextDataset(
+            holdout_validation["clean_text"].tolist(),
+            tokenizer,
+            config.max_length,
+            holdout_validation["label_id"].tolist(),
+        )
+        prediction_dataset = EncodedTextDataset(
+            prediction_df["clean_text"].tolist(),
+            tokenizer,
+            config.max_length,
+        )
+        train_loader, train_sampler = create_train_loader(
+            train_dataset, collator, config, runtime, config.seed
+        )
+        validation_loader = create_eval_loader(
+            validation_dataset, collator, config, runtime
+        )
+        prediction_loader = create_eval_loader(
+            prediction_dataset, collator, config, runtime
+        )
 
         checkpoint_root = CHECKPOINT_ROOT / task.checkpoint_subdir
         output_dir = OUTPUT_ROOT / task.output_subdir
+        checkpoint_path = checkpoint_root / "best_model.pt"
         if runtime.is_main_process:
             checkpoint_root.mkdir(parents=True, exist_ok=True)
             output_dir.mkdir(parents=True, exist_ok=True)
         synchronize(runtime)
 
-        test_probability_sum = np.zeros(
-            (len(test_df), len(task.labels)), dtype=np.float64
+        id_to_label = {index: label for index, label in enumerate(task.labels)}
+        label_to_id = {label: index for index, label in enumerate(task.labels)}
+        model = AutoModelForSequenceClassification.from_pretrained(
+            config.model_name,
+            num_labels=len(task.labels),
+            id2label=id_to_label,
+            label2id=label_to_id,
         )
-        oof_probabilities = np.zeros(
-            (len(train_df), len(task.labels)), dtype=np.float32
+        model.to(runtime.device)
+        if runtime.distributed:
+            if runtime.device.type == "cuda":
+                model = DistributedDataParallel(
+                    model,
+                    device_ids=[runtime.local_rank],
+                    output_device=runtime.local_rank,
+                )
+            else:
+                model = DistributedDataParallel(model)
+
+        optimizer = build_optimizer(model, config)
+        updates_per_epoch = math.ceil(
+            len(train_loader) / config.gradient_accumulation_steps
         )
-        fold_summaries: list[dict[str, Any]] = []
+        total_updates = updates_per_epoch * config.max_epochs
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(total_updates * config.warmup_ratio),
+            num_training_steps=total_updates,
+        )
+        amp_enabled = config.use_amp and runtime.device.type == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+        criterion = nn.CrossEntropyLoss()
 
-        for fold_number, (train_indices, validation_indices) in enumerate(
-            folds, start=1
-        ):
-            fold_seed = config.seed + fold_number
-            set_global_seed(fold_seed)
-            log(
-                f"\n--- Fold {fold_number}/{config.num_folds}: "
-                f"train={len(train_indices)}, validation={len(validation_indices)} ---",
-                runtime,
-            )
-
-            fold_train = train_df.iloc[train_indices]
-            fold_validation = train_df.iloc[validation_indices]
-            train_dataset = EncodedTextDataset(
-                fold_train["clean_text"].tolist(),
-                tokenizer,
-                config.max_length,
-                fold_train["label_id"].tolist(),
-            )
-            validation_dataset = EncodedTextDataset(
-                fold_validation["clean_text"].tolist(),
-                tokenizer,
-                config.max_length,
-                fold_validation["label_id"].tolist(),
-            )
-            test_dataset = EncodedTextDataset(
-                test_df["clean_text"].tolist(),
-                tokenizer,
-                config.max_length,
-            )
-            train_loader, train_sampler = create_train_loader(
-                train_dataset, collator, config, runtime, fold_seed
-            )
-            validation_loader = create_eval_loader(
-                validation_dataset, collator, config, runtime
-            )
-            test_loader = create_eval_loader(test_dataset, collator, config, runtime)
-
-            id_to_label = {index: label for index, label in enumerate(task.labels)}
-            label_to_id = {label: index for index, label in enumerate(task.labels)}
-            model = AutoModelForSequenceClassification.from_pretrained(
-                config.model_name,
-                num_labels=len(task.labels),
-                id2label=id_to_label,
-                label2id=label_to_id,
-            )
-            model.to(runtime.device)
-            if runtime.distributed:
-                if runtime.device.type == "cuda":
-                    model = DistributedDataParallel(
-                        model,
-                        device_ids=[runtime.local_rank],
-                        output_device=runtime.local_rank,
-                    )
-                else:
-                    model = DistributedDataParallel(model)
-
-            optimizer = build_optimizer(model, config)
-            updates_per_epoch = math.ceil(
-                len(train_loader) / config.gradient_accumulation_steps
-            )
-            total_updates = updates_per_epoch * config.max_epochs
-            warmup_steps = int(total_updates * config.warmup_ratio)
-            scheduler = get_linear_schedule_with_warmup(
+        best_metric = -math.inf
+        best_loss = math.inf
+        best_epoch = 0
+        epochs_without_improvement = 0
+        for epoch in range(1, config.max_epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                criterion,
                 optimizer,
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_updates,
+                scheduler,
+                scaler,
+                config,
+                runtime,
+                epoch,
             )
-            amp_enabled = config.use_amp and runtime.device.type == "cuda"
-            scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
-
-            class_weights = None
-            if task.use_class_weights:
-                class_weights = compute_class_weights(
-                    fold_train["label_id"].to_numpy(dtype=np.int64),
-                    len(task.labels),
-                ).to(runtime.device)
-                log(f"Fold class weights: {class_weights.cpu().tolist()}", runtime)
-            criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-            best_metric = -math.inf
-            best_epoch = 0
-            epochs_without_improvement = 0
-            checkpoint_path = checkpoint_root / f"fold_{fold_number}" / "best_model.pt"
-
-            for epoch in range(1, config.max_epochs + 1):
-                if train_sampler is not None:
-                    train_sampler.set_epoch(epoch)
-                train_loss = train_one_epoch(
-                    model,
-                    train_loader,
-                    criterion,
-                    optimizer,
-                    scheduler,
-                    scaler,
-                    config,
-                    runtime,
-                    epoch,
-                )
-                validation_metrics = evaluate_model(
-                    model,
-                    validation_loader,
-                    criterion,
-                    len(task.labels),
-                    runtime,
-                    f"Epoch {epoch} validation",
-                )
-                current_metric = float(validation_metrics["macro_f1"])
-                log(
-                    f"Fold {fold_number} | epoch {epoch} | "
-                    f"train_loss={train_loss:.5f} | "
-                    f"val_loss={validation_metrics['loss']:.5f} | "
-                    f"val_macro_f1={current_metric:.5f} | "
-                    f"val_accuracy={validation_metrics['accuracy']:.5f}",
-                    runtime,
-                )
-
-                if current_metric > best_metric:
-                    best_metric = current_metric
-                    best_epoch = epoch
-                    epochs_without_improvement = 0
-                    if runtime.is_main_process:
-                        save_model_state(model, checkpoint_path)
-                else:
-                    epochs_without_improvement += 1
-
-                synchronize(runtime)
-                if epochs_without_improvement >= config.early_stopping_patience:
-                    log(
-                        f"Early stopping fold {fold_number} after epoch {epoch}.",
-                        runtime,
-                    )
-                    break
-
-            del optimizer, scheduler, scaler
-            synchronize(runtime)
-            load_model_state(model, checkpoint_path, runtime.device)
-            synchronize(runtime)
-
-            best_validation = evaluate_model(
+            validation_metrics = evaluate_model(
                 model,
                 validation_loader,
                 criterion,
                 len(task.labels),
                 runtime,
-                f"Fold {fold_number} best checkpoint",
+                f"Epoch {epoch} validation",
             )
-            _, fold_test_probabilities, _ = predict_distributed(
-                model,
-                test_loader,
+            current_metric = float(validation_metrics["macro_f1"])
+            current_loss = float(validation_metrics["loss"])
+            log(
+                f"Epoch {epoch} | train_loss={train_loss:.5f} | "
+                f"val_loss={current_loss:.5f} | "
+                f"val_macro_f1={current_metric:.5f} | "
+                f"val_accuracy={validation_metrics['accuracy']:.5f}",
                 runtime,
-                f"Fold {fold_number} prediction",
             )
-            if runtime.is_main_process:
-                oof_probabilities[validation_indices] = best_validation["probabilities"]
-                test_probability_sum += fold_test_probabilities
-                fold_summary = {
-                    "fold": fold_number,
-                    "best_epoch": best_epoch,
-                    "best_macro_f1": float(best_validation["macro_f1"]),
-                    "checkpoint": str(checkpoint_path),
-                }
-                fold_summaries.append(fold_summary)
-                metadata_path = checkpoint_path.parent / "metrics.json"
-                metadata_path.write_text(
-                    json.dumps(fold_summary, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
 
-            del model, criterion, class_weights
-            del train_loader, validation_loader, test_loader
-            del train_dataset, validation_dataset, test_dataset
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if is_better_checkpoint(
+                current_metric, current_loss, best_metric, best_loss
+            ):
+                best_metric = current_metric
+                best_loss = current_loss
+                best_epoch = epoch
+                epochs_without_improvement = 0
+                if runtime.is_main_process:
+                    save_model_state(model, checkpoint_path)
+            else:
+                epochs_without_improvement += 1
+
             synchronize(runtime)
+            if epochs_without_improvement >= config.early_stopping_patience:
+                log(f"Early stopping after epoch {epoch}.", runtime)
+                break
+
+        del optimizer, scheduler, scaler
+        synchronize(runtime)
+        load_model_state(model, checkpoint_path, runtime.device)
+        synchronize(runtime)
+
+        best_validation = evaluate_model(
+            model,
+            validation_loader,
+            criterion,
+            len(task.labels),
+            runtime,
+            "Best checkpoint validation",
+        )
+        _, prediction_probabilities, _ = predict_distributed(
+            model,
+            prediction_loader,
+            runtime,
+            "External input prediction",
+        )
 
         if runtime.is_main_process:
-            mean_test_probabilities = test_probability_sum / config.num_folds
-            predicted_label_ids = mean_test_probabilities.argmax(axis=1)
+            predicted_label_ids = prediction_probabilities.argmax(axis=1)
             predicted_labels = [task.labels[index] for index in predicted_label_ids]
             predictions_path, zip_path = write_submission(
-                ids=test_df["id"].tolist(),
+                ids=prediction_df["id"].tolist(),
                 labels=predicted_labels,
                 allowed_labels=task.labels,
                 output_dir=output_dir,
                 zip_name=task.submission_zip_name,
             )
-
-            oof_predictions = oof_probabilities.argmax(axis=1)
-            oof_macro_f1 = f1_score(
-                labels,
-                oof_predictions,
-                labels=list(range(len(task.labels))),
-                average="macro",
-                zero_division=0,
+            validation_path = write_validation_predictions(
+                holdout_validation,
+                task,
+                best_validation["probabilities"],
+                output_dir,
             )
-            oof_path = write_oof_predictions(
-                train_df, task, oof_probabilities, output_dir
+            manifest_path = write_split_manifest(
+                train_df, train_indices, validation_indices, output_dir
+            )
+            checkpoint_summary = {
+                "best_epoch": best_epoch,
+                "macro_f1": float(best_validation["macro_f1"]),
+                "accuracy": float(best_validation["accuracy"]),
+                "loss": float(best_validation["loss"]),
+                "checkpoint": str(checkpoint_path),
+            }
+            metadata_path = checkpoint_root / "metrics.json"
+            metadata_path.write_text(
+                json.dumps(checkpoint_summary, indent=2, ensure_ascii=False),
+                encoding="utf-8",
             )
             run_summary = {
                 "task": task.task_name,
@@ -682,8 +733,20 @@ def run_cross_validated_task(task: TaskConfig, config: TrainingConfig) -> None:
                     * runtime.world_size
                     * config.gradient_accumulation_steps
                 ),
-                "oof_macro_f1": float(oof_macro_f1),
-                "folds": fold_summaries,
+                "split": {
+                    "seed": config.seed,
+                    "validation_size": config.validation_size,
+                    "train_rows": len(holdout_train),
+                    "validation_rows": len(holdout_validation),
+                    "prediction_rows": len(prediction_df),
+                    "train_label_distribution": _label_distribution(
+                        holdout_train, task
+                    ),
+                    "validation_label_distribution": _label_distribution(
+                        holdout_validation, task
+                    ),
+                },
+                "best_checkpoint": checkpoint_summary,
                 "training_config": asdict(config),
             }
             summary_path = output_dir / "run_summary.json"
@@ -692,10 +755,22 @@ def run_cross_validated_task(task: TaskConfig, config: TrainingConfig) -> None:
                 encoding="utf-8",
             )
 
-            log(f"\nOOF Macro-F1: {oof_macro_f1:.5f}", runtime)
-            log(f"Predictions CSV: {predictions_path}", runtime)
-            log(f"Submission ZIP:  {zip_path}", runtime)
-            log(f"OOF diagnostics: {oof_path}", runtime)
-            log(f"Run summary:     {summary_path}", runtime)
+            log(
+                f"\nBest validation Macro-F1: "
+                f"{best_validation['macro_f1']:.5f}",
+                runtime,
+            )
+            log(f"Predictions CSV:       {predictions_path}", runtime)
+            log(f"Submission ZIP:        {zip_path}", runtime)
+            log(f"Validation diagnostics: {validation_path}", runtime)
+            log(f"Split manifest:        {manifest_path}", runtime)
+            log(f"Run summary:           {summary_path}", runtime)
+
+        del model, criterion
+        del train_loader, validation_loader, prediction_loader
+        del train_dataset, validation_dataset, prediction_dataset
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     finally:
         cleanup_runtime(runtime)
