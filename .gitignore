@@ -1,0 +1,27 @@
+# Competition data must stay local or in a private Kaggle Dataset.
+/data/
+/kaggle_data/
+
+# Training artifacts are large and can contain competition predictions.
+/checkpoints/
+/outputs/
+/wandb/
+*.zip
+*.pt
+*.pth
+*.safetensors
+
+# Python caches, environments, notebooks and editor settings.
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.ipynb_checkpoints/
+.ruff_cache/
+.pytest_cache/
+.idea/
+.vscode/
+
+# Operating-system files.
+.DS_Store
+Thumbs.db
