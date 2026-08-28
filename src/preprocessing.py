@@ -6,6 +6,7 @@ import html
 import re
 import unicodedata
 
+import emoji
 import ftfy
 import pandas as pd
 
@@ -22,9 +23,10 @@ _WHITESPACE_RE = re.compile(r"\s+")
 def normalize_text(text: object, config: PreprocessConfig) -> str:
     """Normalize noise without discarding useful hate-speech cues.
 
-    MuRIL is cased, so lowercasing is disabled by default. Emoji, punctuation,
+    MuRIL is cased, so lowercasing is disabled by default. Punctuation,
     stopwords and inflectional information are retained because they may carry
-    sentiment, emphasis, negation, or code-mixed context.
+    emphasis, negation, or code-mixed context. Emoji are removed by default to
+    prevent them from acting as a noisy shortcut for the classifier.
     """
 
     value = "" if pd.isna(text) else str(text)
@@ -33,15 +35,17 @@ def normalize_text(text: object, config: PreprocessConfig) -> str:
         value = unicodedata.normalize("NFKC", value)
     if config.decode_html_entities:
         value = html.unescape(value)
+    if config.remove_emoji:
+        value = emoji.replace_emoji(value, replace=" ")
 
     value = _BR_TAG_RE.sub(" ", value)
     value = _HTML_TAG_RE.sub(" ", value)
     if config.replace_urls:
         value = _URL_RE.sub(" URL ", value)
-    if config.replace_mentions:
-        value = _MENTION_RE.sub(" USER ", value)
     if config.keep_hashtag_text:
         value = _HASHTAG_RE.sub("", value)
+    if config.replace_mentions:
+        value = _MENTION_RE.sub(" USER ", value)
 
     if config.normalize_repeated_characters:
         max_repeats = max(1, config.max_repeated_characters)

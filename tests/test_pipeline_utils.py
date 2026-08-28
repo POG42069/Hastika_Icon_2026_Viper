@@ -18,7 +18,7 @@ class PreprocessingTests(unittest.TestCase):
     """Verify conservative text cleaning behavior."""
 
     def test_normalization_preserves_case_and_hashtag_content(self) -> None:
-        """MuRIL-cased input should keep case, emoji, and hashtag words."""
+        """MuRIL-cased input should keep case and hashtag words."""
 
         text = "HeLLo #Kannada!!! @person https://example.com <br> 😊"
         cleaned = normalize_text(text, PreprocessConfig())
@@ -27,7 +27,22 @@ class PreprocessingTests(unittest.TestCase):
         self.assertNotIn("#", cleaned)
         self.assertIn("USER", cleaned)
         self.assertIn("URL", cleaned)
-        self.assertIn("😊", cleaned)
+        self.assertNotIn("😊", cleaned)
+
+    def test_all_emoji_sequences_are_removed(self) -> None:
+        """Flags, skin tones, keycaps, and joined emoji must not survive."""
+
+        cleaned = normalize_text(
+            "before 😂 👨‍👩‍👧‍👦 👍🏽 🇻🇳 1️⃣ after",
+            PreprocessConfig(),
+        )
+        self.assertEqual(cleaned, "before after")
+
+    def test_hashtag_inside_mention_is_normalized(self) -> None:
+        """Removing a hashtag marker must not expose an untreated mention."""
+
+        cleaned = normalize_text("hello @#ps", PreprocessConfig())
+        self.assertEqual(cleaned, "hello USER")
 
     def test_repeated_characters_are_limited(self) -> None:
         """Three or more repeated characters should be shortened to two."""

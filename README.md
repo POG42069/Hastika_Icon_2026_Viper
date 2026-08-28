@@ -180,13 +180,14 @@ và tự relaunch bằng `torchrun`; người dùng không phải tự viết l�
 Pipeline mặc định:
 
 - sửa Unicode/encoding và giải mã HTML entity;
+- loại bỏ toàn bộ emoji, bao gồm emoji ghép, cờ và biến thể màu da;
 - thay `<br>`/HTML tag bằng khoảng trắng;
 - thay URL bằng token `URL`, mention bằng `USER`;
 - bỏ dấu `#` nhưng giữ nội dung hashtag;
 - rút chuỗi ký tự lặp từ ba lần trở lên còn hai lần;
 - chuẩn hóa khoảng trắng;
 - giữ chữ hoa/thường vì đang dùng `muril-base-cased`;
-- giữ emoji, dấu câu, stopword và dạng biến thể của từ để tránh mất ngữ cảnh.
+- giữ dấu câu, stopword và dạng biến thể của từ để tránh mất ngữ cảnh.
 
 Các lựa chọn nằm trong `PreprocessConfig` của `config.py`.
 

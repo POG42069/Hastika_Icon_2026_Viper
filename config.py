@@ -21,6 +21,7 @@ class PreprocessConfig:
 
     fix_unicode: bool = True
     decode_html_entities: bool = True
+    remove_emoji: bool = True
     replace_urls: bool = True
     replace_mentions: bool = True
     keep_hashtag_text: bool = True
