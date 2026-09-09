@@ -7,7 +7,7 @@ from collections.abc import Sequence
 import torch
 from torch.utils.data import Dataset
 
-from config import TaskConfig
+from llm_config import TaskConfig
 
 
 def system_prompt(task: TaskConfig) -> str:

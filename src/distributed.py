@@ -1,7 +1,7 @@
 """Utilities for transparent single-GPU and two-GPU execution.
 
-The public entry points remain simple (``python Train_A.py`` and
-``python Train_B.py``).  When two GPUs are visible, the parent process
+The public entry points remain simple (``python Train_A_LLM.py`` and
+``python Train_B_LLM.py``). When two GPUs are visible, the parent process
 relaunches the same script with ``torchrun`` and DistributedDataParallel (DDP).
 Each worker receives the configured per-GPU batch size.
 """
@@ -13,11 +13,13 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
-
-from config import TrainingConfig
+class DistributedConfigLike(Protocol):
+    use_all_available_gpus: bool
+    max_gpus: int
 
 
 @dataclass(frozen=True)
@@ -37,7 +39,7 @@ class RuntimeContext:
         return self.rank == 0
 
 
-def relaunch_with_torchrun_if_needed(config: TrainingConfig) -> None:
+def relaunch_with_torchrun_if_needed(config: DistributedConfigLike) -> None:
     """Relaunch the current script with one DDP process per visible GPU.
 
     This function returns immediately in a torchrun worker, on CPU, or when

@@ -1,8 +1,4 @@
-"""Answer-only QLoRA SFT, exact candidate scoring, and CodaBench export.
-
-Production entry points require CUDA and never silently replace QLoRA with full
-fine-tuning. The small pure-PyTorch helpers can also be tested on CPU.
-"""
+"""Raw-text LoRA SFT, holdout selection, full-data retraining and export."""
 
 from __future__ import annotations
 
@@ -31,12 +27,16 @@ from tqdm.auto import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     get_linear_schedule_with_warmup,
 )
 
-from config import CHECKPOINT_ROOT, OUTPUT_ROOT, PreprocessConfig, TaskConfig
-from llm_config import LLM_TRAINING, LLMTrainingConfig
+from llm_config import (
+    CHECKPOINT_ROOT,
+    OUTPUT_ROOT,
+    LLM_TRAINING,
+    LLMTrainingConfig,
+    TaskConfig,
+)
 from src.data import load_task_frames, resolve_data_file
 from src.distributed import (
     RuntimeContext,
@@ -52,7 +52,6 @@ from src.training import (
     create_train_loader,
     is_better_checkpoint,
     log,
-    prepare_nltk_resources,
     set_global_seed,
     stratified_holdout_indices,
     unwrap_model,
@@ -76,8 +75,6 @@ def validate_config(config: LLMTrainingConfig) -> None:
             raise ValueError(f"{name} must be positive")
     if not 0 < config.validation_size < 1:
         raise ValueError("validation_size must be strictly between zero and one")
-    if config.text_mode not in {"paper", "raw"}:
-        raise ValueError("text_mode must be 'paper' or 'raw'")
     if config.compute_dtype not in {"auto", "float16", "bfloat16"}:
         raise ValueError("compute_dtype must be auto, float16 or bfloat16")
     if config.learning_rate <= 0 or config.max_grad_norm <= 0:
@@ -110,7 +107,8 @@ def compute_dtype(config: LLMTrainingConfig, runtime: RuntimeContext) -> torch.d
 def require_cuda(runtime: RuntimeContext) -> None:
     if runtime.device.type != "cuda":
         raise RuntimeError(
-            "QLoRA requires CUDA. Select GPU T4 x2 on Kaggle; CPU is only for tests."
+            "LoRA training requires CUDA. Select a GPU accelerator on Kaggle; "
+            "CPU is only supported by the tests."
         )
 
 
@@ -135,36 +133,29 @@ def on_main(action: Callable[[], None], runtime: RuntimeContext) -> None:
         raise RuntimeError(next(item for item in errors if item is not None))
 
 
-def load_qlora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
-    """Put each worker's entire quantized model on its own GPU, never auto-shard."""
+def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
+    """Load an unquantized backbone and attach rank-r LoRA adapters."""
     require_cuda(runtime)
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model
 
     dtype = compute_dtype(config, runtime)
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         revision=config.model_revision,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=dtype,
-        ),
         dtype=dtype,
         device_map={"": runtime.device.index},
         attn_implementation="sdpa",
         trust_remote_code=False,
     )
-    if not getattr(model, "is_loaded_in_4bit", False):
-        raise RuntimeError(
-            "The backbone was not loaded in 4-bit; refusing a non-QLoRA run."
-        )
+    if getattr(model, "is_loaded_in_4bit", False) or getattr(
+        model, "is_loaded_in_8bit", False
+    ):
+        raise RuntimeError("Expected a non-quantized backbone for standard LoRA.")
     model.config.use_cache = False
-    model = prepare_model_for_kbit_training(
-        model,
-        use_gradient_checkpointing=config.gradient_checkpointing,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-    )
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
     model = get_peft_model(
         model,
         LoraConfig(
@@ -228,7 +219,7 @@ def completion_log_probs(
 
 
 def train_llm_epoch(
-    model, loader, optimizer, scheduler, scaler, config, runtime, epoch
+    model, loader, optimizer, scheduler, scaler, config, runtime, epoch, phase="LLM"
 ):
     """Mean answer-token NLL per example; correctly scale even a partial group."""
     model.train()
@@ -237,7 +228,7 @@ def train_llm_epoch(
     iterator = iter(loader)
     progress = tqdm(
         total=len(loader),
-        desc=f"LLM epoch {epoch}",
+        desc=f"{phase} epoch {epoch}",
         disable=not runtime.is_main_process,
         leave=False,
     )
@@ -387,7 +378,39 @@ def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _wrap_for_ddp(model, runtime: RuntimeContext):
+    if not runtime.distributed:
+        return model
+    return DDP(
+        model,
+        device_ids=[runtime.local_rank],
+        output_device=runtime.local_rank,
+        find_unused_parameters=False,
+        broadcast_buffers=False,
+    )
+
+
+def _training_state(model, loader, epochs, config, runtime):
+    optimizer = build_optimizer(model, config)
+    total_updates = math.ceil(
+        len(loader) / config.gradient_accumulation_steps
+    ) * epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        int(total_updates * config.warmup_ratio),
+        total_updates,
+    )
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=compute_dtype(config, runtime) == torch.float16,
+        init_scale=config.initial_loss_scale,
+    )
+    return optimizer, scheduler, scaler
+
+
 def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
+    """Select on 80/20, retrain fresh on 100%, then predict development data."""
+
     validate_config(config)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     runtime = initialize_runtime()
@@ -395,7 +418,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         require_cuda(runtime)
         set_global_seed(config.seed)
         log(
-            f"\n{task.task_name} | QLoRA {config.model_name} | world_size={runtime.world_size}",
+            f"\n{task.task_name} | LoRA {config.model_name} | "
+            f"rank={config.lora_rank} | world_size={runtime.world_size}",
             runtime,
         )
         log(
@@ -403,52 +427,43 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             f"{config.train_batch_size_per_gpu * config.gradient_accumulation_steps * runtime.world_size}",
             runtime,
         )
-        preprocess = config.preprocess
-        if config.text_mode == "raw":
-            preprocess = PreprocessConfig(
-                **{
-                    key: False
-                    for key, value in asdict(preprocess).items()
-                    if isinstance(value, bool)
-                }
-            )
-        if preprocess.remove_stopwords or preprocess.lemmatize_english:
-            prepare_nltk_resources(runtime)
-        frame, prediction_frame = load_task_frames(task, preprocess)
-        for name, data in (("train", frame), ("prediction", prediction_frame)):
-            if data.empty or data["id"].isna().any():
-                raise ValueError(
-                    f"{name} input must contain rows with non-missing IDs."
-                )
+
+        frame, prediction_frame = load_task_frames(task)
+        for name, data in (("train", frame), ("development", prediction_frame)):
+            if data.empty:
+                raise ValueError(f"{name} input must contain at least one row.")
         train_indices, val_indices = stratified_holdout_indices(
             frame["label_id"].to_numpy(), config.validation_size, config.seed
         )
         train_frame, val_frame = frame.iloc[train_indices], frame.iloc[val_indices]
+
         tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name, revision=config.model_revision, trust_remote_code=False
+            config.model_name,
+            revision=config.model_revision,
+            trust_remote_code=False,
         )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
         encoder = ChatEncoder(tokenizer, task, config.max_length)
-        train_data = CompletionDataset(
-            train_frame["clean_text"].tolist(),
+        selection_train_data = CompletionDataset(
+            train_frame["text"].tolist(),
             encoder,
             train_frame["label_id"].tolist(),
         )
         val_data = CompletionDataset(
-            val_frame["clean_text"].tolist(), encoder, val_frame["label_id"].tolist()
+            val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
         )
-        prediction_data = CompletionDataset(
-            prediction_frame["clean_text"].tolist(), encoder
+        full_train_data = CompletionDataset(
+            frame["text"].tolist(), encoder, frame["label_id"].tolist()
         )
+        prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
         collator = CompletionCollator(tokenizer.pad_token_id)
-        loader, sampler = create_train_loader(
-            train_data, collator, config, runtime, config.seed
-        )
+
         output_dir = OUTPUT_ROOT / task.output_subdir
         checkpoint_dir = CHECKPOINT_ROOT / task.checkpoint_subdir
-        adapter_dir = checkpoint_dir / "best_adapter"
+        selection_adapter_dir = checkpoint_dir / "best_holdout_adapter"
+        final_adapter_dir = checkpoint_dir / "final_full_data_adapter"
 
         def initialize_artifacts():
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -457,62 +472,74 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
 
         on_main(initialize_artifacts, runtime)
         log(
-            f"Split: train={len(train_data)}, validation={len(val_data)}; prediction={len(prediction_data)}",
+            f"Selection split: train={len(selection_train_data)}, "
+            f"validation={len(val_data)}; final retrain={len(full_train_data)} (100%); "
+            f"development={len(prediction_data)}",
             runtime,
         )
         log(
-            f"Truncated comments: train={train_data.truncated_count}, validation={val_data.truncated_count}, "
-            f"prediction={prediction_data.truncated_count}",
+            f"Raw text; truncated comments: selection_train="
+            f"{selection_train_data.truncated_count}, validation={val_data.truncated_count}, "
+            f"full_train={full_train_data.truncated_count}, development="
+            f"{prediction_data.truncated_count}",
             runtime,
         )
-        model = load_qlora_model(config, runtime)
-        base = model.get_base_model()
+
+        # Phase 1: use only the 80% partition for updates and select by 20% Macro-F1.
+        selection_loader, selection_sampler = create_train_loader(
+            selection_train_data, collator, config, runtime, config.seed
+        )
+        selection_model = load_lora_model(config, runtime)
+        base = selection_model.get_base_model()
         resolved_revision = getattr(base.config, "_commit_hash", None)
         parameter_counts = {
-            "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
-            "reported_total": model.num_parameters(),
+            "trainable": sum(
+                parameter.numel()
+                for parameter in selection_model.parameters()
+                if parameter.requires_grad
+            ),
+            "reported_total": selection_model.num_parameters(),
         }
-        if runtime.distributed:
-            model = DDP(
-                model,
-                device_ids=[runtime.local_rank],
-                output_device=runtime.local_rank,
-                find_unused_parameters=False,
-                broadcast_buffers=False,
-            )
-        optimizer = build_optimizer(model, config)
-        total_updates = (
-            math.ceil(len(loader) / config.gradient_accumulation_steps)
-            * config.max_epochs
+        del base
+        selection_model = _wrap_for_ddp(selection_model, runtime)
+        optimizer, scheduler, scaler = _training_state(
+            selection_model, selection_loader, config.max_epochs, config, runtime
         )
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, int(total_updates * config.warmup_ratio), total_updates
-        )
-        scaler = torch.amp.GradScaler(
-            "cuda",
-            enabled=compute_dtype(config, runtime) == torch.float16,
-            init_scale=config.initial_loss_scale,
-        )
+
         best_metric, best_loss, best_epoch, stale = -math.inf, math.inf, 0, 0
-        history = []
+        selection_history = []
         for epoch in range(1, config.max_epochs + 1):
-            if sampler is not None:
-                sampler.set_epoch(epoch)
+            if selection_sampler is not None:
+                selection_sampler.set_epoch(epoch)
             train_loss = train_llm_epoch(
-                model, loader, optimizer, scheduler, scaler, config, runtime, epoch
+                selection_model,
+                selection_loader,
+                optimizer,
+                scheduler,
+                scaler,
+                config,
+                runtime,
+                epoch,
+                "Selection train",
             )
             metrics = score_candidates(
-                model, val_data, collator, config, runtime, f"Epoch {epoch} validation"
+                selection_model,
+                val_data,
+                collator,
+                config,
+                runtime,
+                f"Epoch {epoch} validation",
             )
             record = {
                 "epoch": epoch,
                 "train_loss": train_loss,
                 **{key: metrics[key] for key in ("loss", "macro_f1", "accuracy")},
             }
-            history.append(record)
+            selection_history.append(record)
             log(
-                f"Epoch {epoch}: train_loss={train_loss:.5f}, val_loss={metrics['loss']:.5f}, "
-                f"macro_f1={metrics['macro_f1']:.5f}, accuracy={metrics['accuracy']:.5f}",
+                f"Selection epoch {epoch}: train_loss={train_loss:.5f}, "
+                f"val_loss={metrics['loss']:.5f}, macro_f1={metrics['macro_f1']:.5f}, "
+                f"accuracy={metrics['accuracy']:.5f}",
                 runtime,
             )
             if is_better_checkpoint(
@@ -524,37 +551,99 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     epoch,
                     0,
                 )
-                on_main(partial(save_adapter, model, tokenizer, adapter_dir), runtime)
+                on_main(
+                    partial(
+                        save_adapter,
+                        selection_model,
+                        tokenizer,
+                        selection_adapter_dir,
+                    ),
+                    runtime,
+                )
             else:
                 stale += 1
             on_main(
                 lambda: _write_json(
-                    output_dir / "training_history.json", {"epochs": history}
+                    output_dir / "selection_training_history.json",
+                    {"epochs": selection_history},
                 ),
                 runtime,
             )
             if stale >= config.early_stopping_patience:
-                log(f"Early stopping at epoch {epoch}.", runtime)
+                log(f"Selection early stopping at epoch {epoch}.", runtime)
                 break
+
         del optimizer, scheduler, scaler
-        restore_adapter(model, adapter_dir)
+        restore_adapter(selection_model, selection_adapter_dir)
         best_validation = score_candidates(
-            model, val_data, collator, config, runtime, "Best adapter validation"
+            selection_model,
+            val_data,
+            collator,
+            config,
+            runtime,
+            "Best holdout adapter validation",
         )
+        del selection_model, selection_loader
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Phase 2: replay the selected epoch count from a fresh backbone on all rows.
+        # Starting fresh ensures the former 80% and 20% examples receive equal updates.
+        set_global_seed(config.seed)
+        full_loader, full_sampler = create_train_loader(
+            full_train_data, collator, config, runtime, config.seed
+        )
+        final_model = _wrap_for_ddp(load_lora_model(config, runtime), runtime)
+        optimizer, scheduler, scaler = _training_state(
+            final_model, full_loader, best_epoch, config, runtime
+        )
+        full_history = []
+        for epoch in range(1, best_epoch + 1):
+            if full_sampler is not None:
+                full_sampler.set_epoch(epoch)
+            train_loss = train_llm_epoch(
+                final_model,
+                full_loader,
+                optimizer,
+                scheduler,
+                scaler,
+                config,
+                runtime,
+                epoch,
+                "Full-data retrain",
+            )
+            full_history.append({"epoch": epoch, "train_loss": train_loss})
+            log(
+                f"Full-data epoch {epoch}/{best_epoch}: train_loss={train_loss:.5f}",
+                runtime,
+            )
+            on_main(
+                lambda: _write_json(
+                    output_dir / "full_data_training_history.json",
+                    {"epochs": full_history},
+                ),
+                runtime,
+            )
+
+        del optimizer, scheduler, scaler
+        on_main(
+            partial(save_adapter, final_model, tokenizer, final_adapter_dir), runtime
+        )
+        restore_adapter(final_model, final_adapter_dir)
         predictions = score_candidates(
-            model,
+            final_model,
             prediction_data,
             collator,
             config,
             runtime,
-            "External input prediction",
+            "Development prediction from full-data adapter",
         )
 
         def export_artifacts():
             label_ids = predictions["probabilities"].argmax(axis=1)
             csv_path, zip_path = write_submission(
                 prediction_frame["id"].tolist(),
-                [task.labels[i] for i in label_ids],
+                [task.labels[index] for index in label_ids],
                 task.labels,
                 output_dir,
                 task.submission_zip_name,
@@ -562,33 +651,46 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             write_validation_predictions(
                 val_frame, task, best_validation["probabilities"], output_dir
             )
-            summary = {
+            selection_summary = {
                 "best_epoch": best_epoch,
-                "checkpoint": str(adapter_dir),
+                "checkpoint": str(selection_adapter_dir),
                 **{
                     key: best_validation[key]
                     for key in ("macro_f1", "accuracy", "loss")
                 },
             }
-            _write_json(checkpoint_dir / "metrics.json", summary)
+            final_summary = {
+                "epochs": best_epoch,
+                "training_rows": len(full_train_data),
+                "checkpoint": str(final_adapter_dir),
+                "prediction_source": "final_full_data_adapter",
+            }
+            _write_json(
+                checkpoint_dir / "metrics.json",
+                {
+                    "selection": selection_summary,
+                    "full_data_retrain": final_summary,
+                },
+            )
             _write_json(
                 output_dir / "run_summary.json",
                 {
                     "task": task.task_name,
-                    "method": "QLoRA answer-only causal LM",
+                    "method": "LoRA answer-only causal LM",
                     "model": config.model_name,
                     "resolved_model_revision": resolved_revision,
                     "world_size": runtime.world_size,
                     "compute_dtype": str(compute_dtype(config, runtime)),
+                    "quantization": None,
+                    "text_input": "raw Comment values; missing cells become empty strings",
                     "effective_train_batch_size": config.train_batch_size_per_gpu
                     * config.gradient_accumulation_steps
                     * runtime.world_size,
-                    "split": {
+                    "selection_split": {
                         "seed": config.seed,
                         "validation_size": config.validation_size,
-                        "train_rows": len(train_data),
+                        "train_rows": len(selection_train_data),
                         "validation_rows": len(val_data),
-                        "prediction_rows": len(prediction_data),
                         "train_label_distribution": train_frame[task.label_column]
                         .value_counts()
                         .to_dict(),
@@ -596,9 +698,10 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         .value_counts()
                         .to_dict(),
                     },
-                    "best_checkpoint": summary,
+                    "best_checkpoint": selection_summary,
+                    "full_data_retrain": final_summary,
+                    "development_rows": len(prediction_data),
                     "training_config": asdict(config),
-                    "effective_preprocess": asdict(preprocess),
                     "parameters": parameter_counts,
                     "system_prompt": encoder.system_text,
                     "label_order": list(task.labels),
@@ -607,14 +710,13 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "probabilities": "softmax over allowed full-answer log likelihoods; not calibrated",
                     "loss": "mean per-example answer-token NLL; not class cross-entropy",
                     "truncated_comments": {
-                        "train": train_data.truncated_count,
+                        "selection_train": selection_train_data.truncated_count,
                         "validation": val_data.truncated_count,
-                        "prediction": prediction_data.truncated_count,
+                        "full_train": full_train_data.truncated_count,
+                        "development": prediction_data.truncated_count,
                     },
                     "input_sha256": {
-                        name: hashlib.sha256(
-                            resolve_data_file(name).read_bytes()
-                        ).hexdigest()
+                        name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
                         for name in (task.train_filename, task.prediction_filename)
                     },
                     "packages": {
@@ -624,20 +726,22 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                             "transformers",
                             "peft",
                             "accelerate",
-                            "bitsandbytes",
                             "scikit-learn",
                         )
                     },
                 },
             )
             log(
-                f"Best validation Macro-F1: {best_validation['macro_f1']:.5f}\n"
-                f"Predictions: {csv_path}\nSubmission: {zip_path}\nAdapter: {adapter_dir}",
+                f"Best validation Macro-F1: {best_validation['macro_f1']:.5f} "
+                f"at epoch {best_epoch}\n"
+                f"Retrained from scratch on 100% data for {best_epoch} epoch(s).\n"
+                f"Predictions: {csv_path}\nSubmission: {zip_path}\n"
+                f"Final adapter: {final_adapter_dir}",
                 runtime,
             )
 
         on_main(export_artifacts, runtime)
-        del model, base, loader
+        del final_model, full_loader
         gc.collect()
         torch.cuda.empty_cache()
     finally:
@@ -650,9 +754,6 @@ def run_llm_cli(
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=defaults.model_name)
     parser.add_argument("--revision", default=defaults.model_revision)
-    parser.add_argument(
-        "--text-mode", choices=("paper", "raw"), default=defaults.text_mode
-    )
     parser.add_argument("--max-epochs", type=int, default=defaults.max_epochs)
     parser.add_argument("--max-length", type=int, default=defaults.max_length)
     parser.add_argument(
@@ -674,7 +775,6 @@ def run_llm_cli(
         defaults,
         model_name=args.model,
         model_revision=args.revision,
-        text_mode=args.text_mode,
         max_epochs=args.max_epochs,
         max_length=args.max_length,
         train_batch_size_per_gpu=args.batch_size,

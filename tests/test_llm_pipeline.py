@@ -1,6 +1,6 @@
 """Offline tests with a real, tiny random Qwen2 and trainable PEFT adapters.
 
-No pretrained weights, competition data, GPU or quantization kernels are needed.
+No pretrained weights, competition data or GPU kernels are needed.
 The integration tests replace only the CUDA/model loading boundary; token loss,
 training, best-checkpoint reload, diagnostics and submission run normally.
 """
@@ -23,8 +23,7 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from config import TASK_A, TASK_B
-from llm_config import LLMTrainingConfig, llm_task
+from llm_config import LLMTrainingConfig, TASK_A, TASK_B, llm_task
 from src.distributed import RuntimeContext
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
@@ -302,7 +301,7 @@ class LLMTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
             require_cuda(cpu_runtime())
 
-    def test_both_end_to_end_pipelines_export_best_adapter_predictions(self):
+    def test_both_pipelines_select_then_retrain_100_percent_before_prediction(self):
         for original_task in (TASK_A, TASK_B):
             with (
                 self.subTest(task=original_task.task_name),
@@ -324,10 +323,8 @@ class LLMTests(unittest.TestCase):
                     {"id": ["0100", "0101", "0102"], "Comment": ["one", "two", "three"]}
                 )
                 prediction_frame.to_csv(root / task.prediction_filename, index=False)
-                model = tiny_model()
                 config = replace(
                     self.config,
-                    text_mode="raw",
                     max_epochs=2,
                     train_batch_size_per_gpu=4,
                     gradient_accumulation_steps=2,
@@ -335,11 +332,22 @@ class LLMTests(unittest.TestCase):
                 )
                 real_score = score_candidates
                 calls = []
+                loaded_models = []
+                train_sizes = []
+
+                def model_factory(*_args, **_kwargs):
+                    model = tiny_model()
+                    loaded_models.append(model)
+                    return model
+
+                def tracked_train(*args, **kwargs):
+                    train_sizes.append(len(args[1].dataset))
+                    return train_llm_epoch(*args, **kwargs)
 
                 def controlled_score(*args, real_score=real_score, calls=calls):
                     result = real_score(*args)
                     calls.append(args[-1])
-                    # Force epoch 1 to win; final predictions must restore it.
+                    # Force epoch 1 to win; full-data replay must use one epoch.
                     if args[-1] == "Epoch 1 validation":
                         result["macro_f1"] = 1.0
                     elif args[-1] == "Epoch 2 validation":
@@ -352,7 +360,10 @@ class LLMTests(unittest.TestCase):
                         "src.llm_training.initialize_runtime",
                         return_value=cpu_runtime(),
                     ),
-                    patch("src.llm_training.load_qlora_model", return_value=model),
+                    patch(
+                        "src.llm_training.load_lora_model",
+                        side_effect=model_factory,
+                    ),
                     patch(
                         "src.llm_training.AutoTokenizer.from_pretrained",
                         return_value=self.tokenizer,
@@ -366,6 +377,10 @@ class LLMTests(unittest.TestCase):
                     patch(
                         "src.llm_training.score_candidates",
                         side_effect=controlled_score,
+                    ),
+                    patch(
+                        "src.llm_training.train_llm_epoch",
+                        side_effect=tracked_train,
                     ),
                 ):
                     run_llm_task(task, config)
@@ -381,28 +396,43 @@ class LLMTests(unittest.TestCase):
                         (output / "predictions.csv").read_bytes(),
                     )
                 summary = json.loads((output / "run_summary.json").read_text())
-                self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
-                manifest = pd.read_csv(output / "split_manifest.csv", dtype={"id": str})
                 train, val = stratified_holdout_indices(
                     np.asarray(list(range(len(task.labels))) * 10), 0.2, 42
                 )
+                self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
+                self.assertEqual(summary["quantization"], None)
+                self.assertEqual(summary["full_data_retrain"]["epochs"], 1)
                 self.assertEqual(
-                    manifest.loc[val, "split"].tolist(), ["validation"] * len(val)
+                    summary["full_data_retrain"]["training_rows"], len(frame)
+                )
+                self.assertEqual(len(loaded_models), 2)
+                self.assertEqual(train_sizes, [len(train), len(train), len(frame)])
+                manifest = pd.read_csv(output / "split_manifest.csv", dtype={"id": str})
+                self.assertEqual(
+                    manifest.loc[val, "split"].tolist(),
+                    ["selection_validation"] * len(val),
                 )
                 self.assertEqual(
-                    manifest.loc[train, "split"].tolist(), ["train"] * len(train)
+                    manifest.loc[train, "split"].tolist(),
+                    ["selection_train"] * len(train),
                 )
-                self.assertIn("Best adapter validation", calls)
-                # Loading the saved adapter into the same original backbone
-                # reproduces the exact exported predictions.
+                self.assertIn("Best holdout adapter validation", calls)
+                self.assertIn(
+                    "Development prediction from full-data adapter", calls
+                )
+                # The exported result comes from the second, full-data adapter.
+                final_model = loaded_models[1]
                 restore_adapter(
-                    model,
-                    root / "checkpoints" / task.checkpoint_subdir / "best_adapter",
+                    final_model,
+                    root
+                    / "checkpoints"
+                    / task.checkpoint_subdir
+                    / "final_full_data_adapter",
                 )
                 encoder = ChatEncoder(self.tokenizer, task, config.max_length)
                 data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
                 scores = real_score(
-                    model, data, self.collator, config, cpu_runtime(), "verify"
+                    final_model, data, self.collator, config, cpu_runtime(), "verify"
                 )
                 expected = [
                     task.labels[i] for i in scores["probabilities"].argmax(axis=1)

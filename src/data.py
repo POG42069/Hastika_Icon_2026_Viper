@@ -1,26 +1,16 @@
-"""Data loading, validation, preprocessing, and PyTorch datasets."""
+"""Raw HASTIKA CSV loading and validation."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pandas as pd
-import torch
-from torch.utils.data import Dataset, Sampler
 
-from config import DATA_DIR, PreprocessConfig, TaskConfig
-from src.preprocessing import normalize_text
+from llm_config import DATA_DIR, TaskConfig
 
 
 def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
-    """Find a data file locally or inside an attached Kaggle Dataset.
-
-    Resolution order:
-    1. ``HASTIKA_DATA_DIR`` / configured data directory.
-    2. The repository's local ``data`` directory.
-    3. A recursive search under ``/kaggle/input``.
-    """
+    """Find an input locally or in an attached Kaggle Dataset."""
 
     candidates = [
         configured_dir / filename,
@@ -48,11 +38,14 @@ def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
     )
 
 
-def load_task_frames(
-    task: TaskConfig,
-    preprocess: PreprocessConfig,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load, validate, and preprocess one task's train and prediction files."""
+def _raw_comment(value: object) -> str:
+    """Preserve comment contents exactly; only map a missing cell to empty text."""
+
+    return "" if pd.isna(value) else str(value)
+
+
+def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load and validate train/development CSVs without text preprocessing."""
 
     train_path = resolve_data_file(task.train_filename)
     prediction_path = resolve_data_file(task.prediction_filename)
@@ -71,11 +64,10 @@ def load_task_frames(
         raise ValueError(
             f"{prediction_path} is missing columns: {sorted(missing_prediction)}"
         )
-    if (
-        train_df["id"].duplicated().any()
-        or prediction_df["id"].duplicated().any()
-    ):
-        raise ValueError("Duplicate ids were found; each submission id must be unique.")
+    if train_df["id"].isna().any() or prediction_df["id"].isna().any():
+        raise ValueError("Missing IDs were found; every row needs an ID.")
+    if train_df["id"].duplicated().any() or prediction_df["id"].duplicated().any():
+        raise ValueError("Duplicate IDs were found; each submission ID must be unique.")
 
     unknown_labels = sorted(
         set(train_df[task.label_column].dropna()) - set(task.labels)
@@ -87,95 +79,8 @@ def load_task_frames(
 
     train_df = train_df.copy()
     prediction_df = prediction_df.copy()
-    train_df["clean_text"] = train_df["Comment"].map(
-        lambda value: normalize_text(value, preprocess)
-    )
-    prediction_df["clean_text"] = prediction_df["Comment"].map(
-        lambda value: normalize_text(value, preprocess)
-    )
+    train_df["text"] = train_df["Comment"].map(_raw_comment)
+    prediction_df["text"] = prediction_df["Comment"].map(_raw_comment)
     label_to_id = {label: index for index, label in enumerate(task.labels)}
     train_df["label_id"] = train_df[task.label_column].map(label_to_id).astype(int)
     return train_df, prediction_df
-
-
-class EncodedTextDataset(Dataset):
-    """Tokenize comments lazily so the dataset stays easy to inspect."""
-
-    def __init__(
-        self,
-        texts: Sequence[str],
-        tokenizer: object,
-        max_length: int,
-        labels: Sequence[int] | None = None,
-    ) -> None:
-        self.texts = list(texts)
-        self.labels = None if labels is None else list(labels)
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        if self.labels is not None and len(self.texts) != len(self.labels):
-            raise ValueError("texts and labels must have the same length")
-
-    def __len__(self) -> int:
-        """Return the number of comments."""
-
-        return len(self.texts)
-
-    def __getitem__(self, index: int) -> dict[str, object]:
-        """Tokenize one comment and retain its original dataset index."""
-
-        encoded = self.tokenizer(
-            self.texts[index],
-            truncation=True,
-            max_length=self.max_length,
-            padding=False,
-        )
-        encoded["sample_index"] = index
-        if self.labels is not None:
-            encoded["labels"] = int(self.labels[index])
-        return encoded
-
-
-class ClassificationCollator:
-    """Dynamically pad token fields while preserving labels and row indices."""
-
-    def __init__(self, tokenizer: object, pad_to_multiple_of: int | None = 8) -> None:
-        self.tokenizer = tokenizer
-        self.pad_to_multiple_of = pad_to_multiple_of
-
-    def __call__(self, features: list[dict[str, object]]) -> dict[str, torch.Tensor]:
-        """Convert a list of token dictionaries into one padded tensor batch."""
-
-        sample_indices = [int(feature.pop("sample_index")) for feature in features]
-        contains_labels = "labels" in features[0]
-        labels = (
-            [int(feature.pop("labels")) for feature in features]
-            if contains_labels
-            else None
-        )
-        batch = self.tokenizer.pad(
-            features,
-            padding=True,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors="pt",
-        )
-        batch["sample_index"] = torch.tensor(sample_indices, dtype=torch.long)
-        if labels is not None:
-            batch["labels"] = torch.tensor(labels, dtype=torch.long)
-        return batch
-
-
-class DistributedSliceSampler(Sampler[int]):
-    """Partition evaluation data without padding or duplicate samples."""
-
-    def __init__(self, dataset_size: int, rank: int, world_size: int) -> None:
-        self.indices = list(range(rank, dataset_size, world_size))
-
-    def __iter__(self) -> Iterator[int]:
-        """Yield the unique indices assigned to this worker."""
-
-        return iter(self.indices)
-
-    def __len__(self) -> int:
-        """Return the number of indices assigned to this worker."""
-
-        return len(self.indices)

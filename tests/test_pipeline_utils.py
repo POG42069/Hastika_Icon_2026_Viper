@@ -1,4 +1,4 @@
-"""Fast tests for paper-style preprocessing and submission formatting."""
+"""Fast tests for raw input loading and submission formatting."""
 
 from __future__ import annotations
 
@@ -6,42 +6,36 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
-from config import PreprocessConfig
-from src.preprocessing import ensure_nltk_resources, normalize_text
+from llm_config import TASK_A
+from src.data import load_task_frames
 from src.submission import write_submission
 
 
-class PreprocessingTests(unittest.TestCase):
-    """Verify the reproducible approximation of the paper preprocessing."""
+class RawDataTests(unittest.TestCase):
+    """Verify comments reach tokenization without normalization or cleaning."""
 
-    @classmethod
-    def setUpClass(cls) -> None:
-        """Download the small NLTK corpora once before preprocessing tests."""
-
-        ensure_nltk_resources(download_missing=True)
-
-    def test_normalization_removes_published_noise(self) -> None:
-        """Case, HTML, URL, hashtag, mention, emoji and punctuation are removed."""
-
-        text = "HeLLo #Kannada!!! @person https://example.com <br> 😊 CARS"
-        cleaned = normalize_text(text, PreprocessConfig())
-        self.assertEqual(cleaned, "hello car")
-
-    def test_stopwords_protected_context_and_kannada_are_handled(self) -> None:
-        """Remove configured stopwords but retain paper examples and Kannada text."""
-
-        text = "The mattu ಮತ್ತು Devru not ಕನ್ನಡ"
-        cleaned = normalize_text(text, PreprocessConfig())
-        self.assertEqual(cleaned, "devru not ಕನ್ನಡ")
-
-    def test_repeated_characters_and_words_are_normalized(self) -> None:
-        """Limit long character runs and collapse adjacent repeated tokens."""
-
-        cleaned = normalize_text("soooo goood goood!!!!!", PreprocessConfig())
-        self.assertEqual(cleaned, "soo good")
+    def test_raw_comments_are_preserved_and_missing_cells_become_empty(self) -> None:
+        raw = "HeLLo #Kannada!!! @person https://example.com <br> 😊 CARS"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame(
+                {
+                    "id": ["001", "002"],
+                    "Comment": [raw, None],
+                    "Label": ["Non-Hate", "Hate"],
+                }
+            ).to_csv(root / TASK_A.train_filename, index=False)
+            pd.DataFrame(
+                {"id": ["003"], "Comment": ["Soooo GOOD!!!!!"]}
+            ).to_csv(root / TASK_A.prediction_filename, index=False)
+            with patch("src.data.resolve_data_file", side_effect=root.joinpath):
+                train, development = load_task_frames(TASK_A)
+        self.assertEqual(train["text"].tolist(), [raw, ""])
+        self.assertEqual(development["text"].tolist(), ["Soooo GOOD!!!!!"])
 
 
 class SubmissionTests(unittest.TestCase):

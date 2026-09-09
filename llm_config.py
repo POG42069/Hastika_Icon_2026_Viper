@@ -1,16 +1,37 @@
-"""QLoRA settings; the original BERT configuration and entry points stay intact."""
+"""Configuration for the raw-text LoRA HASTIKA pipelines."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
-from config import TASK_A, TASK_B, TRAINING, PreprocessConfig, TaskConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("HASTIKA_DATA_DIR", str(PROJECT_ROOT / "data")))
+CHECKPOINT_ROOT = Path(
+    os.getenv("HASTIKA_CHECKPOINT_DIR", str(PROJECT_ROOT / "checkpoints"))
+)
+OUTPUT_ROOT = Path(os.getenv("HASTIKA_OUTPUT_DIR", str(PROJECT_ROOT / "outputs")))
+
+
+@dataclass(frozen=True)
+class TaskConfig:
+    """Task-specific input names, labels and artifact directories."""
+
+    task_name: str
+    train_filename: str
+    prediction_filename: str
+    label_column: str
+    labels: tuple[str, ...]
+    checkpoint_subdir: str
+    output_subdir: str
+    submission_zip_name: str
 
 
 @dataclass(frozen=True)
 class LLMTrainingConfig:
-    """Defaults target Kaggle T4 x2 (FP16 compute, one 4-bit model per GPU)."""
+    """LoRA defaults targeting Kaggle T4 x2 with FP16 compute."""
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
@@ -18,11 +39,8 @@ class LLMTrainingConfig:
         )
     )
     model_revision: str = "main"
-    validation_size: float = TRAINING.validation_size
-    seed: int = TRAINING.seed
-    # Match the BERT text preprocessing by default for a controlled comparison.
-    text_mode: str = "paper"
-    preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
+    validation_size: float = 0.20
+    seed: int = 42
     max_length: int = 256  # Full chat, including instructions, answer and EOS.
     max_epochs: int = 5
     learning_rate: float = 1e-4
@@ -46,21 +64,44 @@ class LLMTrainingConfig:
     max_gpus: int = 2
 
 
-def llm_task(task: TaskConfig) -> TaskConfig:
-    """Reuse label order/input files; isolate all LLM artifacts from BERT."""
+TASK_A = TaskConfig(
+    task_name="Task A - Binary Hate Speech Detection",
+    train_filename="binary_train.csv",
+    prediction_filename="binary_validation_inputs.csv",
+    label_column="Label",
+    labels=("Non-Hate", "Hate"),
+    checkpoint_subdir="task_a_lora",
+    output_subdir="task_a_lora",
+    submission_zip_name="task_a_submission.zip",
+)
 
-    return replace(
-        task,
-        checkpoint_subdir=f"{task.checkpoint_subdir}_llm",
-        output_subdir=f"{task.output_subdir}_llm",
-    )
+TASK_B = TaskConfig(
+    task_name="Task B - Fine-Grained Hate Speech Classification",
+    train_filename="multiclass_train.csv",
+    prediction_filename="multiclass_validation_inputs.csv",
+    label_column="Hate Category",
+    labels=(
+        "Gender",
+        "Political",
+        "Religion",
+        "Geo-political",
+        "Violence",
+        "Others",
+    ),
+    checkpoint_subdir="task_b_lora",
+    output_subdir="task_b_lora",
+    submission_zip_name="task_b_submission.zip",
+)
+
+
+def llm_task(task: TaskConfig) -> TaskConfig:
+    """Compatibility helper retained for callers that already use it."""
+
+    return task
 
 
 LLM_TRAINING = LLMTrainingConfig()
-LLM_TRAINING_B = replace(
-    LLM_TRAINING,
-    train_batch_size_per_gpu=4,
-    gradient_accumulation_steps=2,
-)
-TASK_A_LLM = llm_task(TASK_A)
-TASK_B_LLM = llm_task(TASK_B)
+# Standard LoRA consumes more VRAM than QLoRA, so Task B also starts at batch/GPU=1.
+LLM_TRAINING_B = replace(LLM_TRAINING)
+TASK_A_LLM = TASK_A
+TASK_B_LLM = TASK_B

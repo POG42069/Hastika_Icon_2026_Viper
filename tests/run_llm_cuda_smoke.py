@@ -1,7 +1,7 @@
-"""Real CUDA/NF4/PEFT smoke test, with tiny random Qwen2 weights (no download).
+"""Real CUDA/LoRA smoke test with tiny random Qwen2 weights (no download).
 
 Run manually on a CUDA machine after installing requirements.txt. This exercises
-the production quantization loader, gradient checkpointing, FP16 backward, legal
+the production model loader, gradient checkpointing, FP16 backward, legal
 label scoring and adapter save/reload without claiming pretrained-model quality.
 """
 
@@ -19,12 +19,11 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from config import TASK_A, TASK_B
-from llm_config import LLMTrainingConfig
+from llm_config import LLMTrainingConfig, TASK_A, TASK_B
 from src.distributed import RuntimeContext
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
-    load_qlora_model,
+    load_lora_model,
     restore_adapter,
     save_adapter,
     score_candidates,
@@ -66,8 +65,8 @@ def main():
             compute_dtype="float16",
         )
         for task in (TASK_A, TASK_B):
-            model = load_qlora_model(config, runtime)
-            assert model.is_loaded_in_4bit
+            model = load_lora_model(config, runtime)
+            assert not getattr(model, "is_loaded_in_4bit", False)
             before = {name: p.detach().clone() for name, p in model.named_parameters()}
             tokenizer = TestChatTokenizer()
             encoder = ChatEncoder(tokenizer, task, 512)
@@ -113,7 +112,7 @@ def main():
             )
             del model, optimizer, scheduler, before
             torch.cuda.empty_cache()
-    print("LLM_CUDA_QLORA_SMOKE_OK")
+    print("LLM_CUDA_LORA_SMOKE_OK")
 
 
 if __name__ == "__main__":

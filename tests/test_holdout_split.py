@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from config import TASK_A
+from llm_config import TASK_A
 from src.training import (
     is_better_checkpoint,
     stratified_holdout_indices,
@@ -109,7 +109,12 @@ class HoldoutSplitTests(unittest.TestCase):
             self.assertEqual(manifest["id"].tolist(), frame["id"].tolist())
             self.assertEqual(
                 manifest["split"].tolist(),
-                ["train", "train", "validation", "validation"],
+                [
+                    "selection_train",
+                    "selection_train",
+                    "selection_validation",
+                    "selection_validation",
+                ],
             )
             self.assertEqual(diagnostics["id"].tolist(), ["003", "004"])
             self.assertEqual(

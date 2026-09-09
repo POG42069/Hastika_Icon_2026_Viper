@@ -26,8 +26,7 @@ def worker(rank: int, port: int) -> None:
     import torch
     from torch.nn.parallel import DistributedDataParallel
 
-    from config import TASK_B
-    from llm_config import LLMTrainingConfig
+    from llm_config import LLMTrainingConfig, TASK_B
     from src.distributed import RuntimeContext, cleanup_runtime, gather_python_objects
     from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
     from src.llm_training import score_candidates, train_llm_epoch
