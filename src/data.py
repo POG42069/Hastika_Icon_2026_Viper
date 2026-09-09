@@ -55,19 +55,26 @@ def load_task_frames(
     """Load, validate, and preprocess one task's train and prediction files."""
 
     train_path = resolve_data_file(task.train_filename)
-    test_path = resolve_data_file(task.test_filename)
+    prediction_path = resolve_data_file(task.prediction_filename)
     train_df = pd.read_csv(train_path, encoding="utf-8-sig", dtype={"id": str})
-    test_df = pd.read_csv(test_path, encoding="utf-8-sig", dtype={"id": str})
+    prediction_df = pd.read_csv(
+        prediction_path, encoding="utf-8-sig", dtype={"id": str}
+    )
 
     required_train = {"id", "Comment", task.label_column}
-    required_test = {"id", "Comment"}
+    required_prediction = {"id", "Comment"}
     missing_train = required_train.difference(train_df.columns)
-    missing_test = required_test.difference(test_df.columns)
+    missing_prediction = required_prediction.difference(prediction_df.columns)
     if missing_train:
         raise ValueError(f"{train_path} is missing columns: {sorted(missing_train)}")
-    if missing_test:
-        raise ValueError(f"{test_path} is missing columns: {sorted(missing_test)}")
-    if train_df["id"].duplicated().any() or test_df["id"].duplicated().any():
+    if missing_prediction:
+        raise ValueError(
+            f"{prediction_path} is missing columns: {sorted(missing_prediction)}"
+        )
+    if (
+        train_df["id"].duplicated().any()
+        or prediction_df["id"].duplicated().any()
+    ):
         raise ValueError("Duplicate ids were found; each submission id must be unique.")
 
     unknown_labels = sorted(
@@ -79,16 +86,16 @@ def load_task_frames(
         raise ValueError(f"Missing labels were found in {train_path}.")
 
     train_df = train_df.copy()
-    test_df = test_df.copy()
+    prediction_df = prediction_df.copy()
     train_df["clean_text"] = train_df["Comment"].map(
         lambda value: normalize_text(value, preprocess)
     )
-    test_df["clean_text"] = test_df["Comment"].map(
+    prediction_df["clean_text"] = prediction_df["Comment"].map(
         lambda value: normalize_text(value, preprocess)
     )
     label_to_id = {label: index for index, label in enumerate(task.labels)}
     train_df["label_id"] = train_df[task.label_column].map(label_to_id).astype(int)
-    return train_df, test_df
+    return train_df, prediction_df
 
 
 class EncodedTextDataset(Dataset):

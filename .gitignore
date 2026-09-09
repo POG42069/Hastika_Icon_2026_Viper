@@ -10,6 +10,15 @@
 *.pt
 *.pth
 *.safetensors
+/logs/
+/runs/
+/.cache/
+/tmp/
+
+# Local research/slide artifacts, not part of the training repository.
+/.tmp_llm_slide/
+/Viper_HASTIKA_BERT_LLM.pptx
+/Viper_HASTIKA_BERT_LLM.pptx.inspect.ndjson
 
 # Python caches, environments, notebooks and editor settings.
 __pycache__/

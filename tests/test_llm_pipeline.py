@@ -1,0 +1,414 @@
+"""Offline tests with a real, tiny random Qwen2 and trainable PEFT adapters.
+
+No pretrained weights, competition data, GPU or quantization kernels are needed.
+The integration tests replace only the CUDA/model loading boundary; token loss,
+training, best-checkpoint reload, diagnostics and submission run normally.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import tempfile
+import unittest
+import zipfile
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+import torch
+from peft import LoraConfig, get_peft_model
+from torch.utils.data import DataLoader
+from transformers import Qwen2Config, Qwen2ForCausalLM
+
+from config import TASK_A, TASK_B
+from llm_config import LLMTrainingConfig, llm_task
+from src.distributed import RuntimeContext
+from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
+from src.llm_training import (
+    completion_log_probs,
+    compute_dtype,
+    require_cuda,
+    restore_adapter,
+    run_llm_task,
+    save_adapter,
+    score_candidates,
+    train_llm_epoch,
+)
+from src.training import stratified_holdout_indices
+
+
+class TestChatTokenizer:
+    """Character tokenizer deliberately makes every label multi-token."""
+
+    chat_template = "test-only-template"
+    pad_token_id = 0
+    eos_token_id = 2
+    eos_token = "<end>"
+    padding_side = "left"
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(character) + 10 for character in text]
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(value - 10) for value in ids)
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        role_ids = {"system": 3, "user": 4, "assistant": 5}
+        ids = []
+        for message in messages:
+            ids += [role_ids[message["role"]]] + self.encode(message["content"]) + [2]
+        if add_generation_prompt:
+            ids += [5]
+        return ids
+
+    def save_pretrained(self, path):
+        Path(path, "test_tokenizer.json").write_text("{}", encoding="utf-8")
+
+
+def tiny_model():
+    config = Qwen2Config(
+        vocab_size=256,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=1024,
+        pad_token_id=0,
+        eos_token_id=2,
+        use_cache=False,
+        attention_dropout=0.0,
+    )
+    model = Qwen2ForCausalLM(config)
+    return get_peft_model(
+        model,
+        LoraConfig(
+            task_type="CAUSAL_LM",
+            r=2,
+            lora_alpha=4,
+            target_modules="all-linear",
+            lora_dropout=0.0,
+            bias="none",
+        ),
+    )
+
+
+def cpu_runtime():
+    return RuntimeContext(torch.device("cpu"), 0, 0, 1, False)
+
+
+class LLMTests(unittest.TestCase):
+    def test_t4_uses_fp16_even_when_pytorch_supports_emulated_bf16(self):
+        runtime = RuntimeContext(torch.device("cuda", 0), 0, 0, 1, False)
+        config = LLMTrainingConfig()
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(7, 5)),
+            patch("torch.cuda.is_bf16_supported", return_value=True),
+        ):
+            self.assertEqual(compute_dtype(config, runtime), torch.float16)
+            with self.assertRaisesRegex(ValueError, "select auto or float16"):
+                compute_dtype(replace(config, compute_dtype="bfloat16"), runtime)
+
+    def test_native_bf16_gpu_auto_and_explicit_fp16(self):
+        runtime = RuntimeContext(torch.device("cuda", 0), 0, 0, 1, False)
+        config = LLMTrainingConfig()
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(8, 0)),
+            patch("torch.cuda.is_bf16_supported", return_value=True),
+        ):
+            self.assertEqual(compute_dtype(config, runtime), torch.bfloat16)
+            self.assertEqual(
+                compute_dtype(replace(config, compute_dtype="float16"), runtime),
+                torch.float16,
+            )
+
+    @classmethod
+    def setUpClass(cls):
+        torch.set_num_threads(1)
+
+    def setUp(self):
+        torch.manual_seed(42)
+        self.tokenizer = TestChatTokenizer()
+        self.encoder = ChatEncoder(self.tokenizer, TASK_A, 512)
+        self.collator = CompletionCollator(0)
+        self.config = replace(
+            LLMTrainingConfig(),
+            num_workers=0,
+            max_length=512,
+            gradient_checkpointing=False,
+            lora_dropout=0.0,
+        )
+
+    def test_answer_mask_and_truncation_preserve_full_labels(self):
+        for task in (TASK_A, TASK_B):
+            encoder = ChatEncoder(self.tokenizer, task, 512)
+            prompt, truncated = encoder.encode_prompt("long comment " * 300)
+            self.assertTrue(truncated)
+            for label_id, label in enumerate(task.labels):
+                feature = encoder.feature(prompt, label_id)
+                self.assertLessEqual(len(feature["input_ids"]), 512)
+                self.assertEqual(feature["labels"][: len(prompt)], [-100] * len(prompt))
+                self.assertEqual(
+                    feature["labels"][len(prompt) :], self.tokenizer.encode(label) + [2]
+                )
+                self.assertEqual(feature["input_ids"][: len(prompt)], prompt)
+
+    def test_encoding_matches_full_training_chat(self):
+        prompt, _ = self.encoder.encode_prompt("hello")
+        for label_id, label in enumerate(TASK_A.labels):
+            expected = self.tokenizer.apply_chat_template(
+                self.encoder.messages("hello")
+                + [{"role": "assistant", "content": label}]
+            )
+            self.assertEqual(
+                self.encoder.feature(prompt, label_id)["input_ids"], expected
+            )
+
+    def test_shifted_answer_loss_matches_full_qwen_loss(self):
+        model = tiny_model().eval()
+        dataset = CompletionDataset(
+            ["hello", "a much longer comment"], self.encoder, [0, 1]
+        )
+        batch = self.collator([dataset[0], dataset[1]])
+        scores, counts = completion_log_probs(model, batch)
+        reference = model(**batch).loss
+        self.assertTrue(
+            torch.allclose(-scores.sum() / counts.sum(), reference, atol=1e-6)
+        )
+        self.assertEqual(counts.tolist(), [len(x) for x in self.encoder.completions])
+        padding = batch["attention_mask"] == 0
+        self.assertTrue(torch.all(batch["labels"][padding] == -100))
+        prompt_position = len(batch["labels"][0]) - len(self.encoder.completions[0]) - 1
+        self.assertEqual(batch["attention_mask"][0, prompt_position].item(), 1)
+        self.assertEqual(batch["labels"][0, prompt_position].item(), -100)
+
+    def test_causal_mask_blocks_future_answer(self):
+        model = tiny_model().eval()
+        prompt, _ = self.encoder.encode_prompt("hello")
+        feature = self.encoder.feature(prompt, 1)
+        batch = self.collator([feature])
+        altered = {
+            key: value.clone() for key, value in batch.items() if key != "labels"
+        }
+        original = model(**altered).logits
+        altered["input_ids"][0, len(prompt)] = 200
+        changed = model(**altered).logits
+        self.assertTrue(
+            torch.allclose(
+                original[:, len(prompt) - 1], changed[:, len(prompt) - 1], atol=1e-6
+            )
+        )
+
+    def test_only_adapter_weights_change_and_roundtrip(self):
+        model = tiny_model()
+        before = {name: p.detach().clone() for name, p in model.named_parameters()}
+        dataset = CompletionDataset(["aa", "bbb", "cccc"], self.encoder, [0, 1, 0])
+        loader = DataLoader(dataset, batch_size=1, collate_fn=self.collator)
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad], lr=0.01
+        )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
+        config = replace(self.config, gradient_accumulation_steps=2)
+        train_llm_epoch(
+            model,
+            loader,
+            optimizer,
+            scheduler,
+            torch.amp.GradScaler("cuda", enabled=False),
+            config,
+            cpu_runtime(),
+            1,
+        )
+        self.assertEqual(scheduler.last_epoch, 2)
+        changed = [
+            name
+            for name, p in model.named_parameters()
+            if not torch.equal(before[name], p)
+        ]
+        self.assertTrue(changed)
+        self.assertTrue(all("lora_" in name for name in changed))
+        model.eval()
+        expected = score_candidates(
+            model, dataset, self.collator, config, cpu_runtime(), "test"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            save_adapter(model, self.tokenizer, Path(directory))
+            with torch.no_grad():
+                for name, parameter in model.named_parameters():
+                    if "lora_" in name:
+                        parameter.zero_()
+            restore_adapter(model, Path(directory))
+            actual = score_candidates(
+                model, dataset, self.collator, config, cpu_runtime(), "test"
+            )
+            np.testing.assert_allclose(
+                actual["probabilities"], expected["probabilities"], atol=1e-7
+            )
+
+    def test_partial_accumulation_matches_single_large_batch(self):
+        first = tiny_model()
+        second = copy.deepcopy(first)
+        dataset = CompletionDataset(["a", "b", "long"], self.encoder, [0, 1, 0])
+        # One group of 3 examples although accumulation is configured as 8.
+        for model, batch_size, accumulation in ((first, 1, 8), (second, 3, 1)):
+            loader = DataLoader(
+                dataset, batch_size=batch_size, collate_fn=self.collator
+            )
+            optimizer = torch.optim.SGD(
+                [p for p in model.parameters() if p.requires_grad], lr=0.01
+            )
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
+            train_llm_epoch(
+                model,
+                loader,
+                optimizer,
+                scheduler,
+                torch.amp.GradScaler("cuda", enabled=False),
+                replace(self.config, gradient_accumulation_steps=accumulation),
+                cpu_runtime(),
+                1,
+            )
+        for a, b in zip(first.parameters(), second.parameters(), strict=True):
+            self.assertTrue(torch.allclose(a, b, atol=1e-7))
+
+    def test_candidate_scores_independent_of_batching_and_gold_labels(self):
+        model = tiny_model().eval()
+        encoder = ChatEncoder(self.tokenizer, TASK_B, 512)
+        data = CompletionDataset(["a", "some other text", "xyz"], encoder, [0, 1, 5])
+        before = {name: p.detach().clone() for name, p in model.named_parameters()}
+        scores = score_candidates(
+            model, data, self.collator, self.config, cpu_runtime(), "test"
+        )
+        data.labels = [5, 5, 5]
+        other = score_candidates(
+            model,
+            data,
+            self.collator,
+            replace(self.config, eval_batch_size_per_gpu=1),
+            cpu_runtime(),
+            "test",
+        )
+        np.testing.assert_allclose(
+            scores["probabilities"], other["probabilities"], atol=1e-6
+        )
+        np.testing.assert_allclose(scores["probabilities"].sum(axis=1), np.ones(3))
+        for name, parameter in model.named_parameters():
+            self.assertTrue(torch.equal(before[name], parameter))
+
+    def test_cpu_production_run_fails_clearly(self):
+        with self.assertRaisesRegex(RuntimeError, "CUDA"):
+            require_cuda(cpu_runtime())
+
+    def test_both_end_to_end_pipelines_export_best_adapter_predictions(self):
+        for original_task in (TASK_A, TASK_B):
+            with (
+                self.subTest(task=original_task.task_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                task = llm_task(original_task)
+                # Sufficient examples for the stratified six-class holdout.
+                labels = list(task.labels) * 10
+                frame = pd.DataFrame(
+                    {
+                        "id": [f"{i:04d}" for i in range(len(labels))],
+                        "Comment": [f"comment {i}" for i in range(len(labels))],
+                        task.label_column: labels,
+                    }
+                )
+                frame.to_csv(root / task.train_filename, index=False)
+                prediction_frame = pd.DataFrame(
+                    {"id": ["0100", "0101", "0102"], "Comment": ["one", "two", "three"]}
+                )
+                prediction_frame.to_csv(root / task.prediction_filename, index=False)
+                model = tiny_model()
+                config = replace(
+                    self.config,
+                    text_mode="raw",
+                    max_epochs=2,
+                    train_batch_size_per_gpu=4,
+                    gradient_accumulation_steps=2,
+                    eval_batch_size_per_gpu=6,
+                )
+                real_score = score_candidates
+                calls = []
+
+                def controlled_score(*args, real_score=real_score, calls=calls):
+                    result = real_score(*args)
+                    calls.append(args[-1])
+                    # Force epoch 1 to win; final predictions must restore it.
+                    if args[-1] == "Epoch 1 validation":
+                        result["macro_f1"] = 1.0
+                    elif args[-1] == "Epoch 2 validation":
+                        result["macro_f1"] = 0.0
+                    return result
+
+                with (
+                    patch("src.llm_training.require_cuda"),
+                    patch(
+                        "src.llm_training.initialize_runtime",
+                        return_value=cpu_runtime(),
+                    ),
+                    patch("src.llm_training.load_qlora_model", return_value=model),
+                    patch(
+                        "src.llm_training.AutoTokenizer.from_pretrained",
+                        return_value=self.tokenizer,
+                    ),
+                    patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                    patch(
+                        "src.llm_training.resolve_data_file", side_effect=root.joinpath
+                    ),
+                    patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                    patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                    patch(
+                        "src.llm_training.score_candidates",
+                        side_effect=controlled_score,
+                    ),
+                ):
+                    run_llm_task(task, config)
+                output = root / "outputs" / task.output_subdir
+                result = pd.read_csv(output / "predictions.csv", dtype={"id": str})
+                self.assertEqual(result.columns.tolist(), ["id", "label"])
+                self.assertEqual(result["id"].tolist(), ["0100", "0101", "0102"])
+                self.assertTrue(set(result["label"]).issubset(task.labels))
+                with zipfile.ZipFile(output / task.submission_zip_name) as archive:
+                    self.assertEqual(archive.namelist(), ["predictions.csv"])
+                    self.assertEqual(
+                        archive.read("predictions.csv"),
+                        (output / "predictions.csv").read_bytes(),
+                    )
+                summary = json.loads((output / "run_summary.json").read_text())
+                self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
+                manifest = pd.read_csv(output / "split_manifest.csv", dtype={"id": str})
+                train, val = stratified_holdout_indices(
+                    np.asarray(list(range(len(task.labels))) * 10), 0.2, 42
+                )
+                self.assertEqual(
+                    manifest.loc[val, "split"].tolist(), ["validation"] * len(val)
+                )
+                self.assertEqual(
+                    manifest.loc[train, "split"].tolist(), ["train"] * len(train)
+                )
+                self.assertIn("Best adapter validation", calls)
+                # Loading the saved adapter into the same original backbone
+                # reproduces the exact exported predictions.
+                restore_adapter(
+                    model,
+                    root / "checkpoints" / task.checkpoint_subdir / "best_adapter",
+                )
+                encoder = ChatEncoder(self.tokenizer, task, config.max_length)
+                data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
+                scores = real_score(
+                    model, data, self.collator, config, cpu_runtime(), "verify"
+                )
+                expected = [
+                    task.labels[i] for i in scores["probabilities"].argmax(axis=1)
+                ]
+                self.assertEqual(result["label"].tolist(), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

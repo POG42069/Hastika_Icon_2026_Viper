@@ -1,0 +1,28 @@
+# Project-authored romanized variants of the Kannada function words above.
+# The list is deliberately explicit so every Kaggle run uses identical rules.
+mattu
+mathu
+matthu
+ee
+ondu
+nalli
+ralli
+hagu
+haagu
+endu
+athava
+idu
+mele
+aadare
+adare
+nantara
+moolaka
+kelavu
+aneka
+bagge
+itara
+saha
+ide
+adu
+idara
+idannu

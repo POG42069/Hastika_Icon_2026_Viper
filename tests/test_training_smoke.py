@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -17,7 +19,9 @@ from src.training import (
     create_eval_loader,
     create_train_loader,
     evaluate_model,
+    load_model_state,
     predict_distributed,
+    save_model_state,
     train_one_epoch,
 )
 
@@ -114,7 +118,7 @@ class TrainingSmokeTests(unittest.TestCase):
             ["aa", "bbb", "cccc", "ddddd"], tokenizer, max_length=8
         )
         train_loader, _ = create_train_loader(
-            labeled_dataset, collator, config, runtime, fold_seed=42
+            labeled_dataset, collator, config, runtime, shuffle_seed=42
         )
         eval_loader = create_eval_loader(labeled_dataset, collator, config, runtime)
         prediction_loader = create_eval_loader(
@@ -137,6 +141,10 @@ class TrainingSmokeTests(unittest.TestCase):
             runtime,
             epoch_number=1,
         )
+        weights_before_validation = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
         metrics = evaluate_model(
             model,
             eval_loader,
@@ -145,6 +153,11 @@ class TrainingSmokeTests(unittest.TestCase):
             runtime=runtime,
             description="smoke validation",
         )
+        for name, parameter in model.named_parameters():
+            self.assertTrue(
+                torch.equal(weights_before_validation[name], parameter.detach()),
+                msg=f"Validation unexpectedly updated parameter: {name}",
+            )
         indices, probabilities, labels = predict_distributed(
             model, prediction_loader, runtime, description="smoke prediction"
         )
@@ -157,6 +170,20 @@ class TrainingSmokeTests(unittest.TestCase):
         self.assertTrue(
             torch.allclose(torch.tensor(probabilities.sum(axis=1)), torch.ones(4))
         )
+
+        expected_state = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkpoint_path = Path(temporary_directory) / "best_model.pt"
+            save_model_state(model, checkpoint_path)
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.zero_()
+            load_model_state(model, checkpoint_path, runtime.device)
+        for name, parameter in model.named_parameters():
+            self.assertTrue(torch.equal(expected_state[name], parameter.detach()))
 
 
 if __name__ == "__main__":
