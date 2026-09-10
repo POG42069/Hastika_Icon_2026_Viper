@@ -1,4 +1,4 @@
-"""Raw HASTIKA CSV loading and validation."""
+"""HASTIKA CSV loading, validation, and light text normalization."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from llm_config import DATA_DIR, TaskConfig
+from src.preprocessing import normalize_text
 
 
 def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
@@ -38,14 +39,8 @@ def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
     )
 
 
-def _raw_comment(value: object) -> str:
-    """Preserve comment contents exactly; only map a missing cell to empty text."""
-
-    return "" if pd.isna(value) else str(value)
-
-
 def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load and validate train/development CSVs without text preprocessing."""
+    """Load, validate, and normalize train/development CSVs consistently."""
 
     train_path = resolve_data_file(task.train_filename)
     prediction_path = resolve_data_file(task.prediction_filename)
@@ -79,8 +74,8 @@ def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     train_df = train_df.copy()
     prediction_df = prediction_df.copy()
-    train_df["text"] = train_df["Comment"].map(_raw_comment)
-    prediction_df["text"] = prediction_df["Comment"].map(_raw_comment)
+    train_df["text"] = train_df["Comment"].map(normalize_text)
+    prediction_df["text"] = prediction_df["Comment"].map(normalize_text)
     label_to_id = {label: index for index, label in enumerate(task.labels)}
     train_df["label_id"] = train_df[task.label_column].map(label_to_id).astype(int)
     return train_df, prediction_df

@@ -1,4 +1,4 @@
-"""Raw-text LoRA SFT, holdout selection, full-data retraining and export."""
+"""Lightly normalized LoRA SFT, holdout selection, retraining, and export."""
 
 from __future__ import annotations
 
@@ -539,7 +539,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             runtime,
         )
         log(
-            f"Raw text; truncated comments: selection_train="
+            f"Lightly normalized text; truncated comments: selection_train="
             f"{selection_train_data.truncated_count}, validation={val_data.truncated_count}, "
             f"full_train={full_train_data.truncated_count}, development="
             f"{prediction_data.truncated_count}",
@@ -752,7 +752,10 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "world_size": runtime.world_size,
                     "compute_dtype": str(compute_dtype(config, runtime)),
                     "quantization": None,
-                    "text_input": "raw Comment values; missing cells become empty strings",
+                    "text_input": (
+                        "ftfy + Unicode NFKC + HTML entity decoding + whitespace "
+                        "normalization; URLs, mentions, and HTML tags preserved"
+                    ),
                     "effective_train_batch_size": config.train_batch_size_per_gpu
                     * config.gradient_accumulation_steps
                     * runtime.world_size,

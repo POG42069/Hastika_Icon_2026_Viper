@@ -29,15 +29,15 @@ Việc khởi tạo lại ở bước 3 giúp tất cả mẫu được học s�
 tiếp tục trực tiếp từ adapter 80%, nhóm 80% ban đầu sẽ được học nhiều lần hơn
 nhóm validation cũ.
 
-## Raw text
+## Light text normalization
 
-Pipeline đưa nguyên giá trị cột `Comment` vào chat tokenizer:
+Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa cột `Comment` vào chat tokenizer:
 
-- Không lowercase.
-- Không xóa URL, mention, hashtag, HTML, emoji hay dấu câu.
-- Không xóa stopword hoặc lemmatize.
-- Không chuẩn hóa ký tự/từ lặp.
-- Ô `Comment` thiếu được chuyển thành chuỗi rỗng để tokenizer xử lý được.
+- Sửa lỗi encoding bằng `ftfy`, chuẩn hóa Unicode NFKC và giải mã HTML entity.
+- Thu gọn khoảng trắng; ô `Comment` thiếu được chuyển thành chuỗi rỗng.
+- Giữ nguyên URL, mention và thẻ HTML.
+- Không lowercase; giữ hashtag, emoji và dấu câu.
+- Không xóa stopword, không lemmatize và không chuẩn hóa ký tự/từ lặp.
 
 Khi comment quá dài, `ChatEncoder` chỉ cắt phần cuối comment để toàn bộ system
 prompt và assistant label vẫn nằm trong `max_length`.
@@ -125,7 +125,7 @@ Mỗi mẫu có dạng:
 
 ```text
 System: Classify ... Reply with exactly one allowed label.
-User: Comment:\n<raw Comment>
+User: Comment:\n<normalized Comment>
 Assistant: <official label>
 ```
 

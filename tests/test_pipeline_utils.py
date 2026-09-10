@@ -1,4 +1,4 @@
-"""Fast tests for raw input loading and submission formatting."""
+"""Fast tests for light text normalization and submission formatting."""
 
 from __future__ import annotations
 
@@ -15,11 +15,18 @@ from src.data import load_task_frames
 from src.submission import write_submission
 
 
-class RawDataTests(unittest.TestCase):
-    """Verify comments reach tokenization without normalization or cleaning."""
+class TextNormalizationTests(unittest.TestCase):
+    """Verify technical cleanup does not discard authored content."""
 
-    def test_raw_comments_are_preserved_and_missing_cells_become_empty(self) -> None:
-        raw = "HeLLo #Kannada!!! @person https://example.com <br> 😊 CARS"
+    def test_urls_mentions_html_and_stylistic_signals_are_preserved(self) -> None:
+        raw = (
+            "  FranÃ§ais  ＣＡＲＳ &amp; <b>@person "
+            "https://example.com</b>\n#Kannada!!! 😊 soooo  "
+        )
+        normalized = (
+            "Français CARS & <b>@person https://example.com</b> "
+            "#Kannada!!! 😊 soooo"
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pd.DataFrame(
@@ -34,7 +41,7 @@ class RawDataTests(unittest.TestCase):
             ).to_csv(root / TASK_A.prediction_filename, index=False)
             with patch("src.data.resolve_data_file", side_effect=root.joinpath):
                 train, development = load_task_frames(TASK_A)
-        self.assertEqual(train["text"].tolist(), [raw, ""])
+        self.assertEqual(train["text"].tolist(), [normalized, ""])
         self.assertEqual(development["text"].tolist(), ["Soooo GOOD!!!!!"])
 
 

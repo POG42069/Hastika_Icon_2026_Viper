@@ -1,4 +1,4 @@
-"""Configuration for the raw-text LoRA HASTIKA pipelines."""
+"""Configuration for the lightly normalized LoRA HASTIKA pipelines."""
 
 from __future__ import annotations
 
