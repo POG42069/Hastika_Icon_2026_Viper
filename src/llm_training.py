@@ -9,6 +9,7 @@ import inspect
 import json
 import math
 import os
+import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, replace
@@ -23,7 +24,6 @@ from sklearn.metrics import accuracy_score, f1_score
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from tqdm.auto import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -70,11 +70,14 @@ def validate_config(config: LLMTrainingConfig) -> None:
         "lora_rank",
         "early_stopping_patience",
         "max_gpus",
+        "progress_log_percent",
     ):
         if getattr(config, name) < 1:
             raise ValueError(f"{name} must be positive")
     if not 0 < config.validation_size < 1:
         raise ValueError("validation_size must be strictly between zero and one")
+    if config.progress_log_percent > 100:
+        raise ValueError("progress_log_percent must be between 1 and 100")
     if config.compute_dtype not in {"auto", "float16", "bfloat16"}:
         raise ValueError("compute_dtype must be auto, float16 or bfloat16")
     if config.learning_rate <= 0 or config.max_grad_norm <= 0:
@@ -131,6 +134,60 @@ def on_main(action: Callable[[], None], runtime: RuntimeContext) -> None:
     errors = gather_python_objects(error, runtime)
     if any(item is not None for item in errors):
         raise RuntimeError(next(item for item in errors if item is not None))
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+class LineProgress:
+    """Print compact, stable progress lines that render cleanly in Kaggle logs."""
+
+    def __init__(
+        self,
+        total: int,
+        description: str,
+        unit: str,
+        runtime: RuntimeContext,
+        log_every_percent: int,
+    ) -> None:
+        self.total = total
+        self.description = description
+        self.unit = unit
+        self.runtime = runtime
+        self.log_every_percent = log_every_percent
+        self.completed = 0
+        self.next_percent = log_every_percent
+        self.started_at = time.monotonic()
+        log(f"[{description}] START | total={total} {unit}", runtime)
+
+    def update(self, amount: int, details: str = "") -> None:
+        self.completed = min(self.total, self.completed + amount)
+        percent = 100 if self.total == 0 else int(100 * self.completed / self.total)
+        if self.completed < self.total and percent < self.next_percent:
+            return
+
+        elapsed = time.monotonic() - self.started_at
+        rate = self.completed / elapsed if elapsed > 0 else 0.0
+        remaining = (
+            (self.total - self.completed) / rate
+            if rate > 0 and self.completed < self.total
+            else 0.0
+        )
+        suffix = f" | {details}" if details else ""
+        log(
+            f"[{self.description}] {percent:3d}% | "
+            f"{self.completed}/{self.total} {self.unit} | "
+            f"elapsed={_format_duration(elapsed)} | "
+            f"ETA={_format_duration(remaining)} | "
+            f"speed={rate:.2f} {self.unit}/s{suffix}",
+            self.runtime,
+        )
+        while self.next_percent <= percent:
+            self.next_percent += self.log_every_percent
 
 
 def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
@@ -226,11 +283,12 @@ def train_llm_epoch(
     dtype = compute_dtype(config, runtime)
     total_loss, total_examples, successful_updates, skipped_updates = 0.0, 0, 0, 0
     iterator = iter(loader)
-    progress = tqdm(
-        total=len(loader),
-        desc=f"{phase} epoch {epoch}",
-        disable=not runtime.is_main_process,
-        leave=False,
+    progress = LineProgress(
+        len(loader),
+        f"{phase} | epoch {epoch}",
+        "batches/GPU",
+        runtime,
+        config.progress_log_percent,
     )
     while group := list(islice(iterator, config.gradient_accumulation_steps)):
         group_size = sum(batch["input_ids"].shape[0] for batch in group)
@@ -250,8 +308,9 @@ def train_llm_epoch(
                 scaler.scale(loss).backward()
             total_loss += float(example_losses.detach().sum())
             total_examples += len(example_losses)
-            progress.update(1)
-            progress.set_postfix(loss=f"{total_loss / total_examples:.4f}")
+            progress.update(
+                1, details=f"mean_loss={total_loss / total_examples:.4f}"
+            )
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(
             model.parameters(), config.max_grad_norm, error_if_nonfinite=False
@@ -265,7 +324,6 @@ def train_llm_epoch(
             successful_updates += 1
         else:
             skipped_updates += 1
-    progress.close()
     if successful_updates == 0:
         raise RuntimeError(
             "No optimizer updates succeeded. Reduce initial_loss_scale or use BF16 if supported."
@@ -298,8 +356,12 @@ def score_candidates(model, dataset, collator, config, runtime, description):
     )
     local = []
     count = len(range(runtime.rank, len(dataset), runtime.world_size)) * n_labels
-    progress = tqdm(
-        total=count, desc=description, disable=not runtime.is_main_process, leave=False
+    progress = LineProgress(
+        count,
+        description,
+        "candidates/GPU",
+        runtime,
+        config.progress_log_percent,
     )
     while group := list(islice(candidates, config.eval_batch_size_per_gpu)):
         batch = {
@@ -313,7 +375,6 @@ def score_candidates(model, dataset, collator, config, runtime, description):
         ):
             local.append((row, label, score, tokens))
         progress.update(len(group))
-    progress.close()
     gathered = [
         item for shard in gather_python_objects(local, runtime) for item in shard
     ]
@@ -486,6 +547,10 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         )
 
         # Phase 1: use only the 80% partition for updates and select by 20% Macro-F1.
+        log(
+            "\n=== PHASE 1/2 | HOLDOUT SELECTION (80% train / 20% validation) ===",
+            runtime,
+        )
         selection_loader, selection_sampler = create_train_loader(
             selection_train_data, collator, config, runtime, config.seed
         )
@@ -589,6 +654,11 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
 
         # Phase 2: replay the selected epoch count from a fresh backbone on all rows.
         # Starting fresh ensures the former 80% and 20% examples receive equal updates.
+        log(
+            f"\n=== PHASE 2/2 | FULL-DATA RETRAIN "
+            f"(100% train / {best_epoch} epoch(s)) ===",
+            runtime,
+        )
         set_global_seed(config.seed)
         full_loader, full_sampler = create_train_loader(
             full_train_data, collator, config, runtime, config.seed
@@ -732,6 +802,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 },
             )
             log(
+                f"\n=== COMPLETE | {task.task_name} ===\n"
                 f"Best validation Macro-F1: {best_validation['macro_f1']:.5f} "
                 f"at epoch {best_epoch}\n"
                 f"Retrained from scratch on 100% data for {best_epoch} epoch(s).\n"

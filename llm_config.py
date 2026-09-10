@@ -59,6 +59,7 @@ class LLMTrainingConfig:
     gradient_checkpointing: bool = True
     compute_dtype: str = "auto"  # BF16 if supported; FP16 on T4.
     initial_loss_scale: float = 1024.0  # Conservative FP16 start; GradScaler adapts.
+    progress_log_percent: int = 10  # Stable Kaggle log line every N percent.
     num_workers: int = 0
     use_all_available_gpus: bool = True
     max_gpus: int = 2

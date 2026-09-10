@@ -60,6 +60,7 @@ Cấu hình mặc định trong `llm_config.py`:
 | Batch/GPU | 1 |
 | Gradient accumulation | 8 |
 | Eval batch/GPU | 2 candidate completions |
+| Progress log | Một dòng cố định mỗi 10% |
 
 LoRA áp dụng:
 
@@ -132,6 +133,10 @@ Code gọi `apply_chat_template` của tokenizer. Prompt và padding được ma
 `-100`; loss chỉ áp dụng cho các token của assistant label và phần kết thúc
 chat. Khi dự đoán, pipeline tính tổng log-likelihood cho từng nhãn hợp lệ và
 chọn nhãn có điểm lớn nhất; không sinh văn bản tự do và không regex sửa kết quả.
+
+Tiến trình train, validation và prediction được ghi thành dòng cố định mỗi 10%
+với số batch/candidate, elapsed time, ETA, tốc độ và mean loss khi train. Cách
+này tránh progress bar động bị Kaggle nối thành một khối log dài khó đọc.
 
 ## Artifacts
 
