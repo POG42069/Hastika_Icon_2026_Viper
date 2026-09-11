@@ -49,8 +49,8 @@ Cấu hình mặc định trong `llm_config.py`:
 | Tham số | Giá trị |
 |---|---:|
 | Backbone | `Qwen/Qwen2.5-3B-Instruct` |
-| LoRA rank `r` | 16 |
-| LoRA alpha | 32 |
+| LoRA rank `r` | 32 |
+| LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
 | Max epochs để chọn | 5 |
@@ -68,7 +68,7 @@ LoRA áp dụng:
 W = W0 + (alpha / r) BA
 ```
 
-Với `r=16`, `alpha=32`, hệ số scale là 2. Backbone `W0` không được optimizer
+Với `r=32`, `alpha=64`, hệ số scale là 2. Backbone `W0` không được optimizer
 cập nhật.
 
 Đây không còn là QLoRA: code không dùng NF4, double quantization hay
