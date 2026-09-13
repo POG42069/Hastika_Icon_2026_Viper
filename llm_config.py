@@ -27,6 +27,16 @@ class TaskConfig:
     checkpoint_subdir: str
     output_subdir: str
     submission_zip_name: str
+    original_fold_filenames: tuple[str, ...] = ()
+    augmentation_fold_filenames: tuple[str, ...] = ()
+    selection_validation_fold: int | None = None
+
+    def labeled_filenames(self) -> tuple[str, ...]:
+        """Return every labeled CSV used by this task."""
+
+        if self.original_fold_filenames:
+            return self.original_fold_filenames + self.augmentation_fold_filenames
+        return (self.train_filename,)
 
 
 @dataclass(frozen=True)
@@ -92,6 +102,9 @@ TASK_B = TaskConfig(
     checkpoint_subdir="task_b_lora",
     output_subdir="task_b_lora",
     submission_zip_name="task_b_submission.zip",
+    original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
+    augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
+    selection_validation_fold=5,
 )
 
 

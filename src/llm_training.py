@@ -52,6 +52,7 @@ from src.training import (
     create_train_loader,
     is_better_checkpoint,
     log,
+    predefined_fold_indices,
     set_global_seed,
     stratified_holdout_indices,
     unwrap_model,
@@ -470,7 +471,7 @@ def _training_state(model, loader, epochs, config, runtime):
 
 
 def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
-    """Select on 80/20, retrain fresh on 100%, then predict development data."""
+    """Select on a holdout, retrain fresh on all rows, then predict development."""
 
     validate_config(config)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -493,9 +494,21 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         for name, data in (("train", frame), ("development", prediction_frame)):
             if data.empty:
                 raise ValueError(f"{name} input must contain at least one row.")
-        train_indices, val_indices = stratified_holdout_indices(
-            frame["label_id"].to_numpy(), config.validation_size, config.seed
-        )
+        if task.selection_validation_fold is None:
+            train_indices, val_indices = stratified_holdout_indices(
+                frame["label_id"].to_numpy(), config.validation_size, config.seed
+            )
+            split_strategy = "deterministic_stratified_holdout"
+            split_heading = "80% train / 20% validation"
+        else:
+            train_indices, val_indices = predefined_fold_indices(
+                frame["fold"].to_numpy(), task.selection_validation_fold
+            )
+            split_strategy = "predefined_fold_holdout"
+            split_heading = (
+                f"folds 1-{task.selection_validation_fold - 1} train / "
+                f"fold {task.selection_validation_fold} validation"
+            )
         train_frame, val_frame = frame.iloc[train_indices], frame.iloc[val_indices]
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -533,7 +546,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
 
         on_main(initialize_artifacts, runtime)
         log(
-            f"Selection split: train={len(selection_train_data)}, "
+            f"Selection split ({split_heading}): train={len(selection_train_data)}, "
             f"validation={len(val_data)}; final retrain={len(full_train_data)} (100%); "
             f"development={len(prediction_data)}",
             runtime,
@@ -546,9 +559,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             runtime,
         )
 
-        # Phase 1: use only the 80% partition for updates and select by 20% Macro-F1.
+        # Phase 1: update on the selection partition and select by holdout Macro-F1.
         log(
-            "\n=== PHASE 1/2 | HOLDOUT SELECTION (80% train / 20% validation) ===",
+            f"\n=== PHASE 1/2 | HOLDOUT SELECTION ({split_heading}) ===",
             runtime,
         )
         selection_loader, selection_sampler = create_train_loader(
@@ -653,7 +666,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         torch.cuda.empty_cache()
 
         # Phase 2: replay the selected epoch count from a fresh backbone on all rows.
-        # Starting fresh ensures the former 80% and 20% examples receive equal updates.
+        # Starting fresh ensures selection-train and holdout rows receive equal updates.
         log(
             f"\n=== PHASE 2/2 | FULL-DATA RETRAIN "
             f"(100% train / {best_epoch} epoch(s)) ===",
@@ -760,8 +773,14 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     * config.gradient_accumulation_steps
                     * runtime.world_size,
                     "selection_split": {
+                        "strategy": split_strategy,
                         "seed": config.seed,
-                        "validation_size": config.validation_size,
+                        "configured_validation_size": config.validation_size
+                        if task.selection_validation_fold is None
+                        else None,
+                        "validation_fold": task.selection_validation_fold,
+                        "actual_validation_fraction": len(val_data)
+                        / len(full_train_data),
                         "train_rows": len(selection_train_data),
                         "validation_rows": len(val_data),
                         "train_label_distribution": train_frame[task.label_column]
@@ -790,7 +809,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     },
                     "input_sha256": {
                         name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
-                        for name in (task.train_filename, task.prediction_filename)
+                        for name in (*task.labeled_filenames(), task.prediction_filename)
                     },
                     "packages": {
                         name: version(name)

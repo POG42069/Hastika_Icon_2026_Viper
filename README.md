@@ -12,15 +12,17 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 ## Quy trình huấn luyện
 
-Mỗi entry point tự chạy hai giai đoạn:
+Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Chia dữ liệu có nhãn thành stratified 80% train và 20% validation với
-   seed 42.
-2. Train LoRA trên 80%, tính Macro-F1 trên 20% sau mỗi epoch và lưu adapter
-   tốt nhất. Nếu Macro-F1 hòa, validation loss thấp hơn thắng; nếu vẫn hòa,
-   giữ epoch sớm hơn.
+1. Task A chia stratified 80% train và 20% validation với seed 42. Task B dùng
+   split cố định: `original_1..4 + augment1..4` để train và
+   `original_5 + augment5` để validation.
+2. Train LoRA trên selection-train, tính Macro-F1 trên holdout sau mỗi epoch
+   và lưu adapter tốt nhất. Nếu Macro-F1 hòa, validation loss thấp hơn thắng;
+   nếu vẫn hòa, giữ epoch sớm hơn.
 3. Lấy `best_epoch` vừa chọn, khởi tạo lại backbone và LoRA từ đầu, rồi train
-   đúng số epoch đó trên 100% dữ liệu có nhãn. Không dùng validation và không
+   đúng số epoch đó trên 100% dữ liệu có nhãn. Với Task B, 100% gồm toàn bộ
+   năm file original và năm file augment. Không dùng validation và không
    early-stop ở giai đoạn này.
 4. Dùng adapter retrain 100% để dự đoán development inputs và tạo
    `predictions.csv` cùng file ZIP nộp CodaBench.
@@ -79,17 +81,27 @@ khoảng trống để train LoRA trên một T4, và DDP không cộng VRAM c�
 ## Dữ liệu
 
 Mặc định pipeline tìm các file sau trong `HASTIKA_DATA_DIR`, thư mục `data/`,
-hoặc một Kaggle Dataset dưới `/kaggle/input`:
+hoặc một Kaggle Dataset dưới `/kaggle/input`.
+
+Task A:
 
 ```text
 binary_train.csv
 binary_validation_inputs.csv
-multiclass_train.csv
+```
+
+Task B:
+
+```text
+original_1.csv ... original_5.csv
+augment1.csv ... augment5.csv
 multiclass_validation_inputs.csv
 ```
 
 Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Development CSV
-cần `id`, `Comment`.
+cần `id`, `Comment`. Các file `augment*.csv` cần thêm `source_id`,
+`source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn nằm cùng fold,
+nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
 
 ## Chạy trên Kaggle
 

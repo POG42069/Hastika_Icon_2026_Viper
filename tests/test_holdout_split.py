@@ -12,6 +12,7 @@ import pandas as pd
 from llm_config import TASK_A
 from src.training import (
     is_better_checkpoint,
+    predefined_fold_indices,
     stratified_holdout_indices,
     write_split_manifest,
     write_validation_predictions,
@@ -67,6 +68,13 @@ class HoldoutSplitTests(unittest.TestCase):
             ]
         ).astype(np.int64)
         self._assert_valid_split(labels, expected_train=2527, expected_validation=632)
+
+    def test_predefined_fold_five_is_the_complete_validation_set(self) -> None:
+        folds = np.asarray([1, 1, 2, 3, 4, 5, 5], dtype=np.int64)
+        train, validation = predefined_fold_indices(folds, validation_fold=5)
+        self.assertEqual(train.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(validation.tolist(), [5, 6])
+        self.assertFalse(set(train).intersection(validation))
 
     def test_checkpoint_tie_breaking(self) -> None:
         """Macro-F1 wins first, lower loss breaks ties, exact ties keep early epoch."""

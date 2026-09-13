@@ -309,16 +309,77 @@ class LLMTests(unittest.TestCase):
             ):
                 root = Path(directory)
                 task = llm_task(original_task)
-                # Sufficient examples for the stratified six-class holdout.
-                labels = list(task.labels) * 10
-                frame = pd.DataFrame(
-                    {
-                        "id": [f"{i:04d}" for i in range(len(labels))],
-                        "Comment": [f"comment {i}" for i in range(len(labels))],
-                        task.label_column: labels,
-                    }
-                )
-                frame.to_csv(root / task.train_filename, index=False)
+                if task.original_fold_filenames:
+                    fold_frames = []
+                    for fold, (original_name, augment_name) in enumerate(
+                        zip(
+                            task.original_fold_filenames,
+                            task.augmentation_fold_filenames,
+                            strict=True,
+                        ),
+                        start=1,
+                    ):
+                        original_labels = list(task.labels) * 2
+                        original = pd.DataFrame(
+                            {
+                                "id": [
+                                    f"original-{fold}-{i}"
+                                    for i in range(len(original_labels))
+                                ],
+                                "Comment": [
+                                    f"original comment {fold}-{i}"
+                                    for i in range(len(original_labels))
+                                ],
+                                task.label_column: original_labels,
+                            }
+                        )
+                        augment = pd.DataFrame(
+                            {
+                                "id": [
+                                    f"augment-{fold}-{i}"
+                                    for i in range(len(task.labels))
+                                ],
+                                "Comment": [
+                                    f"paraphrase {fold}-{i}"
+                                    for i in range(len(task.labels))
+                                ],
+                                task.label_column: list(task.labels),
+                                "source_id": original["id"].iloc[
+                                    : len(task.labels)
+                                ],
+                                "source_group": [
+                                    f"group-{fold}-{i}"
+                                    for i in range(len(task.labels))
+                                ],
+                                "fold": fold,
+                            }
+                        )
+                        original.to_csv(root / original_name, index=False)
+                        augment.to_csv(root / augment_name, index=False)
+                        original["fold"] = fold
+                        augment["fold"] = fold
+                        fold_frames.extend((original, augment))
+                    frame = pd.concat(fold_frames, ignore_index=True, sort=False)
+                    train = np.flatnonzero(
+                        frame["fold"].to_numpy() != task.selection_validation_fold
+                    )
+                    val = np.flatnonzero(
+                        frame["fold"].to_numpy() == task.selection_validation_fold
+                    )
+                else:
+                    # Sufficient examples for the deterministic stratified holdout.
+                    labels = list(task.labels) * 10
+                    frame = pd.DataFrame(
+                        {
+                            "id": [f"{i:04d}" for i in range(len(labels))],
+                            "Comment": [f"comment {i}" for i in range(len(labels))],
+                            task.label_column: labels,
+                        }
+                    )
+                    frame.to_csv(root / task.train_filename, index=False)
+                    train, val = stratified_holdout_indices(
+                        np.asarray(list(range(len(task.labels))) * 10), 0.2, 42
+                    )
                 prediction_frame = pd.DataFrame(
                     {"id": ["0100", "0101", "0102"], "Comment": ["one", "two", "three"]}
                 )
@@ -396,9 +457,6 @@ class LLMTests(unittest.TestCase):
                         (output / "predictions.csv").read_bytes(),
                     )
                 summary = json.loads((output / "run_summary.json").read_text())
-                train, val = stratified_holdout_indices(
-                    np.asarray(list(range(len(task.labels))) * 10), 0.2, 42
-                )
                 self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
                 self.assertEqual(summary["quantization"], None)
                 self.assertEqual(summary["full_data_retrain"]["epochs"], 1)

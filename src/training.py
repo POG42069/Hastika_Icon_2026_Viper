@@ -134,6 +134,24 @@ def stratified_holdout_indices(
     )
 
 
+def predefined_fold_indices(
+    folds: np.ndarray,
+    validation_fold: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Use one complete, predefined fold for checkpoint selection."""
+
+    fold_values = np.asarray(folds)
+    validation_mask = fold_values == validation_fold
+    if not validation_mask.any():
+        raise ValueError(f"No rows were found for validation fold {validation_fold}.")
+    if validation_mask.all():
+        raise ValueError("A predefined split must leave at least one training fold.")
+    return (
+        np.flatnonzero(~validation_mask).astype(np.int64),
+        np.flatnonzero(validation_mask).astype(np.int64),
+    )
+
+
 def is_better_checkpoint(
     current_metric: float,
     current_loss: float,
@@ -163,9 +181,14 @@ def write_split_manifest(
     assignments[validation_indices] = "selection_validation"
     if np.any(assignments == ""):
         raise RuntimeError("The holdout split did not assign every labeled row.")
-    output = pd.DataFrame(
-        {"id": train_df["id"].astype(str).tolist(), "split": assignments.tolist()}
-    )
+    data = {
+        "id": train_df["id"].astype(str).tolist(),
+        "split": assignments.tolist(),
+    }
+    for column in ("fold", "data_origin", "source_id", "source_group"):
+        if column in train_df.columns:
+            data[column] = train_df[column].tolist()
+    output = pd.DataFrame(data)
     path = output_dir / "split_manifest.csv"
     output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
     return path
