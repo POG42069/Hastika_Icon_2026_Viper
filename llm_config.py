@@ -42,7 +42,7 @@ class LLMTrainingConfig:
     validation_size: float = 0.20
     seed: int = 42
     max_length: int = 256  # Full chat, including instructions, answer and EOS.
-    max_epochs: int = 8
+    max_epochs: int = 5
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
@@ -51,7 +51,7 @@ class LLMTrainingConfig:
     eval_batch_size_per_gpu: int = 2
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
-    early_stopping_patience: int = 3
+    early_stopping_patience: int = 2
     lora_rank: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
