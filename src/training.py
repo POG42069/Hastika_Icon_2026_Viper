@@ -137,17 +137,35 @@ def stratified_holdout_indices(
 def predefined_fold_indices(
     folds: np.ndarray,
     validation_fold: int,
+    data_origins: np.ndarray | None = None,
+    validation_origins: tuple[str, ...] = (),
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Use one complete, predefined fold for checkpoint selection."""
+    """Use earlier folds for training and selected origins of one fold for validation."""
 
     fold_values = np.asarray(folds)
-    validation_mask = fold_values == validation_fold
+    held_out_fold_mask = fold_values == validation_fold
+    validation_mask = held_out_fold_mask.copy()
+    if validation_origins:
+        if data_origins is None:
+            raise ValueError(
+                "data_origins is required when validation_origins is configured."
+            )
+        origin_values = np.asarray(data_origins)
+        if len(origin_values) != len(fold_values):
+            raise ValueError("folds and data_origins must have the same length.")
+        validation_mask &= np.isin(origin_values, validation_origins)
     if not validation_mask.any():
-        raise ValueError(f"No rows were found for validation fold {validation_fold}.")
-    if validation_mask.all():
+        origin_note = (
+            f" with origins {validation_origins}" if validation_origins else ""
+        )
+        raise ValueError(
+            f"No rows were found for validation fold {validation_fold}{origin_note}."
+        )
+    train_mask = ~held_out_fold_mask
+    if not train_mask.any():
         raise ValueError("A predefined split must leave at least one training fold.")
     return (
-        np.flatnonzero(~validation_mask).astype(np.int64),
+        np.flatnonzero(train_mask).astype(np.int64),
         np.flatnonzero(validation_mask).astype(np.int64),
     )
 
@@ -176,11 +194,9 @@ def write_split_manifest(
 ) -> Path:
     """Record the exact holdout used only for epoch/checkpoint selection."""
 
-    assignments = np.full(len(train_df), "", dtype=object)
+    assignments = np.full(len(train_df), "selection_excluded", dtype=object)
     assignments[train_indices] = "selection_train"
     assignments[validation_indices] = "selection_validation"
-    if np.any(assignments == ""):
-        raise RuntimeError("The holdout split did not assign every labeled row.")
     data = {
         "id": train_df["id"].astype(str).tolist(),
         "split": assignments.tolist(),

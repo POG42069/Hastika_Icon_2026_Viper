@@ -357,14 +357,17 @@ class LLMTests(unittest.TestCase):
                         original.to_csv(root / original_name, index=False)
                         augment.to_csv(root / augment_name, index=False)
                         original["fold"] = fold
+                        original["data_origin"] = "original"
                         augment["fold"] = fold
+                        augment["data_origin"] = "augmentation"
                         fold_frames.extend((original, augment))
                     frame = pd.concat(fold_frames, ignore_index=True, sort=False)
                     train = np.flatnonzero(
                         frame["fold"].to_numpy() != task.selection_validation_fold
                     )
                     val = np.flatnonzero(
-                        frame["fold"].to_numpy() == task.selection_validation_fold
+                        (frame["fold"].to_numpy() == task.selection_validation_fold)
+                        & (frame["data_origin"].to_numpy() == "original")
                     )
                 else:
                     # Sufficient examples for the deterministic stratified holdout.
@@ -474,6 +477,15 @@ class LLMTests(unittest.TestCase):
                     manifest.loc[train, "split"].tolist(),
                     ["selection_train"] * len(train),
                 )
+                if task.original_fold_filenames:
+                    excluded = np.flatnonzero(
+                        (frame["fold"].to_numpy() == task.selection_validation_fold)
+                        & (frame["data_origin"].to_numpy() == "augmentation")
+                    )
+                    self.assertEqual(
+                        manifest.loc[excluded, "split"].tolist(),
+                        ["selection_excluded"] * len(excluded),
+                    )
                 self.assertIn("Best holdout adapter validation", calls)
                 self.assertIn(
                     "Development prediction from full-data adapter", calls

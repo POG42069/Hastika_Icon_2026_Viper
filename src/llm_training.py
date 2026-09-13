@@ -502,12 +502,21 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             split_heading = "80% train / 20% validation"
         else:
             train_indices, val_indices = predefined_fold_indices(
-                frame["fold"].to_numpy(), task.selection_validation_fold
+                frame["fold"].to_numpy(),
+                task.selection_validation_fold,
+                frame["data_origin"].to_numpy(),
+                task.selection_validation_data_origins,
             )
             split_strategy = "predefined_fold_holdout"
+            validation_origin_heading = (
+                " + ".join(task.selection_validation_data_origins)
+                if task.selection_validation_data_origins
+                else "all origins"
+            )
             split_heading = (
                 f"folds 1-{task.selection_validation_fold - 1} train / "
-                f"fold {task.selection_validation_fold} validation"
+                f"fold {task.selection_validation_fold} "
+                f"{validation_origin_heading} validation"
             )
         train_frame, val_frame = frame.iloc[train_indices], frame.iloc[val_indices]
 
@@ -779,10 +788,16 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         if task.selection_validation_fold is None
                         else None,
                         "validation_fold": task.selection_validation_fold,
+                        "validation_data_origins": list(
+                            task.selection_validation_data_origins
+                        ),
                         "actual_validation_fraction": len(val_data)
                         / len(full_train_data),
                         "train_rows": len(selection_train_data),
                         "validation_rows": len(val_data),
+                        "selection_excluded_rows": len(full_train_data)
+                        - len(selection_train_data)
+                        - len(val_data),
                         "train_label_distribution": train_frame[task.label_column]
                         .value_counts()
                         .to_dict(),

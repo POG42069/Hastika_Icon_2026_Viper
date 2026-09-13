@@ -15,8 +15,9 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
 1. Task A chia stratified 80% train và 20% validation với seed 42. Task B dùng
-   split cố định: `original_1..4 + augment1..4` để train và
-   `original_5 + augment5` để validation.
+   split cố định: `original_1..4 + augment1..4` để train và chỉ
+   `original_5` để validation. `augment5` được loại khỏi giai đoạn chọn
+   checkpoint để tránh rò rỉ các paraphrase của fold validation.
 2. Train LoRA trên selection-train, tính Macro-F1 trên holdout sau mỗi epoch
    và lưu adapter tốt nhất. Nếu Macro-F1 hòa, validation loss thấp hơn thắng;
    nếu vẫn hòa, giữ epoch sớm hơn.

@@ -30,6 +30,7 @@ class TaskConfig:
     original_fold_filenames: tuple[str, ...] = ()
     augmentation_fold_filenames: tuple[str, ...] = ()
     selection_validation_fold: int | None = None
+    selection_validation_data_origins: tuple[str, ...] = ()
 
     def labeled_filenames(self) -> tuple[str, ...]:
         """Return every labeled CSV used by this task."""
@@ -105,6 +106,7 @@ TASK_B = TaskConfig(
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
     selection_validation_fold=5,
+    selection_validation_data_origins=("original",),
 )
 
 

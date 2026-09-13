@@ -76,6 +76,28 @@ class HoldoutSplitTests(unittest.TestCase):
         self.assertEqual(validation.tolist(), [5, 6])
         self.assertFalse(set(train).intersection(validation))
 
+    def test_predefined_validation_can_use_only_original_rows(self) -> None:
+        folds = np.asarray([1, 1, 4, 5, 5], dtype=np.int64)
+        origins = np.asarray(
+            [
+                "original",
+                "augmentation",
+                "augmentation",
+                "original",
+                "augmentation",
+            ]
+        )
+        train, validation = predefined_fold_indices(
+            folds,
+            validation_fold=5,
+            data_origins=origins,
+            validation_origins=("original",),
+        )
+        self.assertEqual(train.tolist(), [0, 1, 2])
+        self.assertEqual(validation.tolist(), [3])
+        self.assertNotIn(4, train)
+        self.assertNotIn(4, validation)
+
     def test_checkpoint_tie_breaking(self) -> None:
         """Macro-F1 wins first, lower loss breaks ties, exact ties keep early epoch."""
 
