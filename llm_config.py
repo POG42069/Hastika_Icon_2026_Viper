@@ -61,7 +61,7 @@ class LLMTrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
-    train_batch_size_per_gpu: int = 1
+    train_batch_size_per_gpu: int = 4
     # Number of candidate completions per forward, NOT number of comments.
     eval_batch_size_per_gpu: int = 2
     gradient_accumulation_steps: int = 8
