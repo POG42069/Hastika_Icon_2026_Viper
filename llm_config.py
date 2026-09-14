@@ -109,7 +109,7 @@ TASK_B = TaskConfig(
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
-    use_augmentation=False,
+    use_augmentation=True,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
 )
