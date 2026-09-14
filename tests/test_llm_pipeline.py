@@ -294,6 +294,15 @@ class LLMTests(unittest.TestCase):
             scores["probabilities"], other["probabilities"], atol=1e-6
         )
         np.testing.assert_allclose(scores["probabilities"].sum(axis=1), np.ones(3))
+        self.assertEqual(list(scores["per_class"]), list(TASK_B.labels))
+        self.assertEqual(
+            [scores["per_class"][label]["support"] for label in TASK_B.labels],
+            [1, 1, 0, 0, 0, 1],
+        )
+        for class_metrics in scores["per_class"].values():
+            self.assertEqual(
+                set(class_metrics), {"precision", "recall", "f1", "support"}
+            )
         for name, parameter in model.named_parameters():
             self.assertTrue(torch.equal(before[name], parameter))
 

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -414,6 +414,24 @@ def score_candidates(model, dataset, collator, config, runtime, description):
             ),
             accuracy=float(accuracy_score(labels, predictions)),
         )
+        if dataset.encoder.task.report_per_class_metrics:
+            precision, recall, per_class_f1, support = (
+                precision_recall_fscore_support(
+                    labels,
+                    predictions,
+                    labels=list(range(n_labels)),
+                    zero_division=0,
+                )
+            )
+            result["per_class"] = {
+                label: {
+                    "precision": float(precision[index]),
+                    "recall": float(recall[index]),
+                    "f1": float(per_class_f1[index]),
+                    "support": int(support[index]),
+                }
+                for index, label in enumerate(dataset.encoder.task.labels)
+            }
     return result
 
 
@@ -622,6 +640,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 "train_loss": train_loss,
                 **{key: metrics[key] for key in ("loss", "macro_f1", "accuracy")},
             }
+            if "per_class" in metrics:
+                record["per_class"] = metrics["per_class"]
             selection_history.append(record)
             log(
                 f"Selection epoch {epoch}: train_loss={train_loss:.5f}, "
@@ -629,6 +649,14 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"accuracy={metrics['accuracy']:.5f}",
                 runtime,
             )
+            for label, class_metrics in metrics.get("per_class", {}).items():
+                log(
+                    f"  {label}: precision={class_metrics['precision']:.5f}, "
+                    f"recall={class_metrics['recall']:.5f}, "
+                    f"f1={class_metrics['f1']:.5f}, "
+                    f"support={class_metrics['support']}",
+                    runtime,
+                )
             if is_better_checkpoint(
                 metrics["macro_f1"], metrics["loss"], best_metric, best_loss
             ):
@@ -751,6 +779,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     for key in ("macro_f1", "accuracy", "loss")
                 },
             }
+            if "per_class" in best_validation:
+                selection_summary["per_class"] = best_validation["per_class"]
             final_summary = {
                 "epochs": best_epoch,
                 "training_rows": len(full_train_data),

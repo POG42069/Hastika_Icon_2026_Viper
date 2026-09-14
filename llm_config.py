@@ -32,6 +32,7 @@ class TaskConfig:
     use_augmentation: bool = True
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
+    report_per_class_metrics: bool = False
 
     def labeled_filenames(self) -> tuple[str, ...]:
         """Return every labeled CSV used by this task."""
@@ -112,6 +113,7 @@ TASK_B = TaskConfig(
     use_augmentation=True,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
+    report_per_class_metrics=True,
 )
 
 
