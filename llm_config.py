@@ -29,6 +29,7 @@ class TaskConfig:
     submission_zip_name: str
     original_fold_filenames: tuple[str, ...] = ()
     augmentation_fold_filenames: tuple[str, ...] = ()
+    use_augmentation: bool = True
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
 
@@ -36,7 +37,10 @@ class TaskConfig:
         """Return every labeled CSV used by this task."""
 
         if self.original_fold_filenames:
-            return self.original_fold_filenames + self.augmentation_fold_filenames
+            augmentation_files = (
+                self.augmentation_fold_filenames if self.use_augmentation else ()
+            )
+            return self.original_fold_filenames + augmentation_files
         return (self.train_filename,)
 
 
@@ -105,6 +109,7 @@ TASK_B = TaskConfig(
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
+    use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
 )

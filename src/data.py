@@ -100,7 +100,9 @@ def _validate_and_encode_frames(
 
 
 def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
-    if len(task.original_fold_filenames) != len(task.augmentation_fold_filenames):
+    if task.use_augmentation and len(task.original_fold_filenames) != len(
+        task.augmentation_fold_filenames
+    ):
         raise ValueError(
             "original_fold_filenames and augmentation_fold_filenames must have "
             "the same number of files."
@@ -115,23 +117,25 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
     fold_frames: list[pd.DataFrame] = []
     original_by_fold: dict[int, pd.DataFrame] = {}
     augment_by_fold: dict[int, pd.DataFrame] = {}
-    for fold, (original_name, augment_name) in enumerate(
-        zip(
-            task.original_fold_filenames,
-            task.augmentation_fold_filenames,
-            strict=True,
-        ),
-        start=1,
-    ):
+    for fold, original_name in enumerate(task.original_fold_filenames, start=1):
         original_path = resolve_data_file(original_name)
-        augment_path = resolve_data_file(augment_name)
         original = _read_csv(original_path)
-        augment = _read_csv(augment_path)
         _validate_columns(
             original,
             original_path,
             {"id", "Comment", task.label_column},
         )
+        original = original.copy()
+        original["fold"] = fold
+        original["data_origin"] = "original"
+        original_by_fold[fold] = original
+        fold_frames.append(original)
+
+        if not task.use_augmentation:
+            continue
+
+        augment_path = resolve_data_file(task.augmentation_fold_filenames[fold - 1])
+        augment = _read_csv(augment_path)
         _validate_columns(
             augment,
             augment_path,
@@ -152,17 +156,16 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
                 f"{augment_path} must contain only rows whose fold value is {fold}."
             )
 
-        original = original.copy()
         augment = augment.copy()
-        original["fold"] = fold
-        original["data_origin"] = "original"
         augment["fold"] = fold
         augment["data_origin"] = "augmentation"
-        original_by_fold[fold] = original
         augment_by_fold[fold] = augment
-        fold_frames.extend((original, augment))
+        fold_frames.append(augment)
 
     originals = pd.concat(original_by_fold.values(), ignore_index=True, sort=False)
+    if not task.use_augmentation:
+        return originals
+
     original_ids = set(originals["id"])
     for fold, augment in augment_by_fold.items():
         missing_sources = sorted(set(augment["source_id"]) - original_ids)
@@ -206,7 +209,11 @@ def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     prediction_df = _read_csv(prediction_path)
     if task.original_fold_filenames:
         train_df = _load_predefined_folds(task)
-        train_description = "predefined original and augmentation folds"
+        train_description = (
+            "predefined original and augmentation folds"
+            if task.use_augmentation
+            else "predefined original folds"
+        )
     else:
         train_path = resolve_data_file(task.train_filename)
         train_df = _read_csv(train_path)

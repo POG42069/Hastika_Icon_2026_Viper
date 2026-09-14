@@ -355,12 +355,15 @@ class LLMTests(unittest.TestCase):
                             }
                         )
                         original.to_csv(root / original_name, index=False)
-                        augment.to_csv(root / augment_name, index=False)
+                        if task.use_augmentation:
+                            augment.to_csv(root / augment_name, index=False)
                         original["fold"] = fold
                         original["data_origin"] = "original"
                         augment["fold"] = fold
                         augment["data_origin"] = "augmentation"
-                        fold_frames.extend((original, augment))
+                        fold_frames.append(original)
+                        if task.use_augmentation:
+                            fold_frames.append(augment)
                     frame = pd.concat(fold_frames, ignore_index=True, sort=False)
                     train = np.flatnonzero(
                         frame["fold"].to_numpy() != task.selection_validation_fold
@@ -477,7 +480,7 @@ class LLMTests(unittest.TestCase):
                     manifest.loc[train, "split"].tolist(),
                     ["selection_train"] * len(train),
                 )
-                if task.original_fold_filenames:
+                if task.original_fold_filenames and task.use_augmentation:
                     excluded = np.flatnonzero(
                         (frame["fold"].to_numpy() == task.selection_validation_fold)
                         & (frame["data_origin"].to_numpy() == "augmentation")

@@ -14,17 +14,16 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Task A chia stratified 80% train và 20% validation với seed 42. Task B dùng
-   split cố định: `original_1..4 + augment1..4` để train và chỉ
-   `original_5` để validation. `augment5` được loại khỏi giai đoạn chọn
-   checkpoint để tránh rò rỉ các paraphrase của fold validation.
+1. Task A chia stratified 80% train và 20% validation với seed 42. Task B đang
+   chạy baseline không augmentation: `original_1..4` để train và `original_5`
+   để validation.
 2. Train LoRA trên selection-train, tính Macro-F1 trên holdout sau mỗi epoch
    và lưu adapter tốt nhất. Nếu Macro-F1 hòa, validation loss thấp hơn thắng;
    nếu vẫn hòa, giữ epoch sớm hơn.
 3. Lấy `best_epoch` vừa chọn, khởi tạo lại backbone và LoRA từ đầu, rồi train
-   đúng số epoch đó trên 100% dữ liệu có nhãn. Với Task B, 100% gồm toàn bộ
-   năm file original và năm file augment. Không dùng validation và không
-   early-stop ở giai đoạn này.
+   đúng số epoch đó trên 100% dữ liệu có nhãn. Với Task B baseline, 100% chỉ
+   gồm `original_1..5`. Không dùng validation và không early-stop ở giai đoạn
+   này.
 4. Dùng adapter retrain 100% để dự đoán development inputs và tạo
    `predictions.csv` cùng file ZIP nộp CodaBench.
 
