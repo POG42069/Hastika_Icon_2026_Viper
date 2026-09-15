@@ -29,6 +29,7 @@ from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
     completion_log_probs,
     compute_dtype,
+    format_per_class_diagnostics,
     require_cuda,
     restore_adapter,
     run_llm_task,
@@ -299,6 +300,44 @@ class LLMTests(unittest.TestCase):
             [scores["per_class"][label]["support"] for label in TASK_B.labels],
             [1, 1, 0, 0, 0, 1],
         )
+        matrix = np.asarray(scores["confusion_matrix"]["values"])
+        self.assertEqual(matrix.shape, (len(TASK_B.labels), len(TASK_B.labels)))
+        self.assertEqual(matrix.sum(axis=1).tolist(), [1, 1, 0, 0, 0, 1])
+        diagnostic_lines = format_per_class_diagnostics(scores)
+        self.assertEqual(len(diagnostic_lines), len(TASK_B.labels) * 3)
+        self.assertTrue(
+            any(
+                "False positives into Others (actual label)" in line
+                for line in diagnostic_lines
+            )
+        )
+        self.assertTrue(
+            any(
+                "False negatives from Violence (predicted label)" in line
+                for line in diagnostic_lines
+            )
+        )
+        synthetic_matrix = np.zeros(
+            (len(TASK_B.labels), len(TASK_B.labels)), dtype=int
+        )
+        synthetic_matrix[0, 5] = 2  # Actual Gender predicted as Others.
+        synthetic_matrix[4, 5] = 3  # Actual Violence predicted as Others.
+        synthetic_metrics = {
+            "per_class": {
+                label: {"precision": 0.0, "recall": 0.0, "f1": 0.0, "support": 0}
+                for label in TASK_B.labels
+            },
+            "confusion_matrix": {
+                "label_order": list(TASK_B.labels),
+                "values": synthetic_matrix.tolist(),
+            },
+        }
+        synthetic_lines = format_per_class_diagnostics(synthetic_metrics)
+        self.assertIn(
+            "Gender=2, Political=0, Religion=0, Geo-political=0, Violence=3",
+            synthetic_lines[16],
+        )
+        self.assertIn("Others=3", synthetic_lines[14])
         for class_metrics in scores["per_class"].values():
             self.assertEqual(
                 set(class_metrics), {"precision", "recall", "f1", "support"}

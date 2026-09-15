@@ -149,6 +149,10 @@ chọn nhãn có điểm lớn nhất; không sinh văn bản tự do và không
 Tiến trình train, validation và prediction được ghi thành dòng cố định mỗi 10%
 với số batch/candidate, elapsed time, ETA, tốc độ và mean loss khi train. Cách
 này tránh progress bar động bị Kaggle nối thành một khối log dài khó đọc.
+Sau mỗi epoch của Task B, log còn ghi precision, recall, F1 và support của từng
+nhãn, kèm số lỗi theo cả hai chiều: các nhãn thật bị dự đoán nhầm vào nhãn đang
+xét và các mẫu thật của nhãn đang xét bị dự đoán sang từng nhãn khác. Ma trận
+nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện và metrics JSON.
 
 ## Artifacts
 

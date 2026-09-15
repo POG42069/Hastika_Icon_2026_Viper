@@ -20,7 +20,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_fscore_support,
+)
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -432,7 +437,70 @@ def score_candidates(model, dataset, collator, config, runtime, description):
                 }
                 for index, label in enumerate(dataset.encoder.task.labels)
             }
+            matrix = confusion_matrix(
+                labels,
+                predictions,
+                labels=list(range(n_labels)),
+            )
+            result["confusion_matrix"] = {
+                "rows": "actual labels",
+                "columns": "predicted labels",
+                "label_order": list(dataset.encoder.task.labels),
+                "values": matrix.astype(int).tolist(),
+            }
     return result
+
+
+def format_per_class_diagnostics(metrics: dict) -> list[str]:
+    """Describe each class and both directions of its classification errors."""
+
+    per_class = metrics.get("per_class")
+    confusion = metrics.get("confusion_matrix")
+    if not per_class or not confusion:
+        return []
+    labels = confusion["label_order"]
+    matrix = np.asarray(confusion["values"], dtype=np.int64)
+    if matrix.shape != (len(labels), len(labels)):
+        raise ValueError("Confusion matrix shape does not match its label order.")
+
+    lines = []
+    for class_index, label in enumerate(labels):
+        class_metrics = per_class[label]
+        incoming = [
+            f"{source_label}={int(matrix[source_index, class_index])}"
+            for source_index, source_label in enumerate(labels)
+            if source_index != class_index
+        ]
+        outgoing = [
+            f"{predicted_label}={int(matrix[class_index, predicted_index])}"
+            for predicted_index, predicted_label in enumerate(labels)
+            if predicted_index != class_index
+        ]
+        incoming_total = int(
+            matrix[:, class_index].sum() - matrix[class_index, class_index]
+        )
+        outgoing_total = int(
+            matrix[class_index, :].sum() - matrix[class_index, class_index]
+        )
+        lines.extend(
+            [
+                (
+                    f"  {label}: precision={class_metrics['precision']:.5f}, "
+                    f"recall={class_metrics['recall']:.5f}, "
+                    f"f1={class_metrics['f1']:.5f}, "
+                    f"support={class_metrics['support']}"
+                ),
+                (
+                    f"    False positives into {label} (actual label): "
+                    f"{', '.join(incoming)} | total={incoming_total}"
+                ),
+                (
+                    f"    False negatives from {label} (predicted label): "
+                    f"{', '.join(outgoing)} | total={outgoing_total}"
+                ),
+            ]
+        )
+    return lines
 
 
 def save_adapter(model, tokenizer, path: Path) -> None:
@@ -642,6 +710,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             }
             if "per_class" in metrics:
                 record["per_class"] = metrics["per_class"]
+                record["confusion_matrix"] = metrics["confusion_matrix"]
             selection_history.append(record)
             log(
                 f"Selection epoch {epoch}: train_loss={train_loss:.5f}, "
@@ -649,14 +718,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"accuracy={metrics['accuracy']:.5f}",
                 runtime,
             )
-            for label, class_metrics in metrics.get("per_class", {}).items():
-                log(
-                    f"  {label}: precision={class_metrics['precision']:.5f}, "
-                    f"recall={class_metrics['recall']:.5f}, "
-                    f"f1={class_metrics['f1']:.5f}, "
-                    f"support={class_metrics['support']}",
-                    runtime,
-                )
+            for diagnostic_line in format_per_class_diagnostics(metrics):
+                log(diagnostic_line, runtime)
             if is_better_checkpoint(
                 metrics["macro_f1"], metrics["loss"], best_metric, best_loss
             ):
@@ -781,6 +844,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             }
             if "per_class" in best_validation:
                 selection_summary["per_class"] = best_validation["per_class"]
+                selection_summary["confusion_matrix"] = best_validation[
+                    "confusion_matrix"
+                ]
             final_summary = {
                 "epochs": best_epoch,
                 "training_rows": len(full_train_data),
