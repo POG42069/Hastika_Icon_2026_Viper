@@ -400,6 +400,13 @@ def score_candidates(model, dataset, collator, config, runtime, description):
     if dataset.labels is not None:
         labels = np.asarray(dataset.labels, dtype=np.int64)
         predictions = probabilities.argmax(axis=1)
+        per_class_scores = f1_score(
+            labels,
+            predictions,
+            labels=list(range(n_labels)),
+            average=None,
+            zero_division=0,
+        )
         row = np.arange(len(labels))
         result.update(
             loss=float(np.mean(-scores[row, labels] / counts[row, labels])),
@@ -413,6 +420,12 @@ def score_candidates(model, dataset, collator, config, runtime, description):
                 )
             ),
             accuracy=float(accuracy_score(labels, predictions)),
+            per_class_f1={
+                label: float(score)
+                for label, score in zip(
+                    dataset.encoder.task.labels, per_class_scores, strict=True
+                )
+            },
         )
     return result
 
@@ -621,12 +634,21 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 **{key: metrics[key] for key in ("loss", "macro_f1", "accuracy")},
+                "per_class_f1": metrics["per_class_f1"],
             }
             selection_history.append(record)
             log(
                 f"Selection epoch {epoch}: train_loss={train_loss:.5f}, "
                 f"val_loss={metrics['loss']:.5f}, macro_f1={metrics['macro_f1']:.5f}, "
                 f"accuracy={metrics['accuracy']:.5f}",
+                runtime,
+            )
+            log(
+                "Validation F1 by class: "
+                + " | ".join(
+                    f"{label}={metrics['per_class_f1'][label]:.5f}"
+                    for label in task.labels
+                ),
                 runtime,
             )
             if is_better_checkpoint(
@@ -748,7 +770,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 "checkpoint": str(selection_adapter_dir),
                 **{
                     key: best_validation[key]
-                    for key in ("macro_f1", "accuracy", "loss")
+                    for key in ("macro_f1", "accuracy", "loss", "per_class_f1")
                 },
             }
             final_summary = {
