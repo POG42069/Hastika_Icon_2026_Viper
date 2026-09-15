@@ -144,6 +144,56 @@ def _format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def completion_token_diagnostics(encoder: ChatEncoder) -> list[dict[str, object]]:
+    """Describe the exact assistant completion scored for every allowed label."""
+
+    tokenizer = encoder.tokenizer
+    convert_ids_to_tokens = getattr(tokenizer, "convert_ids_to_tokens", None)
+    diagnostics = []
+    for label, token_ids in zip(
+        encoder.task.labels, encoder.completions, strict=True
+    ):
+        ids = list(token_ids)
+        token_pieces = (
+            list(convert_ids_to_tokens(ids))
+            if callable(convert_ids_to_tokens)
+            else None
+        )
+        diagnostics.append(
+            {
+                "label": label,
+                "token_count": len(ids),
+                "token_ids": ids,
+                "token_pieces": token_pieces,
+                "decoded_completion": tokenizer.decode(
+                    ids, skip_special_tokens=False
+                ),
+            }
+        )
+    return diagnostics
+
+
+def log_completion_token_diagnostics(
+    diagnostics: list[dict[str, object]], runtime: RuntimeContext
+) -> None:
+    """Log per-label tokenization and whether all completion lengths match."""
+
+    for item in diagnostics:
+        log(
+            f"Completion tokens | label={item['label']!r} | "
+            f"count={item['token_count']} | ids={item['token_ids']} | "
+            f"pieces={item['token_pieces']} | "
+            f"decoded={item['decoded_completion']!r}",
+            runtime,
+        )
+    token_counts = [int(item["token_count"]) for item in diagnostics]
+    log(
+        "Completion token lengths equal across labels: "
+        f"{len(set(token_counts)) == 1} | counts={token_counts}",
+        runtime,
+    )
+
+
 class LineProgress:
     """Print compact, stable progress lines that render cleanly in Kaggle logs."""
 
@@ -391,12 +441,31 @@ def score_candidates(model, dataset, collator, config, runtime, description):
     counts = np.asarray([item[3] for item in gathered], dtype=np.float64).reshape(
         -1, n_labels
     )
+    expected_counts = np.asarray(
+        [len(token_ids) for token_ids in dataset.encoder.completions],
+        dtype=np.float64,
+    )
+    if not np.all(counts == expected_counts[None, :]):
+        raise RuntimeError(
+            "Completion token counts changed between prediction rows."
+        )
+    log(
+        f"{description} | completion token counts="
+        f"{dict(zip(dataset.encoder.task.labels, expected_counts.astype(int), strict=True))} "
+        "| "
+        f"equal_across_labels={len(set(expected_counts.tolist())) == 1}",
+        runtime,
+    )
     if not np.isfinite(scores).all():
         raise RuntimeError(
             "Non-finite candidate scores; check AMP and training stability."
         )
     probabilities = torch.softmax(torch.from_numpy(scores), dim=1).numpy()
-    result = {"probabilities": probabilities, "sequence_log_probs": scores}
+    result = {
+        "probabilities": probabilities,
+        "sequence_log_probs": scores,
+        "completion_token_counts": counts,
+    }
     if dataset.labels is not None:
         labels = np.asarray(dataset.labels, dtype=np.int64)
         predictions = probabilities.argmax(axis=1)
@@ -542,6 +611,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
         encoder = ChatEncoder(tokenizer, task, config.max_length)
+        token_diagnostics = completion_token_diagnostics(encoder)
+        log_completion_token_diagnostics(token_diagnostics, runtime)
         selection_train_data = CompletionDataset(
             train_frame["text"].tolist(),
             encoder,
@@ -835,6 +906,11 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "system_prompt": encoder.system_text,
                     "label_order": list(task.labels),
                     "completion_token_ids": encoder.completions,
+                    "completion_token_diagnostics": token_diagnostics,
+                    "completion_token_lengths_equal": len(
+                        {int(item["token_count"]) for item in token_diagnostics}
+                    )
+                    == 1,
                     "inference": "argmax sum log P(answer tokens including chat end | prompt)",
                     "probabilities": "softmax over allowed full-answer log likelihoods; not calibrated",
                     "loss": "mean per-example answer-token NLL; not class cross-entropy",

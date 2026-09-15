@@ -27,6 +27,7 @@ from llm_config import LLMTrainingConfig, TASK_A, TASK_B, llm_task
 from src.distributed import RuntimeContext
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
+    completion_token_diagnostics,
     completion_log_probs,
     compute_dtype,
     require_cuda,
@@ -296,6 +297,34 @@ class LLMTests(unittest.TestCase):
         np.testing.assert_allclose(scores["probabilities"].sum(axis=1), np.ones(3))
         for name, parameter in model.named_parameters():
             self.assertTrue(torch.equal(before[name], parameter))
+
+    def test_completion_token_counts_are_reported_and_constant_per_label(self):
+        encoder = ChatEncoder(self.tokenizer, TASK_B, 512)
+        data = CompletionDataset(["short", "a different comment"], encoder)
+        result = score_candidates(
+            tiny_model().eval(),
+            data,
+            self.collator,
+            self.config,
+            cpu_runtime(),
+            "token count test",
+        )
+        expected = np.asarray(
+            [len(token_ids) for token_ids in encoder.completions], dtype=np.float64
+        )
+        self.assertEqual(
+            result["completion_token_counts"].shape,
+            (2, len(TASK_B.labels)),
+        )
+        np.testing.assert_array_equal(
+            result["completion_token_counts"],
+            np.broadcast_to(expected, result["completion_token_counts"].shape),
+        )
+        diagnostics = completion_token_diagnostics(encoder)
+        self.assertEqual(
+            [item["token_count"] for item in diagnostics], expected.tolist()
+        )
+        self.assertTrue(all(item["token_pieces"] is None for item in diagnostics))
 
     def test_cpu_production_run_fails_clearly(self):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
