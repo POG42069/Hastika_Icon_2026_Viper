@@ -32,6 +32,7 @@ class TaskConfig:
     use_augmentation: bool = True
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
+    selection_train_label_caps: tuple[tuple[str, int], ...] = ()
     report_per_class_metrics: bool = False
 
     def labeled_filenames(self) -> tuple[str, ...]:
@@ -113,6 +114,7 @@ TASK_B = TaskConfig(
     use_augmentation=True,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
+    selection_train_label_caps=(("Gender", 670),),
     report_per_class_metrics=True,
 )
 

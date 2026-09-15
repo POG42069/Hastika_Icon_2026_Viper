@@ -54,6 +54,7 @@ from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.submission import write_submission
 from src.training import (
     build_optimizer,
+    cap_training_labels,
     create_train_loader,
     is_better_checkpoint,
     log,
@@ -604,7 +605,19 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"fold {task.selection_validation_fold} "
                 f"{validation_origin_heading} validation"
             )
+        train_indices, downsampled_indices, downsampling_summary = cap_training_labels(
+            train_indices,
+            frame[task.label_column].to_numpy(),
+            task.selection_train_label_caps,
+            config.seed,
+        )
+        full_train_indices = np.setdiff1d(
+            np.arange(len(frame), dtype=np.int64),
+            downsampled_indices,
+            assume_unique=True,
+        )
         train_frame, val_frame = frame.iloc[train_indices], frame.iloc[val_indices]
+        full_train_frame = frame.iloc[full_train_indices]
 
         tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
@@ -624,7 +637,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
         )
         full_train_data = CompletionDataset(
-            frame["text"].tolist(), encoder, frame["label_id"].tolist()
+            full_train_frame["text"].tolist(),
+            encoder,
+            full_train_frame["label_id"].tolist(),
         )
         prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
         collator = CompletionCollator(tokenizer.pad_token_id)
@@ -637,15 +652,30 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         def initialize_artifacts():
             output_dir.mkdir(parents=True, exist_ok=True)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            write_split_manifest(frame, train_indices, val_indices, output_dir)
+            write_split_manifest(
+                frame,
+                train_indices,
+                val_indices,
+                output_dir,
+                downsampled_indices,
+            )
 
         on_main(initialize_artifacts, runtime)
         log(
             f"Selection split ({split_heading}): train={len(selection_train_data)}, "
-            f"validation={len(val_data)}; final retrain={len(full_train_data)} (100%); "
+            f"validation={len(val_data)}; final retrain={len(full_train_data)}/"
+            f"{len(frame)} retained rows; "
             f"development={len(prediction_data)}",
             runtime,
         )
+        for summary in downsampling_summary:
+            log(
+                f"Selection label cap: {summary['label']} available="
+                f"{summary['available']}, retained={summary['retained']}, "
+                f"dropped={summary['dropped']}, cap={summary['cap']}, "
+                f"seed={config.seed}. Dropped rows are also excluded from final retrain.",
+                runtime,
+            )
         log(
             f"Lightly normalized text; truncated comments: selection_train="
             f"{selection_train_data.truncated_count}, validation={val_data.truncated_count}, "
@@ -765,11 +795,11 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Phase 2: replay the selected epoch count from a fresh backbone on all rows.
+        # Phase 2: replay the selected epoch count on every retained labeled row.
         # Starting fresh ensures selection-train and holdout rows receive equal updates.
         log(
             f"\n=== PHASE 2/2 | FULL-DATA RETRAIN "
-            f"(100% train / {best_epoch} epoch(s)) ===",
+            f"(all retained rows / {best_epoch} epoch(s)) ===",
             runtime,
         )
         set_global_seed(config.seed)
@@ -850,6 +880,11 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             final_summary = {
                 "epochs": best_epoch,
                 "training_rows": len(full_train_data),
+                "loaded_rows": len(frame),
+                "downsampled_rows_excluded": len(downsampled_indices),
+                "label_distribution": full_train_frame[task.label_column]
+                .value_counts()
+                .to_dict(),
                 "checkpoint": str(final_adapter_dir),
                 "prediction_source": "final_full_data_adapter",
             }
@@ -887,13 +922,18 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         "validation_data_origins": list(
                             task.selection_validation_data_origins
                         ),
-                        "actual_validation_fraction": len(val_data)
-                        / len(full_train_data),
+                        "actual_validation_fraction": len(val_data) / len(frame),
                         "train_rows": len(selection_train_data),
                         "validation_rows": len(val_data),
-                        "selection_excluded_rows": len(full_train_data)
+                        "selection_excluded_rows": len(frame)
                         - len(selection_train_data)
                         - len(val_data),
+                        "selection_downsampled_rows": len(downsampled_indices),
+                        "selection_train_label_caps": {
+                            summary["label"]: summary["cap"]
+                            for summary in downsampling_summary
+                        },
+                        "downsampling_summary": downsampling_summary,
                         "train_label_distribution": train_frame[task.label_column]
                         .value_counts()
                         .to_dict(),
@@ -938,7 +978,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"\n=== COMPLETE | {task.task_name} ===\n"
                 f"Best validation Macro-F1: {best_validation['macro_f1']:.5f} "
                 f"at epoch {best_epoch}\n"
-                f"Retrained from scratch on 100% data for {best_epoch} epoch(s).\n"
+                f"Retrained from scratch on all {len(full_train_data)} retained rows "
+                f"for {best_epoch} epoch(s).\n"
                 f"Predictions: {csv_path}\nSubmission: {zip_path}\n"
                 f"Final adapter: {final_adapter_dir}",
                 runtime,

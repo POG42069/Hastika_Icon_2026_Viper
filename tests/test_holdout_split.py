@@ -11,6 +11,7 @@ import pandas as pd
 
 from llm_config import TASK_A
 from src.training import (
+    cap_training_labels,
     is_better_checkpoint,
     predefined_fold_indices,
     stratified_holdout_indices,
@@ -105,6 +106,24 @@ class HoldoutSplitTests(unittest.TestCase):
         self.assertTrue(is_better_checkpoint(0.6, 0.3, 0.6, 0.4))
         self.assertFalse(is_better_checkpoint(0.6, 0.4, 0.6, 0.4))
         self.assertFalse(is_better_checkpoint(0.5, 0.1, 0.6, 0.4))
+
+    def test_training_label_cap_is_exact_and_reproducible(self) -> None:
+        labels = np.asarray(["Gender"] * 10 + ["Violence"] * 4)
+        indices = np.arange(len(labels), dtype=np.int64)
+        retained, dropped, summary = cap_training_labels(
+            indices, labels, (("Gender", 6),), seed=42
+        )
+        repeated_retained, repeated_dropped, _ = cap_training_labels(
+            indices, labels, (("Gender", 6),), seed=42
+        )
+
+        self.assertEqual((labels[retained] == "Gender").sum(), 6)
+        self.assertEqual((labels[retained] == "Violence").sum(), 4)
+        self.assertEqual(len(dropped), 4)
+        self.assertTrue(np.array_equal(retained, repeated_retained))
+        self.assertTrue(np.array_equal(dropped, repeated_dropped))
+        self.assertEqual(summary[0]["available"], 10)
+        self.assertEqual(summary[0]["retained"], 6)
 
     def test_holdout_diagnostic_artifacts(self) -> None:
         """Manifest and validation diagnostics must preserve IDs and labels."""
