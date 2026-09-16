@@ -63,10 +63,10 @@ class LLMTrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
-    train_batch_size_per_gpu: int = 4
+    train_batch_size_per_gpu: int = 2
     # Number of candidate completions per forward, NOT number of comments.
     eval_batch_size_per_gpu: int = 2
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 4
     max_grad_norm: float = 1.0
     early_stopping_patience: int = 2
     lora_rank: int = 32
@@ -114,7 +114,7 @@ TASK_B = TaskConfig(
     use_augmentation=True,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
-    selection_train_label_caps=(("Gender", 970),),
+    selection_train_label_caps=(("Gender", 870),),
     report_per_class_metrics=True,
 )
 
