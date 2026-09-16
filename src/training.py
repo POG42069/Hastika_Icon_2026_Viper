@@ -261,6 +261,91 @@ def write_split_manifest(
     return path
 
 
+def write_downsampled_rows(
+    train_df: pd.DataFrame,
+    task: TaskConfig,
+    downsampled_indices: np.ndarray,
+    output_dir: Path,
+) -> Path:
+    """Export the exact rows excluded by label-cap downsampling."""
+
+    columns = ["id", "Comment", task.label_column]
+    columns.extend(
+        column
+        for column in ("fold", "data_origin", "source_id", "source_group")
+        if column in train_df.columns
+    )
+    output = train_df.iloc[np.asarray(downsampled_indices, dtype=np.int64)][
+        columns
+    ].copy()
+    output["id"] = output["id"].astype(str)
+    output["exclusion_reason"] = "selection_label_cap"
+    output["excluded_from"] = "selection_train_and_final_retrain"
+    path = output_dir / "downsampled_rows.csv"
+    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
+    return path
+
+
+def _confusion_matrix_frame(confusion: dict) -> pd.DataFrame:
+    """Build a labeled actual-by-predicted confusion matrix."""
+
+    labels = list(confusion["label_order"])
+    values = np.asarray(confusion["values"], dtype=np.int64)
+    if values.shape != (len(labels), len(labels)):
+        raise ValueError("Confusion matrix shape does not match its label order.")
+    output = pd.DataFrame(values, columns=labels)
+    output.insert(0, "true_label", labels)
+    return output
+
+
+def write_validation_confusion_matrix(
+    confusion: dict,
+    epoch: int,
+    output_dir: Path,
+) -> Path:
+    """Write one human-readable confusion matrix for a validation epoch."""
+
+    matrix_dir = output_dir / "confusion_matrices"
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+    path = matrix_dir / f"validation_epoch_{epoch:02d}.csv"
+    _confusion_matrix_frame(confusion).to_csv(
+        path, index=False, encoding="utf-8", lineterminator="\n"
+    )
+    return path
+
+
+def write_validation_confusion_history(
+    selection_history: list[dict],
+    output_dir: Path,
+) -> Path:
+    """Write all completed validation matrices in one long-form CSV."""
+
+    rows = []
+    for record in selection_history:
+        confusion = record.get("confusion_matrix")
+        if confusion is None:
+            continue
+        labels = list(confusion["label_order"])
+        matrix = _confusion_matrix_frame(confusion).set_index("true_label")
+        for true_label in labels:
+            for predicted_label in labels:
+                rows.append(
+                    {
+                        "epoch": int(record["epoch"]),
+                        "true_label": true_label,
+                        "predicted_label": predicted_label,
+                        "count": int(matrix.loc[true_label, predicted_label]),
+                    }
+                )
+    output = pd.DataFrame(
+        rows,
+        columns=["epoch", "true_label", "predicted_label", "count"],
+    )
+    path = output_dir / "validation_confusion_matrices.csv"
+    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
+    return path
+
+
 def write_validation_predictions(
     validation_df: pd.DataFrame,
     task: TaskConfig,

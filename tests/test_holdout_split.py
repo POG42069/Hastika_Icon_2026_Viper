@@ -15,7 +15,10 @@ from src.training import (
     is_better_checkpoint,
     predefined_fold_indices,
     stratified_holdout_indices,
+    write_downsampled_rows,
     write_split_manifest,
+    write_validation_confusion_history,
+    write_validation_confusion_matrix,
     write_validation_predictions,
 )
 
@@ -152,9 +155,28 @@ class HoldoutSplitTests(unittest.TestCase):
                 validation_probabilities,
                 output_dir,
             )
+            downsampled_path = write_downsampled_rows(
+                frame,
+                TASK_A,
+                np.asarray([1], dtype=np.int64),
+                output_dir,
+            )
+            confusion = {
+                "label_order": list(TASK_A.labels),
+                "values": [[1, 1], [0, 2]],
+            }
+            confusion_path = write_validation_confusion_matrix(
+                confusion, 1, output_dir
+            )
+            confusion_history_path = write_validation_confusion_history(
+                [{"epoch": 1, "confusion_matrix": confusion}], output_dir
+            )
 
             manifest = pd.read_csv(manifest_path, dtype={"id": str})
             diagnostics = pd.read_csv(validation_path, dtype={"id": str})
+            downsampled = pd.read_csv(downsampled_path, dtype={"id": str})
+            confusion_table = pd.read_csv(confusion_path)
+            confusion_history = pd.read_csv(confusion_history_path)
             self.assertEqual(manifest["id"].tolist(), frame["id"].tolist())
             self.assertEqual(
                 manifest["split"].tolist(),
@@ -169,6 +191,24 @@ class HoldoutSplitTests(unittest.TestCase):
             self.assertEqual(
                 diagnostics["predicted_label"].tolist(), ["Non-Hate", "Hate"]
             )
+            self.assertEqual(downsampled["id"].tolist(), ["002"])
+            self.assertEqual(downsampled["Comment"].tolist(), ["b"])
+            self.assertEqual(downsampled["Label"].tolist(), ["Hate"])
+            self.assertEqual(
+                downsampled["excluded_from"].tolist(),
+                ["selection_train_and_final_retrain"],
+            )
+            self.assertEqual(
+                confusion_table.columns.tolist(),
+                ["true_label", "Non-Hate", "Hate"],
+            )
+            self.assertEqual(confusion_table["true_label"].tolist(), list(TASK_A.labels))
+            self.assertEqual(
+                confusion_table[["Non-Hate", "Hate"]].values.tolist(),
+                [[1, 1], [0, 2]],
+            )
+            self.assertEqual(len(confusion_history), len(TASK_A.labels) ** 2)
+            self.assertEqual(confusion_history["count"].sum(), 4)
 
 
 if __name__ == "__main__":

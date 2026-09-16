@@ -62,7 +62,10 @@ from src.training import (
     set_global_seed,
     stratified_holdout_indices,
     unwrap_model,
+    write_downsampled_rows,
     write_split_manifest,
+    write_validation_confusion_history,
+    write_validation_confusion_matrix,
     write_validation_predictions,
 )
 
@@ -502,6 +505,17 @@ def score_candidates(model, dataset, collator, config, runtime, description):
                 )
             },
         )
+        matrix = confusion_matrix(
+            labels,
+            predictions,
+            labels=list(range(n_labels)),
+        )
+        result["confusion_matrix"] = {
+            "rows": "actual labels",
+            "columns": "predicted labels",
+            "label_order": list(dataset.encoder.task.labels),
+            "values": matrix.astype(int).tolist(),
+        }
         if dataset.encoder.task.report_per_class_metrics:
             precision, recall, per_class_f1, support = (
                 precision_recall_fscore_support(
@@ -519,17 +533,6 @@ def score_candidates(model, dataset, collator, config, runtime, description):
                     "support": int(support[index]),
                 }
                 for index, label in enumerate(dataset.encoder.task.labels)
-            }
-            matrix = confusion_matrix(
-                labels,
-                predictions,
-                labels=list(range(n_labels)),
-            )
-            result["confusion_matrix"] = {
-                "rows": "actual labels",
-                "columns": "predicted labels",
-                "label_order": list(dataset.encoder.task.labels),
-                "values": matrix.astype(int).tolist(),
             }
     return result
 
@@ -743,6 +746,12 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 output_dir,
                 downsampled_indices,
             )
+            write_downsampled_rows(
+                frame,
+                task,
+                downsampled_indices,
+                output_dir,
+            )
 
         on_main(initialize_artifacts, runtime)
         log(
@@ -825,14 +834,43 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             }
             if "per_class" in metrics:
                 record["per_class"] = metrics["per_class"]
+            if "confusion_matrix" in metrics:
                 record["confusion_matrix"] = metrics["confusion_matrix"]
             selection_history.append(record)
+            epoch_confusion_path = (
+                output_dir
+                / "confusion_matrices"
+                / f"validation_epoch_{epoch:02d}.csv"
+            )
+            if "confusion_matrix" in metrics:
+                on_main(
+                    partial(
+                        write_validation_confusion_matrix,
+                        metrics["confusion_matrix"],
+                        epoch,
+                        output_dir,
+                    ),
+                    runtime,
+                )
+                on_main(
+                    partial(
+                        write_validation_confusion_history,
+                        selection_history,
+                        output_dir,
+                    ),
+                    runtime,
+                )
             log(
                 f"Selection epoch {epoch}: train_loss={train_loss:.5f}, "
                 f"val_loss={metrics['loss']:.5f}, macro_f1={metrics['macro_f1']:.5f}, "
                 f"accuracy={metrics['accuracy']:.5f}",
                 runtime,
             )
+            if "confusion_matrix" in metrics:
+                log(
+                    f"Validation confusion matrix CSV: {epoch_confusion_path}",
+                    runtime,
+                )
             log(
                 "Validation F1 by class: "
                 + " | ".join(
@@ -967,6 +1005,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             }
             if "per_class" in best_validation:
                 selection_summary["per_class"] = best_validation["per_class"]
+            if "confusion_matrix" in best_validation:
                 selection_summary["confusion_matrix"] = best_validation[
                     "confusion_matrix"
                 ]
@@ -1079,6 +1118,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"Retrained from scratch on all {len(full_train_data)} retained rows "
                 f"for {best_epoch} epoch(s).\n"
                 f"Predictions: {csv_path}\nSubmission: {zip_path}\n"
+                f"Downsampled rows: {output_dir / 'downsampled_rows.csv'}\n"
                 f"Final adapter: {final_adapter_dir}",
                 runtime,
             )
