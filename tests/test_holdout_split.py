@@ -16,6 +16,7 @@ from src.training import (
     predefined_fold_indices,
     stratified_holdout_indices,
     write_downsampled_rows,
+    write_seed_selection_results,
     write_split_manifest,
     write_validation_confusion_history,
     write_validation_confusion_matrix,
@@ -119,12 +120,17 @@ class HoldoutSplitTests(unittest.TestCase):
         repeated_retained, repeated_dropped, _ = cap_training_labels(
             indices, labels, (("Gender", 6),), seed=42
         )
+        other_retained, other_dropped, _ = cap_training_labels(
+            indices, labels, (("Gender", 6),), seed=43
+        )
 
         self.assertEqual((labels[retained] == "Gender").sum(), 6)
         self.assertEqual((labels[retained] == "Violence").sum(), 4)
         self.assertEqual(len(dropped), 4)
         self.assertTrue(np.array_equal(retained, repeated_retained))
         self.assertTrue(np.array_equal(dropped, repeated_dropped))
+        self.assertFalse(np.array_equal(retained, other_retained))
+        self.assertFalse(np.array_equal(dropped, other_dropped))
         self.assertEqual(summary[0]["available"], 10)
         self.assertEqual(summary[0]["retained"], 6)
 
@@ -171,12 +177,30 @@ class HoldoutSplitTests(unittest.TestCase):
             confusion_history_path = write_validation_confusion_history(
                 [{"epoch": 1, "confusion_matrix": confusion}], output_dir
             )
+            seed_results_path = write_seed_selection_results(
+                [
+                    {
+                        "seed": 42,
+                        "best_epoch": 3,
+                        "macro_f1": 0.61,
+                        "loss": 0.4,
+                        "accuracy": 0.7,
+                        "selection_train_rows": 100,
+                        "full_retrain_rows": 120,
+                        "downsampled_rows": 20,
+                        "checkpoint": "seed_42/best_holdout_adapter",
+                        "selected": True,
+                    }
+                ],
+                output_dir,
+            )
 
             manifest = pd.read_csv(manifest_path, dtype={"id": str})
             diagnostics = pd.read_csv(validation_path, dtype={"id": str})
             downsampled = pd.read_csv(downsampled_path, dtype={"id": str})
             confusion_table = pd.read_csv(confusion_path)
             confusion_history = pd.read_csv(confusion_history_path)
+            seed_results = pd.read_csv(seed_results_path)
             self.assertEqual(manifest["id"].tolist(), frame["id"].tolist())
             self.assertEqual(
                 manifest["split"].tolist(),
@@ -209,6 +233,8 @@ class HoldoutSplitTests(unittest.TestCase):
             )
             self.assertEqual(len(confusion_history), len(TASK_A.labels) ** 2)
             self.assertEqual(confusion_history["count"].sum(), 4)
+            self.assertEqual(seed_results["seed"].tolist(), [42])
+            self.assertEqual(seed_results["selected"].tolist(), [True])
 
 
 if __name__ == "__main__":

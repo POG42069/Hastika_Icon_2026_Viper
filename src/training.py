@@ -346,6 +346,27 @@ def write_validation_confusion_history(
     return path
 
 
+def write_seed_selection_results(results: list[dict], output_dir: Path) -> Path:
+    """Write the scalar holdout results used to choose the winning seed."""
+
+    columns = [
+        "seed",
+        "best_epoch",
+        "macro_f1",
+        "loss",
+        "accuracy",
+        "selection_train_rows",
+        "full_retrain_rows",
+        "downsampled_rows",
+        "checkpoint",
+        "selected",
+    ]
+    output = pd.DataFrame(results, columns=columns)
+    path = output_dir / "seed_selection_results.csv"
+    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
+    return path
+
+
 def write_validation_predictions(
     validation_df: pd.DataFrame,
     task: TaskConfig,

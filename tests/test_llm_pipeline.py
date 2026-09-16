@@ -385,7 +385,7 @@ class LLMTests(unittest.TestCase):
                 tempfile.TemporaryDirectory() as directory,
             ):
                 root = Path(directory)
-                task = llm_task(original_task)
+                task = replace(llm_task(original_task), selection_seeds=(42,))
                 if task.original_fold_filenames:
                     task = replace(
                         task, selection_train_label_caps=(("Gender", 4),)

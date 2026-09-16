@@ -67,6 +67,7 @@ from src.training import (
     write_validation_confusion_history,
     write_validation_confusion_matrix,
     write_validation_predictions,
+    write_seed_selection_results,
 )
 
 
@@ -643,17 +644,22 @@ def _training_state(model, loader, epochs, config, runtime):
 
 
 def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
-    """Select on a holdout, retrain fresh on all rows, then predict development."""
+    """Compare downsampling seeds, retrain the winner, then predict development."""
 
     validate_config(config)
+    selection_seeds = task.selection_seeds or (config.seed,)
+    if len(set(selection_seeds)) != len(selection_seeds):
+        raise ValueError("selection_seeds must not contain duplicates")
+    if any(seed < 0 for seed in selection_seeds):
+        raise ValueError("selection_seeds must contain non-negative integers")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     runtime = initialize_runtime()
     try:
         require_cuda(runtime)
         set_global_seed(config.seed)
         log(
-            f"\n{task.task_name} | LoRA {config.model_name} | "
-            f"rank={config.lora_rank} | world_size={runtime.world_size}",
+            f"\n{task.task_name} | LoRA {config.model_name} | rank={config.lora_rank} "
+            f"| world_size={runtime.world_size} | selection_seeds={selection_seeds}",
             runtime,
         )
         log(
@@ -667,13 +673,13 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             if data.empty:
                 raise ValueError(f"{name} input must contain at least one row.")
         if task.selection_validation_fold is None:
-            train_indices, val_indices = stratified_holdout_indices(
+            base_train_indices, val_indices = stratified_holdout_indices(
                 frame["label_id"].to_numpy(), config.validation_size, config.seed
             )
             split_strategy = "deterministic_stratified_holdout"
             split_heading = "80% train / 20% validation"
         else:
-            train_indices, val_indices = predefined_fold_indices(
+            base_train_indices, val_indices = predefined_fold_indices(
                 frame["fold"].to_numpy(),
                 task.selection_validation_fold,
                 frame["data_origin"].to_numpy(),
@@ -690,19 +696,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"fold {task.selection_validation_fold} "
                 f"{validation_origin_heading} validation"
             )
-        train_indices, downsampled_indices, downsampling_summary = cap_training_labels(
-            train_indices,
-            frame[task.label_column].to_numpy(),
-            task.selection_train_label_caps,
-            config.seed,
-        )
-        full_train_indices = np.setdiff1d(
-            np.arange(len(frame), dtype=np.int64),
-            downsampled_indices,
-            assume_unique=True,
-        )
-        train_frame, val_frame = frame.iloc[train_indices], frame.iloc[val_indices]
-        full_train_frame = frame.iloc[full_train_indices]
 
         tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
@@ -715,227 +708,393 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         encoder = ChatEncoder(tokenizer, task, config.max_length)
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
-        selection_train_data = CompletionDataset(
-            train_frame["text"].tolist(),
-            encoder,
-            train_frame["label_id"].tolist(),
-        )
+        val_frame = frame.iloc[val_indices]
         val_data = CompletionDataset(
             val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
-        )
-        full_train_data = CompletionDataset(
-            full_train_frame["text"].tolist(),
-            encoder,
-            full_train_frame["label_id"].tolist(),
         )
         prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
         collator = CompletionCollator(tokenizer.pad_token_id)
 
         output_dir = OUTPUT_ROOT / task.output_subdir
         checkpoint_dir = CHECKPOINT_ROOT / task.checkpoint_subdir
-        selection_adapter_dir = checkpoint_dir / "best_holdout_adapter"
         final_adapter_dir = checkpoint_dir / "final_full_data_adapter"
+        on_main(lambda: output_dir.mkdir(parents=True, exist_ok=True), runtime)
+        on_main(lambda: checkpoint_dir.mkdir(parents=True, exist_ok=True), runtime)
 
-        def initialize_artifacts():
-            output_dir.mkdir(parents=True, exist_ok=True)
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            write_split_manifest(
-                frame,
-                train_indices,
-                val_indices,
-                output_dir,
-                downsampled_indices,
+        seed_results = []
+        resolved_revision = None
+        parameter_counts = None
+        labels = frame[task.label_column].to_numpy()
+        for seed_number, selection_seed in enumerate(selection_seeds, start=1):
+            set_global_seed(selection_seed)
+            train_indices, downsampled_indices, downsampling_summary = (
+                cap_training_labels(
+                    base_train_indices,
+                    labels,
+                    task.selection_train_label_caps,
+                    selection_seed,
+                )
             )
-            write_downsampled_rows(
-                frame,
-                task,
+            full_train_indices = np.setdiff1d(
+                np.arange(len(frame), dtype=np.int64),
                 downsampled_indices,
-                output_dir,
+                assume_unique=True,
             )
+            train_frame = frame.iloc[train_indices]
+            selection_train_data = CompletionDataset(
+                train_frame["text"].tolist(),
+                encoder,
+                train_frame["label_id"].tolist(),
+            )
+            multiple_seeds = len(selection_seeds) > 1
+            seed_output_dir = (
+                output_dir / f"seed_{selection_seed}"
+                if multiple_seeds
+                else output_dir
+            )
+            seed_checkpoint_dir = (
+                checkpoint_dir / f"seed_{selection_seed}"
+                if multiple_seeds
+                else checkpoint_dir
+            )
+            selection_adapter_dir = seed_checkpoint_dir / "best_holdout_adapter"
 
-        on_main(initialize_artifacts, runtime)
-        log(
-            f"Selection split ({split_heading}): train={len(selection_train_data)}, "
-            f"validation={len(val_data)}; final retrain={len(full_train_data)}/"
-            f"{len(frame)} retained rows; "
-            f"development={len(prediction_data)}",
-            runtime,
-        )
-        for summary in downsampling_summary:
+            def initialize_seed_artifacts(
+                seed_output_dir=seed_output_dir,
+                seed_checkpoint_dir=seed_checkpoint_dir,
+                train_indices=train_indices,
+                downsampled_indices=downsampled_indices,
+            ):
+                seed_output_dir.mkdir(parents=True, exist_ok=True)
+                seed_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                write_split_manifest(
+                    frame,
+                    train_indices,
+                    val_indices,
+                    seed_output_dir,
+                    downsampled_indices,
+                )
+                write_downsampled_rows(
+                    frame, task, downsampled_indices, seed_output_dir
+                )
+
+            on_main(initialize_seed_artifacts, runtime)
             log(
-                f"Selection label cap: {summary['label']} available="
-                f"{summary['available']}, retained={summary['retained']}, "
-                f"dropped={summary['dropped']}, cap={summary['cap']}, "
-                f"seed={config.seed}. Dropped rows are also excluded from final retrain.",
+                f"\n=== PHASE 1/2 | SEED {seed_number}/{len(selection_seeds)} "
+                f"| seed={selection_seed} | HOLDOUT SELECTION ({split_heading}) ===",
                 runtime,
             )
-        log(
-            f"Lightly normalized text; truncated comments: selection_train="
-            f"{selection_train_data.truncated_count}, validation={val_data.truncated_count}, "
-            f"full_train={full_train_data.truncated_count}, development="
-            f"{prediction_data.truncated_count}",
-            runtime,
-        )
-
-        # Phase 1: update on the selection partition and select by holdout Macro-F1.
-        log(
-            f"\n=== PHASE 1/2 | HOLDOUT SELECTION ({split_heading}) ===",
-            runtime,
-        )
-        selection_loader, selection_sampler = create_train_loader(
-            selection_train_data, collator, config, runtime, config.seed
-        )
-        selection_model = load_lora_model(config, runtime)
-        base = selection_model.get_base_model()
-        resolved_revision = getattr(base.config, "_commit_hash", None)
-        parameter_counts = {
-            "trainable": sum(
-                parameter.numel()
-                for parameter in selection_model.parameters()
-                if parameter.requires_grad
-            ),
-            "reported_total": selection_model.num_parameters(),
-        }
-        del base
-        selection_model = _wrap_for_ddp(selection_model, runtime)
-        optimizer, scheduler, scaler = _training_state(
-            selection_model, selection_loader, config.max_epochs, config, runtime
-        )
-
-        best_metric, best_loss, best_epoch, stale = -math.inf, math.inf, 0, 0
-        selection_history = []
-        for epoch in range(1, config.max_epochs + 1):
-            if selection_sampler is not None:
-                selection_sampler.set_epoch(epoch)
-            train_loss = train_llm_epoch(
-                selection_model,
-                selection_loader,
-                optimizer,
-                scheduler,
-                scaler,
-                config,
+            log(
+                f"Selection train={len(selection_train_data)}, validation={len(val_data)}, "
+                f"final retrain candidate={len(full_train_indices)}/{len(frame)} rows.",
                 runtime,
-                epoch,
-                "Selection train",
             )
-            metrics = score_candidates(
+            for summary in downsampling_summary:
+                log(
+                    f"Selection label cap: {summary['label']} available="
+                    f"{summary['available']}, retained={summary['retained']}, "
+                    f"dropped={summary['dropped']}, cap={summary['cap']}, "
+                    f"seed={selection_seed}.",
+                    runtime,
+                )
+
+            selection_loader, selection_sampler = create_train_loader(
+                selection_train_data, collator, config, runtime, selection_seed
+            )
+            selection_model = load_lora_model(config, runtime)
+            if parameter_counts is None:
+                base = selection_model.get_base_model()
+                resolved_revision = getattr(base.config, "_commit_hash", None)
+                parameter_counts = {
+                    "trainable": sum(
+                        parameter.numel()
+                        for parameter in selection_model.parameters()
+                        if parameter.requires_grad
+                    ),
+                    "reported_total": selection_model.num_parameters(),
+                }
+                del base
+            selection_model = _wrap_for_ddp(selection_model, runtime)
+            optimizer, scheduler, scaler = _training_state(
+                selection_model, selection_loader, config.max_epochs, config, runtime
+            )
+            best_metric, best_loss, best_epoch, stale = -math.inf, math.inf, 0, 0
+            selection_history = []
+            for epoch in range(1, config.max_epochs + 1):
+                if selection_sampler is not None:
+                    selection_sampler.set_epoch(epoch)
+                train_loss = train_llm_epoch(
+                    selection_model,
+                    selection_loader,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    config,
+                    runtime,
+                    epoch,
+                    "Selection train",
+                )
+                metrics = score_candidates(
+                    selection_model,
+                    val_data,
+                    collator,
+                    config,
+                    runtime,
+                    f"Epoch {epoch} validation",
+                )
+                record = {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    **{
+                        key: metrics[key]
+                        for key in ("loss", "macro_f1", "accuracy")
+                    },
+                    "per_class_f1": metrics["per_class_f1"],
+                }
+                for key in ("per_class", "confusion_matrix"):
+                    if key in metrics:
+                        record[key] = metrics[key]
+                selection_history.append(record)
+                if "confusion_matrix" in metrics:
+                    on_main(
+                        partial(
+                            write_validation_confusion_matrix,
+                            metrics["confusion_matrix"],
+                            epoch,
+                            seed_output_dir,
+                        ),
+                        runtime,
+                    )
+                    on_main(
+                        partial(
+                            write_validation_confusion_history,
+                            selection_history,
+                            seed_output_dir,
+                        ),
+                        runtime,
+                    )
+                log(
+                    f"Seed {selection_seed} epoch {epoch}: train_loss={train_loss:.5f}, "
+                    f"val_loss={metrics['loss']:.5f}, macro_f1={metrics['macro_f1']:.5f}, "
+                    f"accuracy={metrics['accuracy']:.5f}",
+                    runtime,
+                )
+                log(
+                    "Validation F1 by class: "
+                    + " | ".join(
+                        f"{label}={metrics['per_class_f1'][label]:.5f}"
+                        for label in task.labels
+                    ),
+                    runtime,
+                )
+                for diagnostic_line in format_per_class_diagnostics(metrics):
+                    log(diagnostic_line, runtime)
+                if is_better_checkpoint(
+                    metrics["macro_f1"], metrics["loss"], best_metric, best_loss
+                ):
+                    best_metric, best_loss, best_epoch, stale = (
+                        metrics["macro_f1"],
+                        metrics["loss"],
+                        epoch,
+                        0,
+                    )
+                    on_main(
+                        partial(
+                            save_adapter,
+                            selection_model,
+                            tokenizer,
+                            selection_adapter_dir,
+                        ),
+                        runtime,
+                    )
+                else:
+                    stale += 1
+                on_main(
+                    lambda seed_output_dir=seed_output_dir,
+                    selection_history=selection_history: _write_json(
+                        seed_output_dir / "selection_training_history.json",
+                        {"seed": selection_seed, "epochs": selection_history},
+                    ),
+                    runtime,
+                )
+                if stale >= config.early_stopping_patience:
+                    log(
+                        f"Seed {selection_seed} early stopping at epoch {epoch}.",
+                        runtime,
+                    )
+                    break
+
+            del optimizer, scheduler, scaler
+            restore_adapter(selection_model, selection_adapter_dir)
+            best_validation = score_candidates(
                 selection_model,
                 val_data,
                 collator,
                 config,
                 runtime,
-                f"Epoch {epoch} validation",
+                "Best holdout adapter validation",
             )
-            record = {
-                "epoch": epoch,
-                "train_loss": train_loss,
-                **{key: metrics[key] for key in ("loss", "macro_f1", "accuracy")},
-                "per_class_f1": metrics["per_class_f1"],
+            public_summary = {
+                "seed": selection_seed,
+                "best_epoch": best_epoch,
+                "checkpoint": str(selection_adapter_dir),
+                **{
+                    key: best_validation[key]
+                    for key in ("macro_f1", "accuracy", "loss", "per_class_f1")
+                },
+                "selection_train_rows": len(selection_train_data),
+                "full_retrain_rows": len(full_train_indices),
+                "downsampled_rows": len(downsampled_indices),
+                "downsampling_summary": downsampling_summary,
             }
-            if "per_class" in metrics:
-                record["per_class"] = metrics["per_class"]
-            if "confusion_matrix" in metrics:
-                record["confusion_matrix"] = metrics["confusion_matrix"]
-            selection_history.append(record)
-            epoch_confusion_path = (
-                output_dir
-                / "confusion_matrices"
-                / f"validation_epoch_{epoch:02d}.csv"
-            )
-            if "confusion_matrix" in metrics:
-                on_main(
-                    partial(
-                        write_validation_confusion_matrix,
-                        metrics["confusion_matrix"],
-                        epoch,
-                        output_dir,
-                    ),
-                    runtime,
-                )
-                on_main(
-                    partial(
-                        write_validation_confusion_history,
-                        selection_history,
-                        output_dir,
-                    ),
-                    runtime,
-                )
-            log(
-                f"Selection epoch {epoch}: train_loss={train_loss:.5f}, "
-                f"val_loss={metrics['loss']:.5f}, macro_f1={metrics['macro_f1']:.5f}, "
-                f"accuracy={metrics['accuracy']:.5f}",
-                runtime,
-            )
-            if "confusion_matrix" in metrics:
-                log(
-                    f"Validation confusion matrix CSV: {epoch_confusion_path}",
-                    runtime,
-                )
-            log(
-                "Validation F1 by class: "
-                + " | ".join(
-                    f"{label}={metrics['per_class_f1'][label]:.5f}"
-                    for label in task.labels
-                ),
-                runtime,
-            )
-            for diagnostic_line in format_per_class_diagnostics(metrics):
-                log(diagnostic_line, runtime)
-            if is_better_checkpoint(
-                metrics["macro_f1"], metrics["loss"], best_metric, best_loss
+            for key in ("per_class", "confusion_matrix"):
+                if key in best_validation:
+                    public_summary[key] = best_validation[key]
+
+            def export_seed_artifacts(
+                seed_output_dir=seed_output_dir,
+                best_validation=best_validation,
+                public_summary=public_summary,
             ):
-                best_metric, best_loss, best_epoch, stale = (
-                    metrics["macro_f1"],
-                    metrics["loss"],
-                    epoch,
-                    0,
+                write_validation_predictions(
+                    val_frame,
+                    task,
+                    best_validation["probabilities"],
+                    seed_output_dir,
                 )
-                on_main(
-                    partial(
-                        save_adapter,
-                        selection_model,
-                        tokenizer,
-                        selection_adapter_dir,
-                    ),
-                    runtime,
-                )
-            else:
-                stale += 1
-            on_main(
-                lambda: _write_json(
-                    output_dir / "selection_training_history.json",
-                    {"epochs": selection_history},
-                ),
+                _write_json(seed_output_dir / "seed_summary.json", public_summary)
+
+            on_main(export_seed_artifacts, runtime)
+            seed_results.append(
+                {
+                    "summary": public_summary,
+                    "train_indices": train_indices,
+                    "downsampled_indices": downsampled_indices,
+                    "full_train_indices": full_train_indices,
+                    "train_frame": train_frame,
+                    "selection_train_truncated": selection_train_data.truncated_count,
+                    "selection_history": selection_history,
+                    "validation_probabilities": best_validation["probabilities"],
+                }
+            )
+            log(
+                f"Seed {selection_seed} completed: best Macro-F1="
+                f"{best_validation['macro_f1']:.5f} at epoch {best_epoch}.",
                 runtime,
             )
-            if stale >= config.early_stopping_patience:
-                log(f"Selection early stopping at epoch {epoch}.", runtime)
-                break
+            del selection_model, selection_loader, selection_train_data
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        del optimizer, scheduler, scaler
-        restore_adapter(selection_model, selection_adapter_dir)
-        best_validation = score_candidates(
-            selection_model,
-            val_data,
-            collator,
-            config,
-            runtime,
-            "Best holdout adapter validation",
+        winner = seed_results[0]
+        for candidate in seed_results[1:]:
+            candidate_summary = candidate["summary"]
+            winner_summary = winner["summary"]
+            if is_better_checkpoint(
+                candidate_summary["macro_f1"],
+                candidate_summary["loss"],
+                winner_summary["macro_f1"],
+                winner_summary["loss"],
+            ):
+                winner = candidate
+        selection_summary = winner["summary"]
+        winning_seed = selection_summary["seed"]
+        best_epoch = selection_summary["best_epoch"]
+        train_indices = winner["train_indices"]
+        downsampled_indices = winner["downsampled_indices"]
+        full_train_indices = winner["full_train_indices"]
+        train_frame = winner["train_frame"]
+        full_train_frame = frame.iloc[full_train_indices]
+        full_train_data = CompletionDataset(
+            full_train_frame["text"].tolist(),
+            encoder,
+            full_train_frame["label_id"].tolist(),
         )
-        del selection_model, selection_loader
-        gc.collect()
-        torch.cuda.empty_cache()
 
-        # Phase 2: replay the selected epoch count on every retained labeled row.
-        # Starting fresh ensures selection-train and holdout rows receive equal updates.
+        def export_winner_artifacts():
+            write_split_manifest(
+                frame, train_indices, val_indices, output_dir, downsampled_indices
+            )
+            write_downsampled_rows(frame, task, downsampled_indices, output_dir)
+            write_validation_predictions(
+                val_frame,
+                task,
+                winner["validation_probabilities"],
+                output_dir,
+            )
+            _write_json(
+                output_dir / "selection_training_history.json",
+                {
+                    "seed": winning_seed,
+                    "epochs": winner["selection_history"],
+                },
+            )
+            for record in winner["selection_history"]:
+                if "confusion_matrix" in record:
+                    write_validation_confusion_matrix(
+                        record["confusion_matrix"], record["epoch"], output_dir
+                    )
+            write_validation_confusion_history(
+                winner["selection_history"], output_dir
+            )
+            scalar_results = []
+            for result in seed_results:
+                summary = result["summary"]
+                scalar_results.append(
+                    {
+                        "seed": summary["seed"],
+                        "best_epoch": summary["best_epoch"],
+                        "macro_f1": summary["macro_f1"],
+                        "loss": summary["loss"],
+                        "accuracy": summary["accuracy"],
+                        "selection_train_rows": summary["selection_train_rows"],
+                        "full_retrain_rows": summary["full_retrain_rows"],
+                        "downsampled_rows": summary["downsampled_rows"],
+                        "checkpoint": summary["checkpoint"],
+                        "selected": summary["seed"] == winning_seed,
+                    }
+                )
+            write_seed_selection_results(scalar_results, output_dir)
+            macro_scores = [row["macro_f1"] for row in scalar_results]
+            _write_json(
+                output_dir / "seed_selection_summary.json",
+                {
+                    "selection_rule": "highest macro_f1; lowest loss breaks exact ties",
+                    "validation_is_fixed_across_seeds": True,
+                    "split_seed": config.seed,
+                    "winning_seed": winning_seed,
+                    "macro_f1_mean": float(np.mean(macro_scores)),
+                    "macro_f1_std": float(np.std(macro_scores)),
+                    "results": [result["summary"] for result in seed_results],
+                },
+            )
+
+        on_main(export_winner_artifacts, runtime)
         log(
-            f"\n=== PHASE 2/2 | FULL-DATA RETRAIN "
-            f"(all retained rows / {best_epoch} epoch(s)) ===",
+            "Seed comparison: "
+            + " | ".join(
+                f"seed={result['summary']['seed']} "
+                f"Macro-F1={result['summary']['macro_f1']:.5f} "
+                f"epoch={result['summary']['best_epoch']}"
+                for result in seed_results
+            ),
             runtime,
         )
-        set_global_seed(config.seed)
+        log(
+            f"\nWinning seed={winning_seed}, Macro-F1="
+            f"{selection_summary['macro_f1']:.5f}, best_epoch={best_epoch}.",
+            runtime,
+        )
+
+        # Replay only the winning seed and epoch count on every retained row.
+        log(
+            f"\n=== PHASE 2/2 | WINNING SEED {winning_seed} | FULL-DATA RETRAIN "
+            f"({len(full_train_data)} retained rows / {best_epoch} epoch(s)) ===",
+            runtime,
+        )
+        set_global_seed(winning_seed)
         full_loader, full_sampler = create_train_loader(
-            full_train_data, collator, config, runtime, config.seed
+            full_train_data, collator, config, runtime, winning_seed
         )
         final_model = _wrap_for_ddp(load_lora_model(config, runtime), runtime)
         optimizer, scheduler, scaler = _training_state(
@@ -964,7 +1123,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             on_main(
                 lambda: _write_json(
                     output_dir / "full_data_training_history.json",
-                    {"epochs": full_history},
+                    {"seed": winning_seed, "epochs": full_history},
                 ),
                 runtime,
             )
@@ -992,24 +1151,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 output_dir,
                 task.submission_zip_name,
             )
-            write_validation_predictions(
-                val_frame, task, best_validation["probabilities"], output_dir
-            )
-            selection_summary = {
-                "best_epoch": best_epoch,
-                "checkpoint": str(selection_adapter_dir),
-                **{
-                    key: best_validation[key]
-                    for key in ("macro_f1", "accuracy", "loss", "per_class_f1")
-                },
-            }
-            if "per_class" in best_validation:
-                selection_summary["per_class"] = best_validation["per_class"]
-            if "confusion_matrix" in best_validation:
-                selection_summary["confusion_matrix"] = best_validation[
-                    "confusion_matrix"
-                ]
             final_summary = {
+                "seed": winning_seed,
                 "epochs": best_epoch,
                 "training_rows": len(full_train_data),
                 "loaded_rows": len(frame),
@@ -1024,6 +1167,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 checkpoint_dir / "metrics.json",
                 {
                     "selection": selection_summary,
+                    "all_seed_results": [result["summary"] for result in seed_results],
                     "full_data_retrain": final_summary,
                 },
             )
@@ -1044,9 +1188,12 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "effective_train_batch_size": config.train_batch_size_per_gpu
                     * config.gradient_accumulation_steps
                     * runtime.world_size,
+                    "selection_seeds": list(selection_seeds),
+                    "winning_seed": winning_seed,
                     "selection_split": {
                         "strategy": split_strategy,
-                        "seed": config.seed,
+                        "split_seed": config.seed,
+                        "winning_downsampling_seed": winning_seed,
                         "configured_validation_size": config.validation_size
                         if task.selection_validation_fold is None
                         else None,
@@ -1055,17 +1202,19 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                             task.selection_validation_data_origins
                         ),
                         "actual_validation_fraction": len(val_data) / len(frame),
-                        "train_rows": len(selection_train_data),
+                        "train_rows": len(train_indices),
                         "validation_rows": len(val_data),
                         "selection_excluded_rows": len(frame)
-                        - len(selection_train_data)
+                        - len(train_indices)
                         - len(val_data),
                         "selection_downsampled_rows": len(downsampled_indices),
                         "selection_train_label_caps": {
                             summary["label"]: summary["cap"]
-                            for summary in downsampling_summary
+                            for summary in selection_summary["downsampling_summary"]
                         },
-                        "downsampling_summary": downsampling_summary,
+                        "downsampling_summary": selection_summary[
+                            "downsampling_summary"
+                        ],
                         "train_label_distribution": train_frame[task.label_column]
                         .value_counts()
                         .to_dict(),
@@ -1073,6 +1222,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         .value_counts()
                         .to_dict(),
                     },
+                    "seed_selection": [
+                        result["summary"] for result in seed_results
+                    ],
                     "best_checkpoint": selection_summary,
                     "full_data_retrain": final_summary,
                     "development_rows": len(prediction_data),
@@ -1090,13 +1242,17 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "probabilities": "softmax over allowed full-answer log likelihoods; not calibrated",
                     "loss": "mean per-example answer-token NLL; not class cross-entropy",
                     "truncated_comments": {
-                        "selection_train": selection_train_data.truncated_count,
+                        "winning_selection_train": winner[
+                            "selection_train_truncated"
+                        ],
                         "validation": val_data.truncated_count,
                         "full_train": full_train_data.truncated_count,
                         "development": prediction_data.truncated_count,
                     },
                     "input_sha256": {
-                        name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
+                        name: hashlib.sha256(
+                            resolve_data_file(name).read_bytes()
+                        ).hexdigest()
                         for name in (*task.labeled_filenames(), task.prediction_filename)
                     },
                     "packages": {
@@ -1113,12 +1269,14 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             )
             log(
                 f"\n=== COMPLETE | {task.task_name} ===\n"
-                f"Best validation Macro-F1: {best_validation['macro_f1']:.5f} "
+                f"Winning seed: {winning_seed}\n"
+                f"Best validation Macro-F1: {selection_summary['macro_f1']:.5f} "
                 f"at epoch {best_epoch}\n"
                 f"Retrained from scratch on all {len(full_train_data)} retained rows "
                 f"for {best_epoch} epoch(s).\n"
+                f"Seed comparison: {output_dir / 'seed_selection_results.csv'}\n"
                 f"Predictions: {csv_path}\nSubmission: {zip_path}\n"
-                f"Downsampled rows: {output_dir / 'downsampled_rows.csv'}\n"
+                f"Winning downsampled rows: {output_dir / 'downsampled_rows.csv'}\n"
                 f"Final adapter: {final_adapter_dir}",
                 runtime,
             )
