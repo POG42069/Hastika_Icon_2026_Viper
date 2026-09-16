@@ -30,6 +30,7 @@ from src.llm_training import (
     completion_token_diagnostics,
     completion_log_probs,
     compute_dtype,
+    format_per_class_diagnostics,
     require_cuda,
     restore_adapter,
     run_llm_task,
@@ -37,7 +38,7 @@ from src.llm_training import (
     score_candidates,
     train_llm_epoch,
 )
-from src.training import stratified_holdout_indices
+from src.training import cap_training_labels, stratified_holdout_indices
 
 
 class TestChatTokenizer:
@@ -295,6 +296,53 @@ class LLMTests(unittest.TestCase):
             scores["probabilities"], other["probabilities"], atol=1e-6
         )
         np.testing.assert_allclose(scores["probabilities"].sum(axis=1), np.ones(3))
+        self.assertEqual(list(scores["per_class"]), list(TASK_B.labels))
+        self.assertEqual(
+            [scores["per_class"][label]["support"] for label in TASK_B.labels],
+            [1, 1, 0, 0, 0, 1],
+        )
+        matrix = np.asarray(scores["confusion_matrix"]["values"])
+        self.assertEqual(matrix.shape, (len(TASK_B.labels), len(TASK_B.labels)))
+        self.assertEqual(matrix.sum(axis=1).tolist(), [1, 1, 0, 0, 0, 1])
+        diagnostic_lines = format_per_class_diagnostics(scores)
+        self.assertEqual(len(diagnostic_lines), len(TASK_B.labels) * 3)
+        self.assertTrue(
+            any(
+                "False positives into Others (actual label)" in line
+                for line in diagnostic_lines
+            )
+        )
+        self.assertTrue(
+            any(
+                "False negatives from Violence (predicted label)" in line
+                for line in diagnostic_lines
+            )
+        )
+        synthetic_matrix = np.zeros(
+            (len(TASK_B.labels), len(TASK_B.labels)), dtype=int
+        )
+        synthetic_matrix[0, 5] = 2  # Actual Gender predicted as Others.
+        synthetic_matrix[4, 5] = 3  # Actual Violence predicted as Others.
+        synthetic_metrics = {
+            "per_class": {
+                label: {"precision": 0.0, "recall": 0.0, "f1": 0.0, "support": 0}
+                for label in TASK_B.labels
+            },
+            "confusion_matrix": {
+                "label_order": list(TASK_B.labels),
+                "values": synthetic_matrix.tolist(),
+            },
+        }
+        synthetic_lines = format_per_class_diagnostics(synthetic_metrics)
+        self.assertIn(
+            "Gender=2, Political=0, Religion=0, Geo-political=0, Violence=3",
+            synthetic_lines[16],
+        )
+        self.assertIn("Others=3", synthetic_lines[14])
+        for class_metrics in scores["per_class"].values():
+            self.assertEqual(
+                set(class_metrics), {"precision", "recall", "f1", "support"}
+            )
         for name, parameter in model.named_parameters():
             self.assertTrue(torch.equal(before[name], parameter))
 
@@ -330,7 +378,7 @@ class LLMTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
             require_cuda(cpu_runtime())
 
-    def test_both_pipelines_select_then_retrain_100_percent_before_prediction(self):
+    def test_both_pipelines_select_then_retrain_retained_data_before_prediction(self):
         for original_task in (TASK_A, TASK_B):
             with (
                 self.subTest(task=original_task.task_name),
@@ -339,6 +387,9 @@ class LLMTests(unittest.TestCase):
                 root = Path(directory)
                 task = llm_task(original_task)
                 if task.original_fold_filenames:
+                    task = replace(
+                        task, selection_train_label_caps=(("Gender", 4),)
+                    )
                     fold_frames = []
                     for fold, (original_name, augment_name) in enumerate(
                         zip(
@@ -394,12 +445,21 @@ class LLMTests(unittest.TestCase):
                         if task.use_augmentation:
                             fold_frames.append(augment)
                     frame = pd.concat(fold_frames, ignore_index=True, sort=False)
-                    train = np.flatnonzero(
+                    raw_train = np.flatnonzero(
                         frame["fold"].to_numpy() != task.selection_validation_fold
                     )
                     val = np.flatnonzero(
                         (frame["fold"].to_numpy() == task.selection_validation_fold)
                         & (frame["data_origin"].to_numpy() == "original")
+                    )
+                    train, downsampled, _ = cap_training_labels(
+                        raw_train,
+                        frame[task.label_column].to_numpy(),
+                        task.selection_train_label_caps,
+                        seed=42,
+                    )
+                    full_train = np.setdiff1d(
+                        np.arange(len(frame)), downsampled, assume_unique=True
                     )
                 else:
                     # Sufficient examples for the deterministic stratified holdout.
@@ -415,6 +475,8 @@ class LLMTests(unittest.TestCase):
                     train, val = stratified_holdout_indices(
                         np.asarray(list(range(len(task.labels))) * 10), 0.2, 42
                     )
+                    downsampled = np.empty(0, dtype=np.int64)
+                    full_train = np.arange(len(frame), dtype=np.int64)
                 prediction_frame = pd.DataFrame(
                     {"id": ["0100", "0101", "0102"], "Comment": ["one", "two", "three"]}
                 )
@@ -496,10 +558,16 @@ class LLMTests(unittest.TestCase):
                 self.assertEqual(summary["quantization"], None)
                 self.assertEqual(summary["full_data_retrain"]["epochs"], 1)
                 self.assertEqual(
-                    summary["full_data_retrain"]["training_rows"], len(frame)
+                    summary["full_data_retrain"]["training_rows"], len(full_train)
+                )
+                self.assertEqual(
+                    summary["full_data_retrain"]["downsampled_rows_excluded"],
+                    len(downsampled),
                 )
                 self.assertEqual(len(loaded_models), 2)
-                self.assertEqual(train_sizes, [len(train), len(train), len(frame)])
+                self.assertEqual(
+                    train_sizes, [len(train), len(train), len(full_train)]
+                )
                 manifest = pd.read_csv(output / "split_manifest.csv", dtype={"id": str})
                 self.assertEqual(
                     manifest.loc[val, "split"].tolist(),
@@ -508,6 +576,10 @@ class LLMTests(unittest.TestCase):
                 self.assertEqual(
                     manifest.loc[train, "split"].tolist(),
                     ["selection_train"] * len(train),
+                )
+                self.assertEqual(
+                    manifest.loc[downsampled, "split"].tolist(),
+                    ["selection_downsampled"] * len(downsampled),
                 )
                 if task.original_fold_filenames and task.use_augmentation:
                     excluded = np.flatnonzero(

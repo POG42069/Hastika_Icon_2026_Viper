@@ -170,6 +170,54 @@ def predefined_fold_indices(
     )
 
 
+def cap_training_labels(
+    train_indices: np.ndarray,
+    labels: np.ndarray,
+    label_caps: tuple[tuple[str, int], ...],
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, int | str]]]:
+    """Deterministically cap selected labels and report the removed rows."""
+
+    retained = np.asarray(train_indices, dtype=np.int64)
+    label_values = np.asarray(labels)
+    if retained.size and retained.max() >= len(label_values):
+        raise ValueError("A training index is outside the label array.")
+    if len({label for label, _ in label_caps}) != len(label_caps):
+        raise ValueError("Each selection label cap must be configured only once.")
+
+    generator = np.random.default_rng(seed)
+    dropped_parts = []
+    summaries = []
+    for label, cap in label_caps:
+        if cap < 1:
+            raise ValueError(f"The selection cap for {label!r} must be positive.")
+        matching = retained[label_values[retained] == label]
+        available = len(matching)
+        if available > cap:
+            selected = np.sort(generator.choice(matching, cap, replace=False))
+            dropped = np.setdiff1d(matching, selected, assume_unique=True)
+            retained = np.setdiff1d(retained, dropped, assume_unique=True)
+            dropped_parts.append(dropped)
+        else:
+            dropped = np.empty(0, dtype=np.int64)
+        summaries.append(
+            {
+                "label": label,
+                "available": available,
+                "retained": min(available, cap),
+                "dropped": len(dropped),
+                "cap": cap,
+            }
+        )
+
+    dropped_indices = (
+        np.sort(np.concatenate(dropped_parts))
+        if dropped_parts
+        else np.empty(0, dtype=np.int64)
+    )
+    return np.sort(retained), dropped_indices, summaries
+
+
 def is_better_checkpoint(
     current_metric: float,
     current_loss: float,
@@ -191,10 +239,13 @@ def write_split_manifest(
     train_indices: np.ndarray,
     validation_indices: np.ndarray,
     output_dir: Path,
+    downsampled_indices: np.ndarray | None = None,
 ) -> Path:
     """Record the exact holdout used only for epoch/checkpoint selection."""
 
     assignments = np.full(len(train_df), "selection_excluded", dtype=object)
+    if downsampled_indices is not None:
+        assignments[downsampled_indices] = "selection_downsampled"
     assignments[train_indices] = "selection_train"
     assignments[validation_indices] = "selection_validation"
     data = {

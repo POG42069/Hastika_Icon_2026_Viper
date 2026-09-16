@@ -14,15 +14,17 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Task A chia stratified 80% train và 20% validation với seed 42. Task B đang
-   chạy baseline không augmentation: `original_1..4` để train và `original_5`
-   để validation.
+1. Task A chia stratified 80% train và 20% validation với seed 42. Task B dùng
+   `original_1..4 + augment1..4` để train và `original_5` để validation. Trong
+   selection-train, Gender được lấy mẫu cố định bằng seed 42 từ 1.089 xuống
+   670 câu; 419 câu bị bỏ cũng không quay lại ở giai đoạn retrain cuối.
 2. Train LoRA trên selection-train, tính Macro-F1 trên holdout sau mỗi epoch
    và lưu adapter tốt nhất. Nếu Macro-F1 hòa, validation loss thấp hơn thắng;
    nếu vẫn hòa, giữ epoch sớm hơn.
 3. Lấy `best_epoch` vừa chọn, khởi tạo lại backbone và LoRA từ đầu, rồi train
-   đúng số epoch đó trên 100% dữ liệu có nhãn. Với Task B baseline, 100% chỉ
-   gồm `original_1..5`. Không dùng validation và không early-stop ở giai đoạn
+   đúng số epoch đó trên toàn bộ dữ liệu được giữ lại. Task A dùng toàn bộ dữ
+   liệu gốc. Task B dùng cả `original_1..5 + augment1..5`, ngoại trừ 419 câu
+   Gender đã bỏ từ fold 1-4. Không validation hoặc early stopping ở giai đoạn
    này.
 4. Dùng adapter retrain 100% để dự đoán development inputs và tạo
    `predictions.csv` cùng file ZIP nộp CodaBench.
@@ -55,8 +57,8 @@ Cấu hình mặc định trong `llm_config.py`:
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
-| Max epochs để chọn | 8 |
-| Early-stopping patience | 3 |
+| Max epochs để chọn | 5 |
+| Early-stopping patience | 2 |
 | Max chat length | 256 |
 | Learning rate | `1e-4` |
 | Batch/GPU | 1 |
@@ -149,6 +151,10 @@ chọn nhãn có điểm lớn nhất; không sinh văn bản tự do và không
 Tiến trình train, validation và prediction được ghi thành dòng cố định mỗi 10%
 với số batch/candidate, elapsed time, ETA, tốc độ và mean loss khi train. Cách
 này tránh progress bar động bị Kaggle nối thành một khối log dài khó đọc.
+Sau mỗi epoch của Task B, log còn ghi precision, recall, F1 và support của từng
+nhãn, kèm số lỗi theo cả hai chiều: các nhãn thật bị dự đoán nhầm vào nhãn đang
+xét và các mẫu thật của nhãn đang xét bị dự đoán sang từng nhãn khác. Ma trận
+nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện và metrics JSON.
 
 ## Artifacts
 
