@@ -14,17 +14,19 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Task A chia stratified 80% train và 20% validation với seed 42. Task B đang
-   chạy baseline không augmentation: `original_1..4` để train và `original_5`
-   để validation.
+1. Task A chia stratified 80% train và 20% validation với seed 42. Task B dùng
+   `original_1..4 + augment1..4` để train và `original_5` để validation.
+   Trước khi train, Task B loại theo ID 253 hàng Gender đã được gắn cờ là ngắn,
+   thiếu ngữ cảnh hoặc chồng lấn từ vựng với Others/Violence. Danh sách ID nằm
+   trong `config/task_b_ambiguous_gender_ids.txt`; các CSV gốc không bị sửa.
 2. Train LoRA trên selection-train, tính Macro-F1 trên holdout sau mỗi epoch
    và lưu adapter tốt nhất. Nếu Macro-F1 hòa, validation loss thấp hơn thắng;
    nếu vẫn hòa, giữ epoch sớm hơn.
 3. Lấy `best_epoch` vừa chọn, khởi tạo lại backbone và LoRA từ đầu, rồi train
-   đúng số epoch đó trên 100% dữ liệu có nhãn. Với Task B baseline, 100% chỉ
-   gồm `original_1..5`. Không dùng validation và không early-stop ở giai đoạn
-   này.
-4. Dùng adapter retrain 100% để dự đoán development inputs và tạo
+   đúng số epoch đó trên toàn bộ dữ liệu được giữ lại. Task B dùng
+   `original_1..5 + augment1..5`, ngoại trừ đúng 253 hàng Gender trong danh
+   sách cấu hình. Không dùng validation và không early-stop ở giai đoạn này.
+4. Dùng adapter retrain để dự đoán development inputs và tạo
    `predictions.csv` cùng file ZIP nộp CodaBench.
 
 Việc khởi tạo lại ở bước 3 giúp tất cả mẫu được học số epoch như nhau. Nếu
@@ -55,8 +57,8 @@ Cấu hình mặc định trong `llm_config.py`:
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
-| Max epochs để chọn | 8 |
-| Early-stopping patience | 3 |
+| Max epochs để chọn | 5 |
+| Early-stopping patience | 2 |
 | Max chat length | 256 |
 | Learning rate | `1e-4` |
 | Batch/GPU | 1 |
@@ -169,6 +171,8 @@ outputs/task_a_lora/run_summary.json
 
 `validation_predictions.csv` được tạo bằng best holdout adapter để phân tích.
 `predictions.csv` và ZIP luôn được tạo bằng `final_full_data_adapter`.
+Task B còn tạo `excluded_training_rows.csv` để ghi lại đúng các dòng bị loại
+trong code; file này chỉ là artifact kiểm toán và không thay đổi dữ liệu nguồn.
 
 ## Kiểm thử
 

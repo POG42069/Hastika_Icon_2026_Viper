@@ -365,12 +365,25 @@ class LLMTests(unittest.TestCase):
                         if task.use_augmentation:
                             fold_frames.append(augment)
                     frame = pd.concat(fold_frames, ignore_index=True, sort=False)
-                    train = np.flatnonzero(
+                    task = replace(
+                        task,
+                        excluded_training_ids=("original-1-0", "original-5-0"),
+                        excluded_training_label="Gender",
+                        training_exclusion_reason="test exclusion",
+                    )
+                    configured_excluded = np.flatnonzero(
+                        frame["id"].isin(task.excluded_training_ids).to_numpy()
+                    )
+                    base_train = np.flatnonzero(
                         frame["fold"].to_numpy() != task.selection_validation_fold
                     )
+                    train = np.setdiff1d(base_train, configured_excluded)
                     val = np.flatnonzero(
                         (frame["fold"].to_numpy() == task.selection_validation_fold)
                         & (frame["data_origin"].to_numpy() == "original")
+                    )
+                    full_train = np.setdiff1d(
+                        np.arange(len(frame)), configured_excluded
                     )
                 else:
                     # Sufficient examples for the deterministic stratified holdout.
@@ -386,6 +399,8 @@ class LLMTests(unittest.TestCase):
                     train, val = stratified_holdout_indices(
                         np.asarray(list(range(len(task.labels))) * 10), 0.2, 42
                     )
+                    configured_excluded = np.empty(0, dtype=np.int64)
+                    full_train = np.arange(len(frame))
                 prediction_frame = pd.DataFrame(
                     {"id": ["0100", "0101", "0102"], "Comment": ["one", "two", "three"]}
                 )
@@ -467,10 +482,16 @@ class LLMTests(unittest.TestCase):
                 self.assertEqual(summary["quantization"], None)
                 self.assertEqual(summary["full_data_retrain"]["epochs"], 1)
                 self.assertEqual(
-                    summary["full_data_retrain"]["training_rows"], len(frame)
+                    summary["full_data_retrain"]["training_rows"], len(full_train)
+                )
+                self.assertEqual(
+                    summary["full_data_retrain"]["excluded_rows"],
+                    len(configured_excluded),
                 )
                 self.assertEqual(len(loaded_models), 2)
-                self.assertEqual(train_sizes, [len(train), len(train), len(frame)])
+                self.assertEqual(
+                    train_sizes, [len(train), len(train), len(full_train)]
+                )
                 manifest = pd.read_csv(output / "split_manifest.csv", dtype={"id": str})
                 self.assertEqual(
                     manifest.loc[val, "split"].tolist(),
@@ -479,6 +500,18 @@ class LLMTests(unittest.TestCase):
                 self.assertEqual(
                     manifest.loc[train, "split"].tolist(),
                     ["selection_train"] * len(train),
+                )
+                self.assertEqual(
+                    manifest.loc[
+                        configured_excluded, "excluded_from_full_retrain"
+                    ].tolist(),
+                    [True] * len(configured_excluded),
+                )
+                excluded_rows = pd.read_csv(
+                    output / "excluded_training_rows.csv", dtype={"id": str}
+                )
+                self.assertEqual(
+                    set(excluded_rows["id"]), set(task.excluded_training_ids)
                 )
                 if task.original_fold_filenames and task.use_augmentation:
                     excluded = np.flatnonzero(

@@ -11,6 +11,7 @@ import pandas as pd
 
 from llm_config import TASK_A
 from src.training import (
+    exclude_configured_training_rows,
     is_better_checkpoint,
     predefined_fold_indices,
     stratified_holdout_indices,
@@ -105,6 +106,41 @@ class HoldoutSplitTests(unittest.TestCase):
         self.assertTrue(is_better_checkpoint(0.6, 0.3, 0.6, 0.4))
         self.assertFalse(is_better_checkpoint(0.6, 0.4, 0.6, 0.4))
         self.assertFalse(is_better_checkpoint(0.5, 0.1, 0.6, 0.4))
+
+    def test_configured_ids_are_excluded_deterministically(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "id": ["001", "002", "003", "004"],
+                "Hate Category": ["Gender", "Gender", "Others", "Gender"],
+                "data_origin": ["original"] * 4,
+            }
+        )
+        retained, excluded = exclude_configured_training_rows(
+            frame,
+            np.asarray([0, 1, 2], dtype=np.int64),
+            ("002", "004"),
+            "Hate Category",
+            "Gender",
+        )
+        self.assertEqual(retained.tolist(), [0, 2])
+        self.assertEqual(excluded.tolist(), [1, 3])
+
+        with self.assertRaisesRegex(ValueError, "were not found"):
+            exclude_configured_training_rows(
+                frame,
+                np.asarray([0, 1, 2], dtype=np.int64),
+                ("missing",),
+                "Hate Category",
+                "Gender",
+            )
+        with self.assertRaisesRegex(ValueError, "must all have label"):
+            exclude_configured_training_rows(
+                frame,
+                np.asarray([0, 1, 2], dtype=np.int64),
+                ("003",),
+                "Hate Category",
+                "Gender",
+            )
 
     def test_holdout_diagnostic_artifacts(self) -> None:
         """Manifest and validation diagnostics must preserve IDs and labels."""

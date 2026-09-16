@@ -50,12 +50,14 @@ from src.submission import write_submission
 from src.training import (
     build_optimizer,
     create_train_loader,
+    exclude_configured_training_rows,
     is_better_checkpoint,
     log,
     predefined_fold_indices,
     set_global_seed,
     stratified_holdout_indices,
     unwrap_model,
+    write_excluded_training_rows,
     write_split_manifest,
     write_validation_predictions,
 )
@@ -518,7 +520,21 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"fold {task.selection_validation_fold} "
                 f"{validation_origin_heading} validation"
             )
+        selection_candidate_indices = train_indices
+        train_indices, excluded_indices = exclude_configured_training_rows(
+            frame,
+            train_indices,
+            task.excluded_training_ids,
+            task.label_column,
+            task.excluded_training_label,
+        )
+        full_train_indices = np.setdiff1d(
+            np.arange(len(frame), dtype=np.int64),
+            excluded_indices,
+            assume_unique=True,
+        )
         train_frame, val_frame = frame.iloc[train_indices], frame.iloc[val_indices]
+        full_train_frame = frame.iloc[full_train_indices]
 
         tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
@@ -538,7 +554,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
         )
         full_train_data = CompletionDataset(
-            frame["text"].tolist(), encoder, frame["label_id"].tolist()
+            full_train_frame["text"].tolist(),
+            encoder,
+            full_train_frame["label_id"].tolist(),
         )
         prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
         collator = CompletionCollator(tokenizer.pad_token_id)
@@ -551,15 +569,36 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         def initialize_artifacts():
             output_dir.mkdir(parents=True, exist_ok=True)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            write_split_manifest(frame, train_indices, val_indices, output_dir)
+            write_split_manifest(
+                frame,
+                train_indices,
+                val_indices,
+                output_dir,
+                excluded_indices,
+            )
+            write_excluded_training_rows(
+                frame, task, excluded_indices, output_dir
+            )
 
         on_main(initialize_artifacts, runtime)
         log(
             f"Selection split ({split_heading}): train={len(selection_train_data)}, "
-            f"validation={len(val_data)}; final retrain={len(full_train_data)} (100%); "
+            f"validation={len(val_data)}; final retrain={len(full_train_data)}/"
+            f"{len(frame)} retained rows; "
             f"development={len(prediction_data)}",
             runtime,
         )
+        if len(excluded_indices):
+            excluded_from_selection = len(
+                np.intersect1d(excluded_indices, selection_candidate_indices)
+            )
+            log(
+                f"Configured exclusions: {len(excluded_indices)} original "
+                f"{task.excluded_training_label} rows are omitted from full retraining; "
+                f"{excluded_from_selection} of them are also omitted from selection "
+                f"training; reason={task.training_exclusion_reason!r}.",
+                runtime,
+            )
         log(
             f"Lightly normalized text; truncated comments: selection_train="
             f"{selection_train_data.truncated_count}, validation={val_data.truncated_count}, "
@@ -678,7 +717,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         # Starting fresh ensures selection-train and holdout rows receive equal updates.
         log(
             f"\n=== PHASE 2/2 | FULL-DATA RETRAIN "
-            f"(100% train / {best_epoch} epoch(s)) ===",
+            f"({len(full_train_data)} retained rows / {best_epoch} epoch(s)) ===",
             runtime,
         )
         set_global_seed(config.seed)
@@ -754,6 +793,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             final_summary = {
                 "epochs": best_epoch,
                 "training_rows": len(full_train_data),
+                "source_rows": len(frame),
+                "excluded_rows": len(excluded_indices),
                 "checkpoint": str(final_adapter_dir),
                 "prediction_source": "final_full_data_adapter",
             }
@@ -792,12 +833,21 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                             task.selection_validation_data_origins
                         ),
                         "actual_validation_fraction": len(val_data)
-                        / len(full_train_data),
+                        / len(frame),
                         "train_rows": len(selection_train_data),
                         "validation_rows": len(val_data),
-                        "selection_excluded_rows": len(full_train_data)
+                        "selection_excluded_rows": len(frame)
                         - len(selection_train_data)
                         - len(val_data),
+                        "configured_excluded_rows": len(excluded_indices),
+                        "configured_excluded_from_selection": len(
+                            np.intersect1d(
+                                excluded_indices, selection_candidate_indices
+                            )
+                        ),
+                        "configured_excluded_ids": list(task.excluded_training_ids),
+                        "configured_excluded_label": task.excluded_training_label,
+                        "configured_exclusion_reason": task.training_exclusion_reason,
                         "train_label_distribution": train_frame[task.label_column]
                         .value_counts()
                         .to_dict(),
@@ -842,7 +892,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"\n=== COMPLETE | {task.task_name} ===\n"
                 f"Best validation Macro-F1: {best_validation['macro_f1']:.5f} "
                 f"at epoch {best_epoch}\n"
-                f"Retrained from scratch on 100% data for {best_epoch} epoch(s).\n"
+                f"Retrained from scratch on {len(full_train_data)}/{len(frame)} "
+                f"retained rows for {best_epoch} epoch(s).\n"
+                f"Excluded rows: {output_dir / 'excluded_training_rows.csv'}\n"
                 f"Predictions: {csv_path}\nSubmission: {zip_path}\n"
                 f"Final adapter: {final_adapter_dir}",
                 runtime,

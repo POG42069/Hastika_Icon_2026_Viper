@@ -170,6 +170,67 @@ def predefined_fold_indices(
     )
 
 
+def exclude_configured_training_rows(
+    frame: pd.DataFrame,
+    selection_train_indices: np.ndarray,
+    excluded_ids: tuple[str, ...],
+    label_column: str,
+    expected_label: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Exclude configured IDs from selection training and full retraining.
+
+    Validation indices are intentionally managed separately by the caller, so
+    a configured row in the holdout remains available for model selection but
+    is still omitted from the later full-data retraining phase.
+    """
+
+    train_indices = np.asarray(selection_train_indices, dtype=np.int64)
+    if not excluded_ids:
+        return np.sort(train_indices), np.empty(0, dtype=np.int64)
+    if len(set(excluded_ids)) != len(excluded_ids):
+        raise ValueError("excluded_training_ids must be unique")
+
+    ids = frame["id"].astype(str)
+    duplicate_ids = ids[ids.duplicated(False)].unique().tolist()
+    if duplicate_ids:
+        raise ValueError(
+            "Cannot apply an ID exclusion when labeled IDs are duplicated: "
+            f"{duplicate_ids[:10]}"
+        )
+    index_by_id = pd.Series(np.arange(len(frame), dtype=np.int64), index=ids)
+    missing = sorted(set(excluded_ids) - set(index_by_id.index))
+    if missing:
+        raise ValueError(
+            "Configured training exclusions were not found in the labeled data: "
+            f"{missing[:10]}"
+        )
+
+    excluded_indices = np.sort(index_by_id.loc[list(excluded_ids)].to_numpy())
+    excluded_rows = frame.iloc[excluded_indices]
+    if expected_label is not None:
+        wrong_label = excluded_rows[label_column].ne(expected_label)
+        if wrong_label.any():
+            bad_ids = excluded_rows.loc[wrong_label, "id"].astype(str).head(10).tolist()
+            raise ValueError(
+                f"Configured exclusions must all have label {expected_label!r}: {bad_ids}"
+            )
+    if "data_origin" in excluded_rows.columns:
+        wrong_origin = excluded_rows["data_origin"].ne("original")
+        if wrong_origin.any():
+            bad_ids = (
+                excluded_rows.loc[wrong_origin, "id"].astype(str).head(10).tolist()
+            )
+            raise ValueError(
+                "Configured exclusions must refer only to original rows: "
+                f"{bad_ids}"
+            )
+
+    retained_train_indices = np.setdiff1d(
+        train_indices, excluded_indices, assume_unique=True
+    )
+    return retained_train_indices, excluded_indices
+
+
 def is_better_checkpoint(
     current_metric: float,
     current_loss: float,
@@ -191,6 +252,7 @@ def write_split_manifest(
     train_indices: np.ndarray,
     validation_indices: np.ndarray,
     output_dir: Path,
+    excluded_indices: np.ndarray | None = None,
 ) -> Path:
     """Record the exact holdout used only for epoch/checkpoint selection."""
 
@@ -201,11 +263,34 @@ def write_split_manifest(
         "id": train_df["id"].astype(str).tolist(),
         "split": assignments.tolist(),
     }
+    if excluded_indices is not None:
+        excluded_mask = np.zeros(len(train_df), dtype=bool)
+        excluded_mask[np.asarray(excluded_indices, dtype=np.int64)] = True
+        data["excluded_from_full_retrain"] = excluded_mask.tolist()
     for column in ("fold", "data_origin", "source_id", "source_group"):
         if column in train_df.columns:
             data[column] = train_df[column].tolist()
     output = pd.DataFrame(data)
     path = output_dir / "split_manifest.csv"
+    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
+    return path
+
+
+def write_excluded_training_rows(
+    train_df: pd.DataFrame,
+    task: TaskConfig,
+    excluded_indices: np.ndarray,
+    output_dir: Path,
+) -> Path:
+    """Export the exact original rows omitted without modifying source CSVs."""
+
+    columns = ["id", "Comment", task.label_column]
+    for column in ("fold", "data_origin"):
+        if column in train_df.columns:
+            columns.append(column)
+    output = train_df.iloc[np.asarray(excluded_indices, dtype=np.int64)][columns].copy()
+    output["exclusion_reason"] = task.training_exclusion_reason or "configured ID filter"
+    path = output_dir / "excluded_training_rows.csv"
     output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
     return path
 

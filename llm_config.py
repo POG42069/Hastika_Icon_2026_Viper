@@ -15,6 +15,22 @@ CHECKPOINT_ROOT = Path(
 OUTPUT_ROOT = Path(os.getenv("HASTIKA_OUTPUT_DIR", str(PROJECT_ROOT / "outputs")))
 
 
+def _load_id_filter(filename: str) -> tuple[str, ...]:
+    """Load a tracked, comment-friendly list of row IDs."""
+
+    path = PROJECT_ROOT / "config" / filename
+    values = tuple(
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    if not values:
+        raise ValueError(f"Configured ID filter is empty: {path}")
+    if len(set(values)) != len(values):
+        raise ValueError(f"Configured ID filter contains duplicate IDs: {path}")
+    return values
+
+
 @dataclass(frozen=True)
 class TaskConfig:
     """Task-specific input names, labels and artifact directories."""
@@ -32,6 +48,9 @@ class TaskConfig:
     use_augmentation: bool = True
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
+    excluded_training_ids: tuple[str, ...] = ()
+    excluded_training_label: str | None = None
+    training_exclusion_reason: str | None = None
 
     def labeled_filenames(self) -> tuple[str, ...]:
         """Return every labeled CSV used by this task."""
@@ -112,6 +131,9 @@ TASK_B = TaskConfig(
     use_augmentation=True,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
+    excluded_training_ids=_load_id_filter("task_b_ambiguous_gender_ids.txt"),
+    excluded_training_label="Gender",
+    training_exclusion_reason="ambiguous Gender overlap with Others/Violence",
 )
 
 
