@@ -148,21 +148,21 @@ class LLMTests(unittest.TestCase):
             encoder = ChatEncoder(self.tokenizer, task, 512)
             prompt, truncated = encoder.encode_prompt("long comment " * 300)
             self.assertTrue(truncated)
-            for label_id, label in enumerate(task.labels):
+            for label_id, code in enumerate(task.label_codes):
                 feature = encoder.feature(prompt, label_id)
                 self.assertLessEqual(len(feature["input_ids"]), 512)
                 self.assertEqual(feature["labels"][: len(prompt)], [-100] * len(prompt))
                 self.assertEqual(
-                    feature["labels"][len(prompt) :], self.tokenizer.encode(label) + [2]
+                    feature["labels"][len(prompt) :], self.tokenizer.encode(code) + [2]
                 )
                 self.assertEqual(feature["input_ids"][: len(prompt)], prompt)
 
     def test_encoding_matches_full_training_chat(self):
         prompt, _ = self.encoder.encode_prompt("hello")
-        for label_id, label in enumerate(TASK_A.labels):
+        for label_id, code in enumerate(TASK_A.label_codes):
             expected = self.tokenizer.apply_chat_template(
                 self.encoder.messages("hello")
-                + [{"role": "assistant", "content": label}]
+                + [{"role": "assistant", "content": code}]
             )
             self.assertEqual(
                 self.encoder.feature(prompt, label_id)["input_ids"], expected
