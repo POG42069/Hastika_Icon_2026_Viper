@@ -33,6 +33,7 @@ class TaskConfig:
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
+    selection_seeds: tuple[int, ...] = ()
     report_per_class_metrics: bool = False
 
     def labeled_filenames(self) -> tuple[str, ...]:
