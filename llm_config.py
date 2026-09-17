@@ -32,6 +32,9 @@ class TaskConfig:
     use_augmentation: bool = True
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
+    selection_train_label_caps: tuple[tuple[str, int], ...] = ()
+    selection_seeds: tuple[int, ...] = ()
+    report_per_class_metrics: bool = False
 
     def labeled_filenames(self) -> tuple[str, ...]:
         """Return every labeled CSV used by this task."""
@@ -61,10 +64,10 @@ class LLMTrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
-    train_batch_size_per_gpu: int = 1
+    train_batch_size_per_gpu: int = 4
     # Number of candidate completions per forward, NOT number of comments.
     eval_batch_size_per_gpu: int = 2
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 2
     max_grad_norm: float = 1.0
     early_stopping_patience: int = 2
     lora_rank: int = 32
@@ -112,6 +115,9 @@ TASK_B = TaskConfig(
     use_augmentation=True,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
+    selection_train_label_caps=(("Gender", 870),),
+    selection_seeds=(42, 52, 62, 72, 82),
+    report_per_class_metrics=True,
 )
 
 

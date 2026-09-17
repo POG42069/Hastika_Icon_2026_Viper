@@ -170,6 +170,54 @@ def predefined_fold_indices(
     )
 
 
+def cap_training_labels(
+    train_indices: np.ndarray,
+    labels: np.ndarray,
+    label_caps: tuple[tuple[str, int], ...],
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, int | str]]]:
+    """Deterministically cap selected labels and report the removed rows."""
+
+    retained = np.asarray(train_indices, dtype=np.int64)
+    label_values = np.asarray(labels)
+    if retained.size and retained.max() >= len(label_values):
+        raise ValueError("A training index is outside the label array.")
+    if len({label for label, _ in label_caps}) != len(label_caps):
+        raise ValueError("Each selection label cap must be configured only once.")
+
+    generator = np.random.default_rng(seed)
+    dropped_parts = []
+    summaries = []
+    for label, cap in label_caps:
+        if cap < 1:
+            raise ValueError(f"The selection cap for {label!r} must be positive.")
+        matching = retained[label_values[retained] == label]
+        available = len(matching)
+        if available > cap:
+            selected = np.sort(generator.choice(matching, cap, replace=False))
+            dropped = np.setdiff1d(matching, selected, assume_unique=True)
+            retained = np.setdiff1d(retained, dropped, assume_unique=True)
+            dropped_parts.append(dropped)
+        else:
+            dropped = np.empty(0, dtype=np.int64)
+        summaries.append(
+            {
+                "label": label,
+                "available": available,
+                "retained": min(available, cap),
+                "dropped": len(dropped),
+                "cap": cap,
+            }
+        )
+
+    dropped_indices = (
+        np.sort(np.concatenate(dropped_parts))
+        if dropped_parts
+        else np.empty(0, dtype=np.int64)
+    )
+    return np.sort(retained), dropped_indices, summaries
+
+
 def is_better_checkpoint(
     current_metric: float,
     current_loss: float,
@@ -191,10 +239,13 @@ def write_split_manifest(
     train_indices: np.ndarray,
     validation_indices: np.ndarray,
     output_dir: Path,
+    downsampled_indices: np.ndarray | None = None,
 ) -> Path:
     """Record the exact holdout used only for epoch/checkpoint selection."""
 
     assignments = np.full(len(train_df), "selection_excluded", dtype=object)
+    if downsampled_indices is not None:
+        assignments[downsampled_indices] = "selection_downsampled"
     assignments[train_indices] = "selection_train"
     assignments[validation_indices] = "selection_validation"
     data = {
@@ -206,6 +257,112 @@ def write_split_manifest(
             data[column] = train_df[column].tolist()
     output = pd.DataFrame(data)
     path = output_dir / "split_manifest.csv"
+    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
+    return path
+
+
+def write_downsampled_rows(
+    train_df: pd.DataFrame,
+    task: TaskConfig,
+    downsampled_indices: np.ndarray,
+    output_dir: Path,
+) -> Path:
+    """Export the exact rows excluded by label-cap downsampling."""
+
+    columns = ["id", "Comment", task.label_column]
+    columns.extend(
+        column
+        for column in ("fold", "data_origin", "source_id", "source_group")
+        if column in train_df.columns
+    )
+    output = train_df.iloc[np.asarray(downsampled_indices, dtype=np.int64)][
+        columns
+    ].copy()
+    output["id"] = output["id"].astype(str)
+    output["exclusion_reason"] = "selection_label_cap"
+    output["excluded_from"] = "selection_train_and_final_retrain"
+    path = output_dir / "downsampled_rows.csv"
+    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
+    return path
+
+
+def _confusion_matrix_frame(confusion: dict) -> pd.DataFrame:
+    """Build a labeled actual-by-predicted confusion matrix."""
+
+    labels = list(confusion["label_order"])
+    values = np.asarray(confusion["values"], dtype=np.int64)
+    if values.shape != (len(labels), len(labels)):
+        raise ValueError("Confusion matrix shape does not match its label order.")
+    output = pd.DataFrame(values, columns=labels)
+    output.insert(0, "true_label", labels)
+    return output
+
+
+def write_validation_confusion_matrix(
+    confusion: dict,
+    epoch: int,
+    output_dir: Path,
+) -> Path:
+    """Write one human-readable confusion matrix for a validation epoch."""
+
+    matrix_dir = output_dir / "confusion_matrices"
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+    path = matrix_dir / f"validation_epoch_{epoch:02d}.csv"
+    _confusion_matrix_frame(confusion).to_csv(
+        path, index=False, encoding="utf-8", lineterminator="\n"
+    )
+    return path
+
+
+def write_validation_confusion_history(
+    selection_history: list[dict],
+    output_dir: Path,
+) -> Path:
+    """Write all completed validation matrices in one long-form CSV."""
+
+    rows = []
+    for record in selection_history:
+        confusion = record.get("confusion_matrix")
+        if confusion is None:
+            continue
+        labels = list(confusion["label_order"])
+        matrix = _confusion_matrix_frame(confusion).set_index("true_label")
+        for true_label in labels:
+            for predicted_label in labels:
+                rows.append(
+                    {
+                        "epoch": int(record["epoch"]),
+                        "true_label": true_label,
+                        "predicted_label": predicted_label,
+                        "count": int(matrix.loc[true_label, predicted_label]),
+                    }
+                )
+    output = pd.DataFrame(
+        rows,
+        columns=["epoch", "true_label", "predicted_label", "count"],
+    )
+    path = output_dir / "validation_confusion_matrices.csv"
+    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
+    return path
+
+
+def write_seed_selection_results(results: list[dict], output_dir: Path) -> Path:
+    """Write the scalar holdout results used to choose the winning seed."""
+
+    columns = [
+        "seed",
+        "best_epoch",
+        "macro_f1",
+        "loss",
+        "accuracy",
+        "selection_train_rows",
+        "full_retrain_rows",
+        "downsampled_rows",
+        "checkpoint",
+        "selected",
+    ]
+    output = pd.DataFrame(results, columns=columns)
+    path = output_dir / "seed_selection_results.csv"
     output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
     return path
 
