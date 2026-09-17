@@ -115,7 +115,7 @@ TASK_B = TaskConfig(
     use_augmentation=True,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
-    selection_train_label_caps=(("Gender", 870),),
+    selection_train_label_caps=(("Gender", 920),),
     selection_seeds=(42, 52, 62, 72, 82),
     report_per_class_metrics=True,
 )
