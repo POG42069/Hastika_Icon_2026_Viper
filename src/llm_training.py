@@ -403,9 +403,10 @@ def train_llm_epoch(
 def score_candidates(model, dataset, collator, config, runtime, description):
     """Score every full legal answer, restore row order and compute fixed-class F1.
 
-    Sum token log probabilities including the chat end suffix. Softmax produces
-    probabilities conditional on this finite candidate set (not calibrated
-    confidence). No sampling or free-text label parsing is used.
+    Mean token log probabilities include the chat end suffix and avoid favoring
+    shorter answers when official labels have different token counts. Softmax
+    produces probabilities conditional on this finite candidate set (not
+    calibrated confidence). No sampling or free-text label parsing is used.
     """
     model = unwrap_model(model)  # No DDP forward collectives on uneven eval shards.
     model.eval()
@@ -471,10 +472,14 @@ def score_candidates(model, dataset, collator, config, runtime, description):
         raise RuntimeError(
             "Non-finite candidate scores; check AMP and training stability."
         )
-    probabilities = torch.softmax(torch.from_numpy(scores), dim=1).numpy()
+    normalized_scores = scores / counts
+    probabilities = torch.softmax(
+        torch.from_numpy(normalized_scores), dim=1
+    ).numpy()
     result = {
         "probabilities": probabilities,
         "sequence_log_probs": scores,
+        "mean_token_log_probs": normalized_scores,
         "completion_token_counts": counts,
     }
     if dataset.labels is not None:

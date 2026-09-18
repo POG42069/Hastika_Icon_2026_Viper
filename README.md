@@ -161,18 +161,22 @@ Có thể đặt thư mục bằng biến môi trường trước khi chạy:
 
 ## Tokenization, loss và dự đoán
 
-Mỗi mẫu có dạng:
+Task A dùng trực tiếp nhãn chính thức trong assistant response:
 
 ```text
-System: Classify ... Reply with exactly one allowed label.
+System: Classify ... Allowed labels: Non-Hate; Hate.
 User: Comment:\n<normalized Comment>
-Assistant: <official label>
+Assistant: Non-Hate hoặc Hate
 ```
+
+Task B vẫn dùng các mã nội bộ `A`–`F` để giữ các candidate completion ngắn.
 
 Code gọi `apply_chat_template` của tokenizer. Prompt và padding được mask bằng
 `-100`; loss chỉ áp dụng cho các token của assistant label và phần kết thúc
-chat. Khi dự đoán, pipeline tính tổng log-likelihood cho từng nhãn hợp lệ và
-chọn nhãn có điểm lớn nhất; không sinh văn bản tự do và không regex sửa kết quả.
+chat. Khi dự đoán, pipeline tính mean token log-likelihood cho từng câu trả lời
+hợp lệ và chọn nhãn có điểm lớn nhất; phép chuẩn hóa này tránh thiên vị câu trả
+lời ngắn khi Task A dùng trực tiếp tên nhãn. Pipeline không sinh văn bản tự do
+và không regex sửa kết quả.
 
 Tiến trình train, validation và prediction được ghi thành dòng cố định mỗi 10%
 với số batch/candidate, elapsed time, ETA, tốc độ và mean loss khi train. Cách

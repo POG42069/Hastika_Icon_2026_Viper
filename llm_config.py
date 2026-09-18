@@ -95,7 +95,9 @@ TASK_A = TaskConfig(
     prediction_filename="binary_validation_inputs.csv",
     label_column="Label",
     labels=("Non-Hate", "Hate"),
-    label_codes=("A", "B"),
+    # Task A trains and scores the official labels directly. Task B keeps short
+    # internal codes because its six category names vary substantially in length.
+    label_codes=("Non-Hate", "Hate"),
     checkpoint_subdir="task_a_lora",
     output_subdir="task_a_lora",
     submission_zip_name="task_a_submission.zip",

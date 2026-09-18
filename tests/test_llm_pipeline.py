@@ -144,6 +144,9 @@ class LLMTests(unittest.TestCase):
         )
 
     def test_answer_mask_and_truncation_preserve_full_labels(self):
+        self.assertEqual(TASK_A.label_codes, TASK_A.labels)
+        self.assertIn("Allowed labels: Non-Hate; Hate", self.encoder.system_text)
+        self.assertNotIn("Code mapping", self.encoder.system_text)
         for task in (TASK_A, TASK_B):
             encoder = ChatEncoder(self.tokenizer, task, 512)
             prompt, truncated = encoder.encode_prompt("long comment " * 300)
@@ -373,6 +376,27 @@ class LLMTests(unittest.TestCase):
             [item["token_count"] for item in diagnostics], expected.tolist()
         )
         self.assertTrue(all(item["token_pieces"] is None for item in diagnostics))
+
+    def test_task_a_direct_labels_use_length_normalized_candidate_scores(self):
+        encoder = ChatEncoder(self.tokenizer, TASK_A, 512)
+        self.assertNotEqual(len(encoder.completions[0]), len(encoder.completions[1]))
+        data = CompletionDataset(["a direct-label example"], encoder)
+        result = score_candidates(
+            tiny_model().eval(),
+            data,
+            self.collator,
+            self.config,
+            cpu_runtime(),
+            "direct-label test",
+        )
+        np.testing.assert_allclose(
+            result["mean_token_log_probs"],
+            result["sequence_log_probs"] / result["completion_token_counts"],
+        )
+        expected = torch.softmax(
+            torch.from_numpy(result["mean_token_log_probs"]), dim=1
+        ).numpy()
+        np.testing.assert_allclose(result["probabilities"], expected)
 
     def test_cpu_production_run_fails_clearly(self):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
