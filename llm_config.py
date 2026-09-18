@@ -24,8 +24,6 @@ class TaskConfig:
     prediction_filename: str
     label_column: str
     labels: tuple[str, ...]
-    # Short answer codes used internally by the LLM. Their order must match labels.
-    label_codes: tuple[str, ...]
     checkpoint_subdir: str
     output_subdir: str
     submission_zip_name: str
@@ -95,7 +93,6 @@ TASK_A = TaskConfig(
     prediction_filename="binary_validation_inputs.csv",
     label_column="Label",
     labels=("Non-Hate", "Hate"),
-    label_codes=("A", "B"),
     checkpoint_subdir="task_a_lora",
     output_subdir="task_a_lora",
     submission_zip_name="task_a_submission.zip",
@@ -125,7 +122,6 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    label_codes=("A", "B", "C", "D", "E", "F"),
     checkpoint_subdir="task_b_lora",
     output_subdir="task_b_lora",
     submission_zip_name="task_b_submission.zip",
