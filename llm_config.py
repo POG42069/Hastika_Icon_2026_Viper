@@ -37,6 +37,10 @@ class TaskConfig:
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
     selection_seeds: tuple[int, ...] = ()
     report_per_class_metrics: bool = False
+    enable_augmentation_audit: bool = True
+    augmentation_audit_action: str = "report"
+    augmentation_near_duplicate_threshold: float = 0.92
+    augmentation_min_source_similarity: float = 0.20
 
     def labeled_filenames(self) -> tuple[str, ...]:
         """Return every labeled CSV used by this task."""
@@ -122,6 +126,8 @@ TASK_B = TaskConfig(
     selection_train_label_caps=(("Gender", 870),),
     selection_seeds=(42, 52, 62, 72, 82),
     report_per_class_metrics=False,
+    enable_augmentation_audit=True,
+    augmentation_audit_action="report",
 )
 
 
