@@ -30,7 +30,7 @@ def system_prompt(task: TaskConfig) -> str:
 class ChatEncoder:
     """Keep the chat scaffold and complete answer when truncating long comments.
 
-    Each official label is encoded as an assistant response with the model's own template.
+    Each label is encoded as an assistant response with the model's own template.
     The longest response is reserved for EVERY candidate, so candidate scores for
     a comment all condition on exactly the same prompt. No assumptions about
     single-token labels, newlines, EOS IDs, or role-token spellings are made.

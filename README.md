@@ -14,19 +14,15 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Cả hai task dùng predefined folds để giữ câu nguồn và augment cùng một fold.
-   Task A dùng `binary_original_1..4 + binary_augment1..4` để train và chỉ
-   `binary_original_5` để validation. Task B dùng
+1. Task A chia stratified 80% train và 20% validation với seed 42. Task B dùng
    `original_1..4 + augment1..4` để train và `original_5` để validation.
-2. Task B chạy độc lập với 5 seed `42, 52, 62, 72, 82`. Mỗi seed lấy ngẫu
-   nhiên một tập Gender khác nhau xuống tối đa 870 câu, train LoRA và chọn
-   checkpoint tốt nhất trên cùng một validation cố định. Macro-F1 cao hơn
-   thắng; validation loss thấp hơn dùng để phá hòa.
+2. Task B chạy với seed `52`, lấy ngẫu nhiên Gender xuống tối đa 870 câu,
+   train LoRA và chọn checkpoint tốt nhất trên validation cố định. Macro-F1
+   cao hơn thắng; validation loss thấp hơn dùng để phá hòa giữa các epoch.
 3. Chọn seed tốt nhất, lấy `best_epoch` của seed đó, khởi tạo lại backbone và
    LoRA từ đầu, rồi train
-   đúng số epoch đó trên toàn bộ dữ liệu được giữ lại. Task A dùng cả
-   `binary_original_1..5 + binary_augment1..5`. Task B dùng cả
-   `original_1..5 + augment1..5`, ngoại trừ các câu
+   đúng số epoch đó trên toàn bộ dữ liệu được giữ lại. Task A dùng toàn bộ dữ
+   liệu gốc. Task B dùng cả `original_1..5 + augment1..5`, ngoại trừ các câu
    Gender bị seed chiến thắng loại khỏi fold 1-4. Không validation hoặc early
    stopping ở giai đoạn này.
 4. Dùng adapter retrain 100% để dự đoán development inputs và tạo
@@ -91,8 +87,7 @@ hoặc một Kaggle Dataset dưới `/kaggle/input`.
 Task A:
 
 ```text
-binary_original_1.csv ... binary_original_5.csv
-binary_augment1.csv ... binary_augment5.csv
+binary_train.csv
 binary_validation_inputs.csv
 ```
 
@@ -108,28 +103,6 @@ Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Develo
 cần `id`, `Comment`. Các file `augment*.csv` cần thêm `source_id`,
 `source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn nằm cùng fold,
 nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
-
-Tạo lại dữ liệu Task A cân bằng từ bộ dữ liệu đã làm sạch:
-
-```bash
-python scripts/build_task_a_balanced_data.py \
-  --input-dir ../hastika_regenerated_augments \
-  --output-dir ../task_a_balanced
-```
-
-Script không sửa dữ liệu nguồn. Nó audit Hate augment, khôi phục các câu nguồn
-Task B còn thiếu trong binary data, gán fold có seed cố định, sinh Non-Hate
-variants bảo thủ, tạo hàng chờ human review và xuất các fold Task A. Đặt
-`HASTIKA_DATA_DIR` trỏ tới thư mục output trước khi train.
-
-Chạy sanity check nhẹ trước khi dùng GPU:
-
-```bash
-python scripts/evaluate_task_a_data_sanity.py --data-dir ../task_a_balanced
-```
-
-Đây chỉ là kiểm tra hồi quy dữ liệu bằng character n-gram Naive Bayes. Quyết
-định cuối cùng vẫn dựa trên LoRA experiment với original-only fold 5.
 
 ## Chạy trên Kaggle
 

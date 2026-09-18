@@ -5,11 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
-from llm_config import DATA_DIR, OUTPUT_ROOT, TaskConfig
+from llm_config import DATA_DIR, TaskConfig
 from src.preprocessing import normalize_text
 
 
@@ -100,127 +97,6 @@ def _validate_and_encode_frames(
     label_to_id = {label: index for index, label in enumerate(task.labels)}
     train_df["label_id"] = train_df[task.label_column].map(label_to_id).astype(int)
     return train_df, prediction_df
-
-
-def _normalise_for_audit(values: pd.Series) -> pd.Series:
-    """Create a conservative text key for exact-duplicate checks."""
-
-    return (
-        values.fillna("")
-        .astype(str)
-        .str.lower()
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
-
-
-def _audit_augmentation_quality(
-    originals: pd.DataFrame,
-    augments: pd.DataFrame,
-    task: TaskConfig,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Audit augmentation quality and optionally filter flagged rows.
-
-    This audit is deliberately conservative: ``report`` is the default action,
-    so questionable rows are written to a report but remain in training data.
-    """
-
-    if task.augmentation_audit_action not in {"report", "drop", "error"}:
-        raise ValueError(
-            "augmentation_audit_action must be one of: report, drop, error"
-        )
-    if not 0 < task.augmentation_near_duplicate_threshold <= 1:
-        raise ValueError("augmentation_near_duplicate_threshold must be in (0, 1]")
-    if not 0 <= task.augmentation_min_source_similarity <= 1:
-        raise ValueError("augmentation_min_source_similarity must be in [0, 1]")
-
-    audit = augments[
-        ["id", "source_id", "source_group", "fold", task.label_column, "Comment"]
-    ].copy()
-    audit["audit_reason"] = ""
-    audit["audit_status"] = "keep"
-    audit["text_length"] = audit["Comment"].fillna("").astype(str).str.len()
-    audit["word_count"] = audit["Comment"].fillna("").astype(str).str.split().str.len()
-    audit.loc[audit["word_count"] < 2, "audit_reason"] += "too_short;"
-
-    all_texts = pd.concat(
-        [originals["Comment"].fillna(""), augments["Comment"].fillna("")],
-        ignore_index=True,
-    ).astype(str)
-    all_keys = _normalise_for_audit(all_texts)
-    duplicate_counts = all_keys.value_counts()
-    augment_keys = _normalise_for_audit(audit["Comment"])
-    audit["exact_duplicate"] = augment_keys.map(duplicate_counts).gt(1)
-    audit.loc[audit["exact_duplicate"], "audit_reason"] += "exact_duplicate;"
-
-    # Character n-grams work for Kannada-English code-mixed text without
-    # requiring a separate embedding model or network download.
-    try:
-        vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(3, 5), min_df=1)
-        matrix = vectorizer.fit_transform(all_texts.tolist())
-        original_matrix = matrix[: len(originals)]
-        augment_matrix = matrix[len(originals) :]
-        similarity = cosine_similarity(augment_matrix, original_matrix)
-    except ValueError:
-        # An all-empty or too-short corpus has no character n-gram vocabulary.
-        similarity = np.zeros((len(augments), len(originals)), dtype=float)
-    original_ids = originals["id"].astype(str).tolist()
-    original_labels = originals[task.label_column].tolist()
-    source_similarity = []
-    nearest_similarity = []
-    nearest_label = []
-    for row_index, source_id in enumerate(audit["source_id"].astype(str)):
-        source_positions = [
-            index for index, value in enumerate(original_ids) if value == source_id
-        ]
-        source_position = source_positions[0] if source_positions else None
-        source_score = (
-            float(similarity[row_index, source_position])
-            if source_position is not None
-            else 0.0
-        )
-        source_similarity.append(source_score)
-        comparison = similarity[row_index].copy()
-        if source_position is not None:
-            comparison[source_position] = -1.0
-        nearest_position = int(comparison.argmax())
-        nearest_score = float(comparison[nearest_position])
-        nearest_similarity.append(nearest_score)
-        nearest_label.append(original_labels[nearest_position])
-    audit["source_similarity"] = source_similarity
-    audit["nearest_original_similarity"] = nearest_similarity
-    audit["nearest_original_label"] = nearest_label
-    audit.loc[
-        audit["source_similarity"] < task.augmentation_min_source_similarity,
-        "audit_reason",
-    ] += "semantic_drift;"
-    near_duplicate = (
-        audit["nearest_original_similarity"]
-        >= task.augmentation_near_duplicate_threshold
-    )
-    audit.loc[near_duplicate, "audit_reason"] += "near_duplicate;"
-    cross_class = near_duplicate & audit[task.label_column].ne(
-        audit["nearest_original_label"]
-    )
-    audit.loc[cross_class, "audit_reason"] += "cross_class_overlap;"
-    audit["audit_status"] = audit["audit_reason"].ne("").map(
-        {True: "review", False: "keep"}
-    )
-
-    report_dir = OUTPUT_ROOT / task.output_subdir
-    report_dir.mkdir(parents=True, exist_ok=True)
-    audit_path = report_dir / "augmentation_audit.csv"
-    audit.to_csv(audit_path, index=False, encoding="utf-8-sig")
-
-    flagged = audit["audit_status"].eq("review")
-    if flagged.any() and task.augmentation_audit_action == "error":
-        raise ValueError(
-            f"Augmentation audit flagged {int(flagged.sum())} rows; "
-            f"see {audit_path}"
-        )
-    if task.augmentation_audit_action == "drop":
-        augments = augments.loc[~flagged.to_numpy()].copy()
-    return augments, audit
 
 
 def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
@@ -316,12 +192,6 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
             )
 
     all_augments = pd.concat(augment_by_fold.values(), ignore_index=True, sort=False)
-    if task.enable_augmentation_audit:
-        all_augments, _ = _audit_augmentation_quality(
-            originals,
-            all_augments,
-            task,
-        )
     groups_per_fold = all_augments.groupby("source_group")["fold"].nunique()
     crossing_groups = groups_per_fold[groups_per_fold > 1]
     if not crossing_groups.empty:
@@ -329,9 +199,7 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
             "Augmentation source groups cross predefined folds: "
             f"{crossing_groups.index[:10].tolist()}"
         )
-    # Use the audited (and possibly filtered) augmentation frame, rather than
-    # the pre-audit fold list accumulated while reading each file.
-    return pd.concat([originals, all_augments], ignore_index=True, sort=False)
+    return pd.concat(fold_frames, ignore_index=True, sort=False)
 
 
 def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
