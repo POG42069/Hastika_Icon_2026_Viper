@@ -1,4 +1,4 @@
-"""Lightly normalized LoRA SFT, holdout selection, retraining, and export."""
+"""Lightly normalized LoRA SFT, selection or direct training, and export."""
 
 from __future__ import annotations
 
@@ -63,6 +63,7 @@ from src.training import (
     stratified_holdout_indices,
     unwrap_model,
     write_downsampled_rows,
+    write_full_training_manifest,
     write_split_manifest,
     write_validation_confusion_history,
     write_validation_confusion_matrix,
@@ -643,8 +644,254 @@ def _training_state(model, loader, epochs, config, runtime):
     return optimizer, scheduler, scaler
 
 
+def _run_direct_full_train(
+    task: TaskConfig,
+    config: LLMTrainingConfig,
+    runtime: RuntimeContext,
+    frame,
+    prediction_frame,
+    downsampling_pool_indices: np.ndarray,
+    tokenizer,
+    encoder: ChatEncoder,
+    prediction_data: CompletionDataset,
+    collator: CompletionCollator,
+    output_dir: Path,
+    checkpoint_dir: Path,
+    training_seeds: tuple[int, ...],
+) -> None:
+    """Train once on retained full data for a fixed number of epochs."""
+
+    if task.direct_full_train_epochs is None:
+        raise ValueError("direct_full_train_epochs must be configured")
+    if task.direct_full_train_epochs < 1:
+        raise ValueError("direct_full_train_epochs must be positive")
+    if len(training_seeds) != 1:
+        raise ValueError("Direct full-data training requires exactly one seed")
+
+    training_seed = training_seeds[0]
+    epochs = task.direct_full_train_epochs
+    labels = frame[task.label_column].to_numpy()
+    _, downsampled_indices, downsampling_summary = cap_training_labels(
+        downsampling_pool_indices,
+        labels,
+        task.selection_train_label_caps,
+        training_seed,
+    )
+    full_train_indices = np.setdiff1d(
+        np.arange(len(frame), dtype=np.int64),
+        downsampled_indices,
+        assume_unique=True,
+    )
+    full_train_frame = frame.iloc[full_train_indices]
+    full_train_data = CompletionDataset(
+        full_train_frame["text"].tolist(),
+        encoder,
+        full_train_frame["label_id"].tolist(),
+    )
+    final_adapter_dir = checkpoint_dir / "final_full_data_adapter"
+
+    def initialize_artifacts():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        write_full_training_manifest(
+            frame,
+            full_train_indices,
+            downsampled_indices,
+            output_dir,
+        )
+        # Keep the established CSV schema so the exact excluded IDs remain easy
+        # to compare with earlier seed-52 runs.
+        write_downsampled_rows(frame, task, downsampled_indices, output_dir)
+
+    on_main(initialize_artifacts, runtime)
+    log(
+        f"\n=== DIRECT FULL-DATA TRAIN | seed={training_seed} | "
+        f"{len(full_train_data)}/{len(frame)} retained rows | {epochs} epoch(s) ===",
+        runtime,
+    )
+    log("Selection training and validation are disabled for this task.", runtime)
+    for summary in downsampling_summary:
+        log(
+            f"Label cap: {summary['label']} available={summary['available']}, "
+            f"retained={summary['retained']}, dropped={summary['dropped']}, "
+            f"cap={summary['cap']}, seed={training_seed}.",
+            runtime,
+        )
+
+    set_global_seed(training_seed)
+    full_loader, full_sampler = create_train_loader(
+        full_train_data, collator, config, runtime, training_seed
+    )
+    final_model = load_lora_model(config, runtime)
+    base = final_model.get_base_model()
+    resolved_revision = getattr(base.config, "_commit_hash", None)
+    parameter_counts = {
+        "trainable": sum(
+            parameter.numel()
+            for parameter in final_model.parameters()
+            if parameter.requires_grad
+        ),
+        "reported_total": final_model.num_parameters(),
+    }
+    del base
+    final_model = _wrap_for_ddp(final_model, runtime)
+    optimizer, scheduler, scaler = _training_state(
+        final_model, full_loader, epochs, config, runtime
+    )
+    full_history = []
+    for epoch in range(1, epochs + 1):
+        if full_sampler is not None:
+            full_sampler.set_epoch(epoch)
+        train_loss = train_llm_epoch(
+            final_model,
+            full_loader,
+            optimizer,
+            scheduler,
+            scaler,
+            config,
+            runtime,
+            epoch,
+            "Direct full-data train",
+        )
+        full_history.append({"epoch": epoch, "train_loss": train_loss})
+        log(
+            f"Full-data epoch {epoch}/{epochs}: train_loss={train_loss:.5f}",
+            runtime,
+        )
+        on_main(
+            lambda: _write_json(
+                output_dir / "full_data_training_history.json",
+                {"seed": training_seed, "epochs": full_history},
+            ),
+            runtime,
+        )
+
+    del optimizer, scheduler, scaler
+    on_main(partial(save_adapter, final_model, tokenizer, final_adapter_dir), runtime)
+    restore_adapter(final_model, final_adapter_dir)
+    predictions = score_candidates(
+        final_model,
+        prediction_data,
+        collator,
+        config,
+        runtime,
+        "Development prediction from direct full-data adapter",
+    )
+
+    def export_artifacts():
+        label_ids = predictions["probabilities"].argmax(axis=1)
+        csv_path, zip_path = write_submission(
+            prediction_frame["id"].tolist(),
+            [task.labels[index] for index in label_ids],
+            task.labels,
+            output_dir,
+            task.submission_zip_name,
+        )
+        final_summary = {
+            "seed": training_seed,
+            "epochs": epochs,
+            "training_rows": len(full_train_data),
+            "loaded_rows": len(frame),
+            "downsampled_rows_excluded": len(downsampled_indices),
+            "downsampling_summary": downsampling_summary,
+            "label_distribution": full_train_frame[task.label_column]
+            .value_counts()
+            .to_dict(),
+            "checkpoint": str(final_adapter_dir),
+            "prediction_source": "final_full_data_adapter",
+        }
+        _write_json(
+            checkpoint_dir / "metrics.json",
+            {
+                "training_mode": "direct_full_data",
+                "selection_skipped": True,
+                "full_data_retrain": final_summary,
+            },
+        )
+        _write_json(
+            output_dir / "run_summary.json",
+            {
+                "task": task.task_name,
+                "method": "LoRA answer-only causal LM",
+                "training_mode": "direct_full_data",
+                "selection_skipped": True,
+                "model": config.model_name,
+                "resolved_model_revision": resolved_revision,
+                "world_size": runtime.world_size,
+                "compute_dtype": str(compute_dtype(config, runtime)),
+                "quantization": None,
+                "text_input": (
+                    "ftfy + Unicode NFKC + HTML entity decoding + whitespace "
+                    "normalization; URLs, mentions, and HTML tags preserved"
+                ),
+                "effective_train_batch_size": config.train_batch_size_per_gpu
+                * config.gradient_accumulation_steps
+                * runtime.world_size,
+                "training_seed": training_seed,
+                "fixed_epochs": epochs,
+                "downsampling": {
+                    "seed": training_seed,
+                    "source_pool_rows": len(downsampling_pool_indices),
+                    "downsampled_rows": len(downsampled_indices),
+                    "summary": downsampling_summary,
+                },
+                "full_data_retrain": final_summary,
+                "development_rows": len(prediction_data),
+                "training_config": asdict(config),
+                "parameters": parameter_counts,
+                "system_prompt": encoder.system_text,
+                "label_order": list(task.labels),
+                "completion_token_ids": encoder.completions,
+                "completion_token_diagnostics": completion_token_diagnostics(encoder),
+                "completion_token_lengths_equal": len(
+                    {len(token_ids) for token_ids in encoder.completions}
+                )
+                == 1,
+                "inference": (
+                    "argmax sum log P(answer tokens including chat end | prompt)"
+                ),
+                "probabilities": (
+                    "softmax over allowed full-answer log likelihoods; not calibrated"
+                ),
+                "loss": "mean per-example answer-token NLL; not class cross-entropy",
+                "truncated_comments": {
+                    "full_train": full_train_data.truncated_count,
+                    "development": prediction_data.truncated_count,
+                },
+                "input_sha256": {
+                    name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
+                    for name in (*task.labeled_filenames(), task.prediction_filename)
+                },
+                "packages": {
+                    name: version(name)
+                    for name in (
+                        "torch",
+                        "transformers",
+                        "peft",
+                        "accelerate",
+                        "scikit-learn",
+                    )
+                },
+            },
+        )
+        log(
+            f"\n=== COMPLETE | {task.task_name} ===\n"
+            f"Selection skipped; seed {training_seed} trained directly on "
+            f"{len(full_train_data)} retained rows for {epochs} epoch(s).\n"
+            f"Predictions: {csv_path}\nSubmission: {zip_path}\n"
+            f"Downsampled rows: {output_dir / 'downsampled_rows.csv'}\n"
+            f"Final adapter: {final_adapter_dir}",
+            runtime,
+        )
+
+    on_main(export_artifacts, runtime)
+    del final_model, full_loader
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
-    """Compare downsampling seeds, retrain the winner, then predict development."""
+    """Run task-specific selection/retraining or direct full-data training."""
 
     validate_config(config)
     selection_seeds = task.selection_seeds or (config.seed,)
@@ -657,9 +904,14 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
     try:
         require_cuda(runtime)
         set_global_seed(config.seed)
+        seed_heading = (
+            f"training_seed={selection_seeds[0]}"
+            if task.direct_full_train_epochs is not None and len(selection_seeds) == 1
+            else f"selection_seeds={selection_seeds}"
+        )
         log(
             f"\n{task.task_name} | LoRA {config.model_name} | rank={config.lora_rank} "
-            f"| world_size={runtime.world_size} | selection_seeds={selection_seeds}",
+            f"| world_size={runtime.world_size} | {seed_heading}",
             runtime,
         )
         log(
@@ -708,10 +960,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         encoder = ChatEncoder(tokenizer, task, config.max_length)
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
-        val_frame = frame.iloc[val_indices]
-        val_data = CompletionDataset(
-            val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
-        )
         prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
         collator = CompletionCollator(tokenizer.pad_token_id)
 
@@ -721,6 +969,28 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         on_main(lambda: output_dir.mkdir(parents=True, exist_ok=True), runtime)
         on_main(lambda: checkpoint_dir.mkdir(parents=True, exist_ok=True), runtime)
 
+        if task.direct_full_train_epochs is not None:
+            _run_direct_full_train(
+                task,
+                config,
+                runtime,
+                frame,
+                prediction_frame,
+                base_train_indices,
+                tokenizer,
+                encoder,
+                prediction_data,
+                collator,
+                output_dir,
+                checkpoint_dir,
+                selection_seeds,
+            )
+            return
+
+        val_frame = frame.iloc[val_indices]
+        val_data = CompletionDataset(
+            val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
+        )
         seed_results = []
         resolved_revision = None
         parameter_counts = None

@@ -34,6 +34,7 @@ class TaskConfig:
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
     selection_seeds: tuple[int, ...] = ()
+    direct_full_train_epochs: int | None = None
     report_per_class_metrics: bool = False
 
     def labeled_filenames(self) -> tuple[str, ...]:
@@ -117,6 +118,7 @@ TASK_B = TaskConfig(
     selection_validation_data_origins=("original",),
     selection_train_label_caps=(("Gender", 870),),
     selection_seeds=(52,),
+    direct_full_train_epochs=3,
     report_per_class_metrics=True,
 )
 
@@ -128,7 +130,7 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-# Standard LoRA consumes more VRAM than QLoRA, so Task B also starts at batch/GPU=1.
+# Task B keeps the same T4 x2 hyperparameters as the restored 03c7ca8 pipeline.
 LLM_TRAINING_B = replace(LLM_TRAINING)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B
