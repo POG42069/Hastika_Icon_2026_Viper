@@ -36,6 +36,7 @@ class TaskConfig:
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
     selection_seeds: tuple[int, ...] = ()
+    ensemble_all_seeds: bool = False
     report_per_class_metrics: bool = False
     enable_augmentation_audit: bool = True
     augmentation_audit_action: str = "report"
@@ -110,7 +111,8 @@ TASK_A = TaskConfig(
     use_augmentation=True,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
-    selection_seeds=(42, 52, 62),
+    selection_seeds=(42, 52, 62, 72, 82),
+    ensemble_all_seeds=True,
     report_per_class_metrics=True,
 )
 

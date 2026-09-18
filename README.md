@@ -18,21 +18,22 @@ Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộ
    Task A dùng `binary_original_1..4 + binary_augment1..4` để train và chỉ
    `binary_original_5` để validation. Task B dùng
    `original_1..4 + augment1..4` để train và `original_5` để validation.
-2. Task B chạy độc lập với 5 seed `42, 52, 62, 72, 82`. Mỗi seed lấy ngẫu
-   nhiên một tập Gender khác nhau xuống tối đa 870 câu, train LoRA và chọn
-   checkpoint tốt nhất trên cùng một validation cố định. Macro-F1 cao hơn
-   thắng; validation loss thấp hơn dùng để phá hòa.
-3. Chọn seed tốt nhất, lấy `best_epoch` của seed đó, khởi tạo lại backbone và
-   LoRA từ đầu, rồi train
-   đúng số epoch đó trên toàn bộ dữ liệu được giữ lại. Task A dùng cả
-   `binary_original_1..5 + binary_augment1..5`. Task B dùng cả
-   `original_1..5 + augment1..5`, ngoại trừ các câu
-   Gender bị seed chiến thắng loại khỏi fold 1-4. Không validation hoặc early
-   stopping ở giai đoạn này.
-4. Dùng adapter retrain 100% để dự đoán development inputs và tạo
-   `predictions.csv` cùng file ZIP nộp CodaBench.
+2. Task A và Task B đều chạy 5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
+   và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
+   thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
+   lấy ngẫu nhiên một tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
+3. Với Task A, cả 5 seed đều khởi tạo lại backbone và LoRA từ đầu, rồi retrain
+   trên `binary_original_1..5 + binary_augment1..5` theo `best_epoch` riêng.
+   Năm adapter dự đoán development độc lập; nhãn cuối là hard majority vote,
+   tức `Hate` khi có ít nhất 3 phiếu, ngược lại là `Non-Hate`.
+4. Task B vẫn chọn seed tốt nhất, khởi tạo lại từ đầu và retrain trên
+   `original_1..5 + augment1..5`, ngoại trừ các câu Gender bị seed chiến thắng
+   loại khỏi fold 1-4.
+5. Adapter full-retrain dùng để dự đoán development inputs và tạo
+   `predictions.csv` cùng file ZIP nộp CodaBench. Full-retrain không đánh giá
+   lại fold 5 vì fold này đã được đưa vào dữ liệu huấn luyện đầy đủ.
 
-Việc khởi tạo lại ở bước 3 giúp tất cả mẫu được học số epoch như nhau. Nếu
+Việc khởi tạo lại ở bước full-retrain giúp tất cả mẫu được học số epoch như nhau. Nếu
 tiếp tục trực tiếp từ adapter 80%, nhóm 80% ban đầu sẽ được học nhiều lần hơn
 nhóm validation cũ.
 
@@ -188,33 +189,42 @@ nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện,
 
 ## Artifacts
 
-Ví dụ Task A:
+Task A:
 
 ```text
-checkpoints/task_a_lora/best_holdout_adapter/
-checkpoints/task_a_lora/final_full_data_adapter/
+checkpoints/task_a_lora/seed_42/best_holdout_adapter/
+checkpoints/task_a_lora/seed_42/final_full_data_adapter/
+checkpoints/task_a_lora/seed_52/...
+checkpoints/task_a_lora/seed_62/...
+checkpoints/task_a_lora/seed_72/...
+checkpoints/task_a_lora/seed_82/...
 checkpoints/task_a_lora/metrics.json
+outputs/task_a_lora/seed_42/validation_predictions.csv
+outputs/task_a_lora/seed_42/predictions.csv
+outputs/task_a_lora/seed_52/...
 outputs/task_a_lora/selection_training_history.json
-outputs/task_a_lora/full_data_training_history.json
 outputs/task_a_lora/split_manifest.csv
 outputs/task_a_lora/validation_predictions.csv
+outputs/task_a_lora/seed_selection_results.csv
+outputs/task_a_lora/voting_predictions.csv
 outputs/task_a_lora/predictions.csv
 outputs/task_a_lora/task_a_submission.zip
 outputs/task_a_lora/run_summary.json
 ```
 
-`validation_predictions.csv` được tạo bằng best holdout adapter để phân tích.
-`predictions.csv` và ZIP luôn được tạo bằng `final_full_data_adapter`.
+`validation_predictions.csv` ở thư mục gốc là kết quả của seed có holdout tốt
+nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 5 seed,
+số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
+kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
 Task B còn tạo một thư mục riêng cho từng seed, ví dụ
 `outputs/task_b_lora/seed_42/`, cùng `seed_selection_results.csv` và
 `seed_selection_summary.json`. Các artifact ở trực tiếp
 `outputs/task_b_lora/` luôn tương ứng với seed chiến thắng.
 
-Lưu ý: chọn seed tốt nhất trên cùng một validation cũng là một dạng tối ưu theo
-validation, nên Macro-F1 của seed thắng có thể lạc quan hơn khả năng tổng quát
-thực tế. File tổng hợp vì vậy lưu cả điểm trung bình và độ lệch chuẩn của 5
-seed; test/development chính thức vẫn là đánh giá cuối cùng.
+Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
+tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức
+vẫn là đánh giá cuối cùng.
 
 ## Kiểm thử
 
