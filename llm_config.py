@@ -34,7 +34,12 @@ class TaskConfig:
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
     selection_seeds: tuple[int, ...] = ()
+    ensemble_all_seeds: bool = False
     report_per_class_metrics: bool = False
+    enable_augmentation_audit: bool = True
+    augmentation_audit_action: str = "report"
+    augmentation_near_duplicate_threshold: float = 0.92
+    augmentation_min_source_similarity: float = 0.20
 
     def labeled_filenames(self) -> tuple[str, ...]:
         """Return every labeled CSV used by this task."""
@@ -92,6 +97,18 @@ TASK_A = TaskConfig(
     checkpoint_subdir="task_a_lora",
     output_subdir="task_a_lora",
     submission_zip_name="task_a_submission.zip",
+    original_fold_filenames=tuple(
+        f"binary_original_{fold}.csv" for fold in range(1, 6)
+    ),
+    augmentation_fold_filenames=tuple(
+        f"binary_augment{fold}.csv" for fold in range(1, 6)
+    ),
+    use_augmentation=True,
+    selection_validation_fold=5,
+    selection_validation_data_origins=("original",),
+    selection_seeds=(42, 52, 62, 72, 82),
+    ensemble_all_seeds=True,
+    report_per_class_metrics=True,
 )
 
 TASK_B = TaskConfig(
@@ -117,7 +134,9 @@ TASK_B = TaskConfig(
     selection_validation_data_origins=("original",),
     selection_train_label_caps=(("Gender", 920),),
     selection_seeds=(42, 52, 62, 72, 82),
-    report_per_class_metrics=True,
+    report_per_class_metrics=False,
+    enable_augmentation_audit=True,
+    augmentation_audit_action="report",
 )
 
 
