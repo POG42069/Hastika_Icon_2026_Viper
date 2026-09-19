@@ -145,28 +145,33 @@ class LLMTests(unittest.TestCase):
         )
 
     def test_answer_mask_and_truncation_preserve_full_labels(self):
-        self.assertEqual(TASK_A.label_codes, TASK_A.labels)
         self.assertIn("Allowed labels: Non-Hate; Hate", self.encoder.system_text)
         self.assertNotIn("Code mapping", self.encoder.system_text)
+        task_b_prompt = ChatEncoder(self.tokenizer, TASK_B, 512).system_text
+        self.assertIn(
+            "Allowed labels: Gender; Political; Religion; Geo-political; Violence; Others",
+            task_b_prompt,
+        )
+        self.assertNotIn("Code mapping", task_b_prompt)
         for task in (TASK_A, TASK_B):
             encoder = ChatEncoder(self.tokenizer, task, 512)
             prompt, truncated = encoder.encode_prompt("long comment " * 300)
             self.assertTrue(truncated)
-            for label_id, code in enumerate(task.label_codes):
+            for label_id, label in enumerate(task.labels):
                 feature = encoder.feature(prompt, label_id)
                 self.assertLessEqual(len(feature["input_ids"]), 512)
                 self.assertEqual(feature["labels"][: len(prompt)], [-100] * len(prompt))
                 self.assertEqual(
-                    feature["labels"][len(prompt) :], self.tokenizer.encode(code) + [2]
+                    feature["labels"][len(prompt) :], self.tokenizer.encode(label) + [2]
                 )
                 self.assertEqual(feature["input_ids"][: len(prompt)], prompt)
 
     def test_encoding_matches_full_training_chat(self):
         prompt, _ = self.encoder.encode_prompt("hello")
-        for label_id, code in enumerate(TASK_A.label_codes):
+        for label_id, label in enumerate(TASK_A.labels):
             expected = self.tokenizer.apply_chat_template(
                 self.encoder.messages("hello")
-                + [{"role": "assistant", "content": code}]
+                + [{"role": "assistant", "content": label}]
             )
             self.assertEqual(
                 self.encoder.feature(prompt, label_id)["input_ids"], expected

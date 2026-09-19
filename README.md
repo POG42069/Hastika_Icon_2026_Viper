@@ -170,7 +170,8 @@ User: Comment:\n<normalized Comment>
 Assistant: Non-Hate hoặc Hate
 ```
 
-Task B vẫn dùng các mã nội bộ `A`–`F` để giữ các candidate completion ngắn.
+Task B cũng dùng trực tiếp các nhãn chính thức `Gender`, `Political`, `Religion`,
+`Geo-political`, `Violence` và `Others`; pipeline không dùng mã nội bộ `A`–`F`.
 
 Code gọi `apply_chat_template` của tokenizer. Prompt và padding được mask bằng
 `-100`; loss chỉ áp dụng cho các token của assistant label và phần kết thúc
