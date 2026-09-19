@@ -24,6 +24,8 @@ class TaskConfig:
     prediction_filename: str
     label_column: str
     labels: tuple[str, ...]
+    # Answers emitted by the model, in the same order as the official labels.
+    label_codes: tuple[str, ...]
     checkpoint_subdir: str
     output_subdir: str
     submission_zip_name: str
@@ -94,6 +96,7 @@ TASK_A = TaskConfig(
     prediction_filename="binary_validation_inputs.csv",
     label_column="Label",
     labels=("Non-Hate", "Hate"),
+    label_codes=("A", "B"),
     checkpoint_subdir="task_a_lora",
     output_subdir="task_a_lora",
     submission_zip_name="task_a_submission.zip",
@@ -117,6 +120,15 @@ TASK_B = TaskConfig(
     prediction_filename="multiclass_validation_inputs.csv",
     label_column="Hate Category",
     labels=(
+        "Gender",
+        "Political",
+        "Religion",
+        "Geo-political",
+        "Violence",
+        "Others",
+    ),
+    # Task B continues to train and score the official category names directly.
+    label_codes=(
         "Gender",
         "Political",
         "Religion",

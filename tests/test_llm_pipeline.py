@@ -144,9 +144,10 @@ class LLMTests(unittest.TestCase):
             lora_dropout=0.0,
         )
 
-    def test_answer_mask_and_truncation_preserve_full_labels(self):
-        self.assertIn("Allowed labels: Non-Hate; Hate", self.encoder.system_text)
-        self.assertNotIn("Code mapping", self.encoder.system_text)
+    def test_answer_mask_and_truncation_preserve_configured_answers(self):
+        self.assertEqual(TASK_A.label_codes, ("A", "B"))
+        self.assertIn("Code mapping: A=Non-Hate; B=Hate", self.encoder.system_text)
+        self.assertNotIn("Allowed labels", self.encoder.system_text)
         task_b_prompt = ChatEncoder(self.tokenizer, TASK_B, 512).system_text
         self.assertIn(
             "Allowed labels: Gender; Political; Religion; Geo-political; Violence; Others",
@@ -157,21 +158,21 @@ class LLMTests(unittest.TestCase):
             encoder = ChatEncoder(self.tokenizer, task, 512)
             prompt, truncated = encoder.encode_prompt("long comment " * 300)
             self.assertTrue(truncated)
-            for label_id, label in enumerate(task.labels):
+            for label_id, code in enumerate(task.label_codes):
                 feature = encoder.feature(prompt, label_id)
                 self.assertLessEqual(len(feature["input_ids"]), 512)
                 self.assertEqual(feature["labels"][: len(prompt)], [-100] * len(prompt))
                 self.assertEqual(
-                    feature["labels"][len(prompt) :], self.tokenizer.encode(label) + [2]
+                    feature["labels"][len(prompt) :], self.tokenizer.encode(code) + [2]
                 )
                 self.assertEqual(feature["input_ids"][: len(prompt)], prompt)
 
     def test_encoding_matches_full_training_chat(self):
         prompt, _ = self.encoder.encode_prompt("hello")
-        for label_id, label in enumerate(TASK_A.labels):
+        for label_id, code in enumerate(TASK_A.label_codes):
             expected = self.tokenizer.apply_chat_template(
                 self.encoder.messages("hello")
-                + [{"role": "assistant", "content": label}]
+                + [{"role": "assistant", "content": code}]
             )
             self.assertEqual(
                 self.encoder.feature(prompt, label_id)["input_ids"], expected
@@ -383,10 +384,13 @@ class LLMTests(unittest.TestCase):
         )
         self.assertTrue(all(item["token_pieces"] is None for item in diagnostics))
 
-    def test_task_a_direct_labels_use_length_normalized_candidate_scores(self):
+    def test_task_a_uses_equal_length_encoded_label_candidates(self):
         encoder = ChatEncoder(self.tokenizer, TASK_A, 512)
-        self.assertNotEqual(len(encoder.completions[0]), len(encoder.completions[1]))
-        data = CompletionDataset(["a direct-label example"], encoder)
+        self.assertEqual(len(encoder.completions[0]), len(encoder.completions[1]))
+        diagnostics = completion_token_diagnostics(encoder)
+        self.assertEqual([item["label"] for item in diagnostics], ["Non-Hate", "Hate"])
+        self.assertEqual([item["code"] for item in diagnostics], ["A", "B"])
+        data = CompletionDataset(["an encoded-label example"], encoder)
         result = score_candidates(
             tiny_model().eval(),
             data,

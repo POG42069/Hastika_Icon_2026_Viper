@@ -161,8 +161,11 @@ def completion_token_diagnostics(encoder: ChatEncoder) -> list[dict[str, object]
     tokenizer = encoder.tokenizer
     convert_ids_to_tokens = getattr(tokenizer, "convert_ids_to_tokens", None)
     diagnostics = []
-    for label, token_ids in zip(
-        encoder.task.labels, encoder.completions, strict=True
+    for label, code, token_ids in zip(
+        encoder.task.labels,
+        encoder.task.label_codes,
+        encoder.completions,
+        strict=True,
     ):
         ids = list(token_ids)
         token_pieces = (
@@ -173,6 +176,7 @@ def completion_token_diagnostics(encoder: ChatEncoder) -> list[dict[str, object]
         diagnostics.append(
             {
                 "label": label,
+                "code": code,
                 "token_count": len(ids),
                 "token_ids": ids,
                 "token_pieces": token_pieces,
@@ -191,7 +195,7 @@ def log_completion_token_diagnostics(
 
     for item in diagnostics:
         log(
-            f"Completion tokens | label={item['label']!r} | "
+            f"Completion tokens | label={item['label']!r} | code={item['code']!r} | "
             f"count={item['token_count']} | ids={item['token_ids']} | "
             f"pieces={item['token_pieces']} | "
             f"decoded={item['decoded_completion']!r}",
