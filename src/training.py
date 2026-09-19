@@ -261,30 +261,6 @@ def write_split_manifest(
     return path
 
 
-def write_full_training_manifest(
-    train_df: pd.DataFrame,
-    training_indices: np.ndarray,
-    downsampled_indices: np.ndarray,
-    output_dir: Path,
-) -> Path:
-    """Record rows used by a direct full-data run without a selection phase."""
-
-    assignments = np.full(len(train_df), "excluded", dtype=object)
-    assignments[np.asarray(training_indices, dtype=np.int64)] = "full_train"
-    assignments[np.asarray(downsampled_indices, dtype=np.int64)] = "downsampled"
-    data = {
-        "id": train_df["id"].astype(str).tolist(),
-        "split": assignments.tolist(),
-    }
-    for column in ("fold", "data_origin", "source_id", "source_group"):
-        if column in train_df.columns:
-            data[column] = train_df[column].tolist()
-    output = pd.DataFrame(data)
-    path = output_dir / "full_training_manifest.csv"
-    output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
-    return path
-
-
 def write_downsampled_rows(
     train_df: pd.DataFrame,
     task: TaskConfig,

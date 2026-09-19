@@ -6,7 +6,6 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("HASTIKA_DATA_DIR", str(PROJECT_ROOT / "data")))
 CHECKPOINT_ROOT = Path(
@@ -34,8 +33,8 @@ class TaskConfig:
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
     selection_seeds: tuple[int, ...] = ()
-    direct_full_train_epochs: int | None = None
     report_per_class_metrics: bool = False
+    reproduction_manifest: str | None = None
 
     def labeled_filenames(self) -> tuple[str, ...]:
         """Return every labeled CSV used by this task."""
@@ -117,8 +116,7 @@ TASK_B = TaskConfig(
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_train_label_caps=(("Gender", 870),),
-    selection_seeds=(52,),
-    direct_full_train_epochs=3,
+    selection_seeds=(42, 52, 62, 72, 82),
     report_per_class_metrics=True,
 )
 
@@ -130,7 +128,13 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-# Task B keeps the same T4 x2 hyperparameters as the restored 03c7ca8 pipeline.
-LLM_TRAINING_B = replace(LLM_TRAINING)
+TASK_B_066_MODEL_REVISION = "aa8e72537993ba99e69dfaafa59ed015b17504d1"
+TASK_B_066_MANIFEST = PROJECT_ROOT / "reproduction_task_b_066.json"
+# Pin the exact Qwen snapshot resolved by the recorded 0.66 run. All other
+# hyperparameters remain the values recorded in that run summary.
+LLM_TRAINING_B = replace(
+    LLM_TRAINING,
+    model_revision=TASK_B_066_MODEL_REVISION,
+)
 TASK_A_LLM = TASK_A
-TASK_B_LLM = TASK_B
+TASK_B_LLM = replace(TASK_B, reproduction_manifest=str(TASK_B_066_MANIFEST))
