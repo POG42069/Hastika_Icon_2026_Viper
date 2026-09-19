@@ -22,14 +22,16 @@ Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộ
    và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
    thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
    lấy ngẫu nhiên một tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
-3. Với Task A, cả 5 seed đều khởi tạo lại backbone và LoRA từ đầu, rồi retrain
-   trên `binary_original_1..5 + binary_augment1..5` theo `best_epoch` riêng.
-   Năm adapter dự đoán development độc lập; nhãn cuối là hard majority vote,
-   tức `Hate` khi có ít nhất 3 phiếu, ngược lại là `Non-Hate`.
-4. Task B vẫn chọn seed tốt nhất, khởi tạo lại từ đầu và retrain trên
-   `original_1..5 + augment1..5`, ngoại trừ các câu Gender bị seed chiến thắng
-   loại khỏi fold 1-4.
-5. Adapter full-retrain dùng để dự đoán development inputs và tạo
+3. Với cả hai task, từng seed khởi tạo lại backbone và LoRA từ đầu rồi retrain
+   trên dữ liệu đầy đủ theo `best_epoch` riêng. Task B tiếp tục loại đúng tập
+   Gender mà seed đó đã chọn khi chạy phase selection; vì vậy 5 seed có thể
+   retrain trên 5 tập Gender khác nhau nhưng cùng số lượng mẫu.
+4. Năm adapter dự đoán development độc lập và có trọng số ngang nhau. Task A
+   dùng majority vote. Task B dùng plurality vote; nếu nhiều nhãn cùng số phiếu
+   cao nhất thì lần lượt phá hòa bằng tổng điểm Borda, tổng `mean_token_log_probs`
+   đã z-normalize riêng trong từng seed/mẫu, rồi thứ tự label cố định trong
+   `llm_config.py` nếu mọi giá trị vẫn bằng nhau.
+5. Kết quả ensemble dùng để tạo
    `predictions.csv` cùng file ZIP nộp CodaBench. Full-retrain không đánh giá
    lại fold 5 vì fold này đã được đưa vào dữ liệu huấn luyện đầy đủ.
 
@@ -217,10 +219,13 @@ nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoá
 số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
 kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
-Task B còn tạo một thư mục riêng cho từng seed, ví dụ
-`outputs/task_b_lora/seed_42/`, cùng `seed_selection_results.csv` và
-`seed_selection_summary.json`. Các artifact ở trực tiếp
-`outputs/task_b_lora/` luôn tương ứng với seed chiến thắng.
+Task B có cấu trúc artifact tương tự Task A: mỗi seed có
+`best_holdout_adapter/`, `final_full_data_adapter/`, prediction và lịch sử
+retrain riêng. `outputs/task_b_lora/voting_predictions.csv` lưu nhãn của từng
+seed, số phiếu, điểm Borda, tổng candidate score đã chuẩn hóa, phương thức phá
+hòa và nhãn cuối. Các file `predictions.csv`, ZIP và `run_summary.json` ở thư
+mục gốc là kết quả ensemble; seed có holdout tốt nhất chỉ được dùng để xuất báo
+cáo validation đại diện, không còn là seed duy nhất được retrain.
 
 Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
 tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức

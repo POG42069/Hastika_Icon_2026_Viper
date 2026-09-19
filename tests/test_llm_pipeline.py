@@ -31,6 +31,7 @@ from src.llm_training import (
     completion_token_diagnostics,
     completion_log_probs,
     compute_dtype,
+    ensemble_plurality_vote,
     format_per_class_diagnostics,
     require_cuda,
     restore_adapter,
@@ -429,6 +430,83 @@ class LLMTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "odd number of seeds"):
             binary_majority_vote(np.asarray([[0, 1], [1, 0]]), TASK_A.labels)
 
+    def test_ensemble_plurality_vote_uses_unique_plurality(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray(
+            [
+                [0, 2],
+                [0, 1],
+                [1, 2],
+                [0, 2],
+                [2, 0],
+            ]
+        )
+        scores = np.eye(len(labels), dtype=np.float64)[label_ids]
+        final_ids, votes, _, _, ties, methods = ensemble_plurality_vote(
+            label_ids, scores, labels
+        )
+        np.testing.assert_array_equal(final_ids, [0, 2])
+        np.testing.assert_array_equal(votes, [[3, 1, 1], [1, 1, 3]])
+        np.testing.assert_array_equal(ties, [False, False])
+        self.assertEqual(methods.tolist(), ["plurality", "plurality"])
+
+    def test_ensemble_plurality_vote_breaks_tie_with_borda(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray([[0], [0], [1], [1], [2]])
+        scores = np.asarray(
+            [
+                [[3.0, 2.0, 1.0]],
+                [[3.0, 2.0, 1.0]],
+                [[1.0, 3.0, 2.0]],
+                [[1.0, 3.0, 2.0]],
+                [[2.0, 1.0, 3.0]],
+            ]
+        )
+        final_ids, votes, borda, _, ties, methods = ensemble_plurality_vote(
+            label_ids, scores, labels
+        )
+        np.testing.assert_array_equal(votes[0], [2, 2, 1])
+        np.testing.assert_array_equal(borda[0], [5, 6, 4])
+        np.testing.assert_array_equal(final_ids, [1])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["borda"])
+
+    def test_ensemble_plurality_vote_breaks_borda_tie_with_normalized_score(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray([[0], [0], [1], [1], [2]])
+        scores = np.asarray(
+            [
+                [[1.0, 0.9, 0.0]],
+                [[0.1, -10.0, 0.0]],
+                [[0.0, 10.0, 0.1]],
+                [[0.0, 10.0, 0.1]],
+                [[0.1, 0.0, 10.0]],
+            ]
+        )
+        final_ids, votes, borda, normalized, ties, methods = (
+            ensemble_plurality_vote(label_ids, scores, labels)
+        )
+        np.testing.assert_array_equal(votes[0], [2, 2, 1])
+        np.testing.assert_array_equal(borda[0, :2], [5, 5])
+        self.assertGreater(normalized[0, 1], normalized[0, 0])
+        np.testing.assert_array_equal(final_ids, [1])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["normalized_score"])
+
+    def test_ensemble_plurality_vote_uses_label_order_for_exact_tie(self):
+        labels = ("A", "B")
+        label_ids = np.asarray([[0], [1]])
+        scores = np.asarray([[[1.0, 0.0]], [[0.0, 1.0]]])
+        final_ids, votes, borda, normalized, ties, methods = (
+            ensemble_plurality_vote(label_ids, scores, labels)
+        )
+        np.testing.assert_array_equal(votes[0], [1, 1])
+        np.testing.assert_array_equal(borda[0], [1, 1])
+        np.testing.assert_allclose(normalized[0], [0.0, 0.0])
+        np.testing.assert_array_equal(final_ids, [0])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["label_order"])
+
     def test_cpu_production_run_fails_clearly(self):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
             require_cuda(cpu_runtime())
@@ -639,9 +717,18 @@ class LLMTests(unittest.TestCase):
                     self.assertEqual(
                         voting["final_label"].tolist(), result["label"].tolist()
                     )
+                    vote_columns = [
+                        "votes_"
+                        + label.lower().replace("-", "_").replace(" ", "_")
+                        for label in task.labels
+                    ]
                     self.assertEqual(
-                        (voting["hate_votes"] + voting["nonhate_votes"]).tolist(),
+                        voting[vote_columns].sum(axis=1).tolist(),
                         [len(test_seeds)] * len(voting),
+                    )
+                    self.assertEqual(
+                        summary["ensemble"]["fixed_label_order"],
+                        list(task.labels),
                     )
                 else:
                     self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
@@ -694,6 +781,7 @@ class LLMTests(unittest.TestCase):
                 data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
                 if task.ensemble_all_seeds:
                     seed_label_ids = []
+                    seed_mean_token_log_probs = []
                     for index, seed in enumerate(test_seeds):
                         final_model = loaded_models[len(test_seeds) + index]
                         restore_adapter(
@@ -715,8 +803,13 @@ class LLMTests(unittest.TestCase):
                         seed_label_ids.append(
                             scores["probabilities"].argmax(axis=1)
                         )
-                    expected_ids, _, _ = binary_majority_vote(
-                        np.stack(seed_label_ids), task.labels
+                        seed_mean_token_log_probs.append(
+                            scores["mean_token_log_probs"]
+                        )
+                    expected_ids, *_ = ensemble_plurality_vote(
+                        np.stack(seed_label_ids),
+                        np.stack(seed_mean_token_log_probs),
+                        task.labels,
                     )
                     expected = [task.labels[index] for index in expected_ids]
                 else:

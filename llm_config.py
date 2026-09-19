@@ -146,6 +146,7 @@ TASK_B = TaskConfig(
     selection_validation_data_origins=("original",),
     selection_train_label_caps=(("Gender", 870),),
     selection_seeds=(42, 52, 62, 72, 82),
+    ensemble_all_seeds=True,
     report_per_class_metrics=False,
     enable_augmentation_audit=True,
     augmentation_audit_action="report",
