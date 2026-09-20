@@ -20,8 +20,9 @@ Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộ
    `original_1..4 + augment1..4` để train và `original_5` để validation.
 2. Task A và Task B đều chạy 5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
    và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
-   thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
-   lấy ngẫu nhiên một tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
+   thắng; validation loss thấp hơn dùng để phá hòa. Với Task B, cùng quy tắc
+   này còn được dùng để chọn một seed chiến thắng. Task B lấy ngẫu nhiên một
+   tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
 3. Với Task A, cả 5 seed đều khởi tạo lại backbone và LoRA từ đầu, rồi retrain
    trên `binary_original_1..5 + binary_augment1..5` theo `best_epoch` riêng.
    Năm adapter dự đoán development độc lập; nhãn cuối là hard majority vote,
@@ -110,6 +111,11 @@ cần `id`, `Comment`. Các file `augment*.csv` cần thêm `source_id`,
 `source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn nằm cùng fold,
 nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
 
+Loader còn tạo `augmentation_audit.csv` để đánh dấu câu quá ngắn, trùng lặp,
+quá khác câu nguồn hoặc gần giống một original khác. Cấu hình hiện tại dùng
+`augmentation_audit_action="report"`, nên audit chỉ báo cáo; các câu bị đánh
+dấu vẫn được giữ trong dữ liệu huấn luyện.
+
 Tạo lại dữ liệu Task A cân bằng từ bộ dữ liệu đã làm sạch:
 
 ```bash
@@ -182,10 +188,12 @@ và không regex sửa kết quả.
 Tiến trình train, validation và prediction được ghi thành dòng cố định mỗi 10%
 với số batch/candidate, elapsed time, ETA, tốc độ và mean loss khi train. Cách
 này tránh progress bar động bị Kaggle nối thành một khối log dài khó đọc.
-Sau mỗi epoch của Task B, log còn ghi precision, recall, F1 và support của từng
-nhãn, kèm số lỗi theo cả hai chiều: các nhãn thật bị dự đoán nhầm vào nhãn đang
-xét và các mẫu thật của nhãn đang xét bị dự đoán sang từng nhãn khác. Ma trận
-nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện, CSV và metrics JSON.
+Sau mỗi epoch, cả hai task đều ghi F1 của từng nhãn. Task A còn ghi precision,
+recall, support và số lỗi theo cả hai chiều: các nhãn thật bị dự đoán nhầm vào
+nhãn đang xét và các mẫu thật của nhãn đang xét bị dự đoán sang từng nhãn khác.
+Task B hiện không in các thống kê chi tiết này vì
+`report_per_class_metrics=False`. Ma trận nhầm lẫn của cả hai task vẫn được lưu
+trong lịch sử huấn luyện, CSV và metrics JSON.
 
 ## Artifacts
 
@@ -222,9 +230,12 @@ Task B còn tạo một thư mục riêng cho từng seed, ví dụ
 `seed_selection_summary.json`. Các artifact ở trực tiếp
 `outputs/task_b_lora/` luôn tương ứng với seed chiến thắng.
 
-Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
-tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức
-vẫn là đánh giá cuối cùng.
+Với Task A, Macro-F1 holdout chỉ chọn `best_epoch` riêng cho từng seed; cả 5
+seed đều được full-retrain và tham gia majority vote. Seed có holdout tốt nhất
+chỉ đại diện cho báo cáo validation. Với Task B, Macro-F1 holdout vừa chọn
+`best_epoch` trong từng seed, vừa chọn một winning seed duy nhất để full-retrain
+và dự đoán development. File tổng hợp lưu cả điểm trung bình và độ lệch chuẩn;
+test/development chính thức vẫn là đánh giá cuối cùng.
 
 ## Kiểm thử
 
