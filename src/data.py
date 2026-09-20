@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -233,10 +233,14 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
         )
     if not task.original_fold_filenames:
         raise ValueError("At least one predefined fold is required.")
-    if task.selection_validation_fold not in range(
-        1, len(task.original_fold_filenames) + 1
-    ):
-        raise ValueError("selection_validation_fold does not identify a configured fold.")
+    configured_folds = set(range(1, len(task.original_fold_filenames) + 1))
+    validation_folds = (
+        set(task.oof_validation_folds)
+        if task.oof_validation_folds
+        else {task.selection_validation_fold}
+    )
+    if not validation_folds or not validation_folds.issubset(configured_folds):
+        raise ValueError("Validation folds do not identify configured folds.")
 
     fold_frames: list[pd.DataFrame] = []
     original_by_fold: dict[int, pd.DataFrame] = {}

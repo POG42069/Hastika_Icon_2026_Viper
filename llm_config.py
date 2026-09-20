@@ -6,7 +6,6 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("HASTIKA_DATA_DIR", str(PROJECT_ROOT / "data")))
 CHECKPOINT_ROOT = Path(
@@ -37,6 +36,11 @@ class TaskConfig:
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
     selection_seeds: tuple[int, ...] = ()
     ensemble_all_seeds: bool = False
+    oof_validation_folds: tuple[int, ...] = ()
+    full_retrain_soft_ensemble: bool = False
+    class_weight_power: float | None = None
+    class_weight_min: float = 0.75
+    class_weight_max: float = 1.50
     report_per_class_metrics: bool = False
     enable_augmentation_audit: bool = True
     augmentation_audit_action: str = "report"
@@ -136,10 +140,14 @@ TASK_B = TaskConfig(
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
     use_augmentation=True,
-    selection_validation_fold=5,
+    selection_validation_fold=None,
     selection_validation_data_origins=("original",),
-    selection_train_label_caps=(("Gender", 870),),
     selection_seeds=(42, 52, 62, 72, 82),
+    oof_validation_folds=(1, 2, 3, 4, 5),
+    full_retrain_soft_ensemble=True,
+    class_weight_power=0.50,
+    class_weight_min=0.75,
+    class_weight_max=1.50,
     report_per_class_metrics=False,
     enable_augmentation_audit=True,
     augmentation_audit_action="report",
@@ -153,7 +161,6 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-# Standard LoRA consumes more VRAM than QLoRA, so Task B also starts at batch/GPU=1.
 LLM_TRAINING_B = replace(LLM_TRAINING)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B

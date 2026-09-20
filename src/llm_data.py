@@ -140,12 +140,14 @@ class CompletionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.prompts)
 
-    def __getitem__(self, index: int) -> dict[str, list[int]]:
+    def __getitem__(self, index: int) -> dict[str, list[int] | int]:
         if self.labels is None:
             raise ValueError(
                 "Unlabeled prompts are for candidate scoring, not training."
             )
-        return self.encoder.feature(self.prompts[index], self.labels[index])
+        feature = self.encoder.feature(self.prompts[index], self.labels[index])
+        feature["class_id"] = self.labels[index]
+        return feature
 
 
 class CompletionCollator:
@@ -154,9 +156,14 @@ class CompletionCollator:
     def __init__(self, pad_token_id: int) -> None:
         self.pad_token_id = pad_token_id
 
-    def __call__(self, features: list[dict[str, list[int]]]) -> dict[str, torch.Tensor]:
+    def __call__(
+        self, features: list[dict[str, list[int] | int]]
+    ) -> dict[str, torch.Tensor]:
         width = max(len(item["input_ids"]) for item in features)
         ids, masks, labels = [], [], []
+        has_class_ids = ["class_id" in item for item in features]
+        if any(has_class_ids) and not all(has_class_ids):
+            raise ValueError("A batch cannot mix labeled and candidate features.")
         for item in features:
             padding = width - len(item["input_ids"])
             ids.append([self.pad_token_id] * padding + item["input_ids"])
@@ -165,9 +172,14 @@ class CompletionCollator:
         attention_mask = torch.tensor(masks, dtype=torch.long)
         position_ids = attention_mask.cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 0)
-        return {
+        batch = {
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "labels": torch.tensor(labels, dtype=torch.long),
         }
+        if all(has_class_ids):
+            batch["class_ids"] = torch.tensor(
+                [item["class_id"] for item in features], dtype=torch.long
+            )
+        return batch

@@ -23,13 +23,14 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from llm_config import LLMTrainingConfig, TASK_A, TASK_B, llm_task
+from llm_config import TASK_A, TASK_B, LLMTrainingConfig, llm_task
 from src.distributed import RuntimeContext
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
     binary_majority_vote,
-    completion_token_diagnostics,
     completion_log_probs,
+    completion_token_diagnostics,
+    compute_class_weights,
     compute_dtype,
     format_per_class_diagnostics,
     require_cuda,
@@ -55,7 +56,16 @@ class TestChatTokenizer:
         return [ord(character) + 10 for character in text]
 
     def decode(self, ids, skip_special_tokens=False):
-        return "".join(chr(value - 10) for value in ids)
+        pieces = []
+        for value in ids:
+            if value == self.eos_token_id:
+                if not skip_special_tokens:
+                    pieces.append(self.eos_token)
+            elif value >= 10:
+                pieces.append(chr(value - 10))
+            elif not skip_special_tokens:
+                pieces.append(f"<{value}>")
+        return "".join(pieces)
 
     def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
         role_ids = {"system": 3, "user": 4, "assistant": 5}
@@ -279,9 +289,47 @@ class LLMTests(unittest.TestCase):
         for a, b in zip(first.parameters(), second.parameters(), strict=True):
             self.assertTrue(torch.allclose(a, b, atol=1e-7))
 
+    def test_mild_class_weights_preserve_scale_and_weight_rare_classes_more(self):
+        labels = np.asarray([0] * 12 + [1] * 4 + [2] * 3, dtype=np.int64)
+        weights, counts = compute_class_weights(labels, 3, 0.5, 0.75, 1.5)
+        self.assertEqual(counts.tolist(), [12, 4, 3])
+        self.assertAlmostEqual(
+            float(np.dot(counts, weights.numpy()) / len(labels)), 1.0, places=6
+        )
+        self.assertLess(weights[0], weights[1])
+        self.assertLess(weights[1], weights[2])
+
+    def test_class_weighted_partial_accumulation_matches_large_batch(self):
+        first = tiny_model()
+        second = copy.deepcopy(first)
+        dataset = CompletionDataset(["a", "b", "long"], self.encoder, [0, 1, 0])
+        class_weights = torch.tensor([0.8, 1.4])
+        for model, batch_size, accumulation in ((first, 1, 8), (second, 3, 1)):
+            loader = DataLoader(
+                dataset, batch_size=batch_size, collate_fn=self.collator
+            )
+            optimizer = torch.optim.SGD(
+                [p for p in model.parameters() if p.requires_grad], lr=0.01
+            )
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
+            train_llm_epoch(
+                model,
+                loader,
+                optimizer,
+                scheduler,
+                torch.amp.GradScaler("cuda", enabled=False),
+                replace(self.config, gradient_accumulation_steps=accumulation),
+                cpu_runtime(),
+                1,
+                class_weights=class_weights,
+            )
+        for a, b in zip(first.parameters(), second.parameters(), strict=True):
+            self.assertTrue(torch.allclose(a, b, atol=1e-7))
+
     def test_candidate_scores_independent_of_batching_and_gold_labels(self):
         model = tiny_model().eval()
-        encoder = ChatEncoder(self.tokenizer, TASK_B, 512)
+        diagnostic_task = replace(TASK_B, report_per_class_metrics=True)
+        encoder = ChatEncoder(self.tokenizer, diagnostic_task, 512)
         data = CompletionDataset(["a", "some other text", "xyz"], encoder, [0, 1, 5])
         before = {name: p.detach().clone() for name, p in model.named_parameters()}
         scores = score_candidates(
@@ -424,8 +472,8 @@ class LLMTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
             require_cuda(cpu_runtime())
 
-    def test_both_pipelines_select_then_retrain_retained_data_before_prediction(self):
-        for original_task in (TASK_A, TASK_B):
+    def test_task_a_selects_then_retrains_every_seed_before_voting(self):
+        for original_task in (TASK_A,):
             with (
                 self.subTest(task=original_task.task_name),
                 tempfile.TemporaryDirectory() as directory,
@@ -439,7 +487,8 @@ class LLMTests(unittest.TestCase):
                     task = replace(
                         task, selection_train_label_caps=(("Gender", 4),)
                     )
-                    fold_frames = []
+                    original_frames = []
+                    augment_frames = []
                     for fold, (original_name, augment_name) in enumerate(
                         zip(
                             task.original_fold_filenames,
@@ -490,10 +539,14 @@ class LLMTests(unittest.TestCase):
                         original["data_origin"] = "original"
                         augment["fold"] = fold
                         augment["data_origin"] = "augmentation"
-                        fold_frames.append(original)
+                        original_frames.append(original)
                         if task.use_augmentation:
-                            fold_frames.append(augment)
-                    frame = pd.concat(fold_frames, ignore_index=True, sort=False)
+                            augment_frames.append(augment)
+                    frame = pd.concat(
+                        original_frames + augment_frames,
+                        ignore_index=True,
+                        sort=False,
+                    )
                     raw_train = np.flatnonzero(
                         frame["fold"].to_numpy() != task.selection_validation_fold
                     )
@@ -542,12 +595,14 @@ class LLMTests(unittest.TestCase):
                 loaded_models = []
                 train_sizes = []
 
-                def model_factory(*_args, **_kwargs):
+                def model_factory(
+                    *_args, loaded_models=loaded_models, **_kwargs
+                ):
                     model = tiny_model()
                     loaded_models.append(model)
                     return model
 
-                def tracked_train(*args, **kwargs):
+                def tracked_train(*args, train_sizes=train_sizes, **kwargs):
                     train_sizes.append(len(args[1].dataset))
                     return train_llm_epoch(*args, **kwargs)
 
@@ -732,6 +787,183 @@ class LLMTests(unittest.TestCase):
                         for index in scores["probabilities"].argmax(axis=1)
                     ]
                 self.assertEqual(result["label"].tolist(), expected)
+
+    def test_task_b_oof_selects_global_epoch_then_soft_ensembles_full_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            retrain_seeds = (42, 52)
+            task = replace(
+                TASK_B,
+                selection_seeds=retrain_seeds,
+                enable_augmentation_audit=False,
+            )
+            rows_per_fold = len(task.labels) * 2
+            for fold, (original_name, augment_name) in enumerate(
+                zip(
+                    task.original_fold_filenames,
+                    task.augmentation_fold_filenames,
+                    strict=True,
+                ),
+                start=1,
+            ):
+                original_labels = list(task.labels) * 2
+                original = pd.DataFrame(
+                    {
+                        "id": [f"original-{fold}-{i}" for i in range(rows_per_fold)],
+                        "Comment": [
+                            f"original comment {fold}-{i}" for i in range(rows_per_fold)
+                        ],
+                        task.label_column: original_labels,
+                    }
+                )
+                augment = pd.DataFrame(
+                    {
+                        "id": [f"augment-{fold}-{i}" for i in range(len(task.labels))],
+                        "Comment": [
+                            f"paraphrase {fold}-{i}" for i in range(len(task.labels))
+                        ],
+                        task.label_column: list(task.labels),
+                        "source_id": original["id"].iloc[: len(task.labels)],
+                        "source_group": [
+                            f"group-{fold}-{i}" for i in range(len(task.labels))
+                        ],
+                        "fold": fold,
+                    }
+                )
+                original.to_csv(root / original_name, index=False)
+                augment.to_csv(root / augment_name, index=False)
+
+            prediction_frame = pd.DataFrame(
+                {
+                    "id": ["0100", "0101", "0102"],
+                    "Comment": ["one", "two", "three"],
+                }
+            )
+            prediction_frame.to_csv(root / task.prediction_filename, index=False)
+            config = replace(
+                self.config,
+                max_epochs=2,
+                train_batch_size_per_gpu=6,
+                gradient_accumulation_steps=1,
+                eval_batch_size_per_gpu=6,
+            )
+            real_score = score_candidates
+            loaded_models = []
+            train_calls = []
+
+            def model_factory(*_args, **_kwargs):
+                model = tiny_model()
+                loaded_models.append(model)
+                return model
+
+            def tracked_train(*args, **kwargs):
+                train_calls.append(
+                    {
+                        "rows": len(args[1].dataset),
+                        "class_weights": kwargs.get("class_weights"),
+                    }
+                )
+                return train_llm_epoch(*args, **kwargs)
+
+            def controlled_score(*args):
+                result = real_score(*args)
+                description = args[-1]
+                dataset = args[1]
+                if description.startswith("OOF fold") and "validation" in description:
+                    epoch = int(description.split(" epoch ", 1)[1].split()[0])
+                    gold = np.asarray(dataset.labels, dtype=np.int64)
+                    predicted = gold if epoch == 1 else (gold + 1) % len(task.labels)
+                    probabilities = np.full(
+                        (len(gold), len(task.labels)), 0.01, dtype=np.float64
+                    )
+                    probabilities[np.arange(len(gold)), predicted] = 0.95
+                    probabilities /= probabilities.sum(axis=1, keepdims=True)
+                    result["probabilities"] = probabilities
+                    result["loss"] = 0.1 if epoch == 1 else 1.0
+                    result["macro_f1"] = 1.0 if epoch == 1 else 0.0
+                    result["accuracy"] = 1.0 if epoch == 1 else 0.0
+                return result
+
+            with (
+                patch("src.llm_training.require_cuda"),
+                patch(
+                    "src.llm_training.initialize_runtime", return_value=cpu_runtime()
+                ),
+                patch(
+                    "src.llm_training.load_lora_model", side_effect=model_factory
+                ),
+                patch(
+                    "src.llm_training.AutoTokenizer.from_pretrained",
+                    return_value=self.tokenizer,
+                ),
+                patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                patch(
+                    "src.llm_training.resolve_data_file", side_effect=root.joinpath
+                ),
+                patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                patch(
+                    "src.llm_training.score_candidates", side_effect=controlled_score
+                ),
+                patch(
+                    "src.llm_training.train_llm_epoch", side_effect=tracked_train
+                ),
+            ):
+                run_llm_task(task, config)
+
+            output = root / "outputs" / task.output_subdir
+            summary = json.loads((output / "run_summary.json").read_text())
+            self.assertEqual(summary["oof"]["best_epoch"], 1)
+            self.assertEqual(summary["oof"]["validation_folds"], [1, 2, 3, 4, 5])
+            self.assertEqual(summary["class_weighting"]["downsampling"], None)
+            self.assertEqual(len(summary["full_data_retrains"]), len(retrain_seeds))
+            self.assertEqual(summary["ensemble"]["method"], (
+                "equal-weight mean of per-seed candidate probabilities"
+            ))
+
+            oof = pd.read_csv(output / "oof_predictions.csv", dtype={"id": str})
+            self.assertEqual(len(oof), rows_per_fold * 5)
+            self.assertEqual(set(oof["fold"]), {1, 2, 3, 4, 5})
+            self.assertTrue((oof["true_label"] == oof["predicted_label"]).all())
+
+            result = pd.read_csv(output / "predictions.csv", dtype={"id": str})
+            ensemble = pd.read_csv(
+                output / "ensemble_predictions.csv", dtype={"id": str}
+            )
+            self.assertEqual(result["id"].tolist(), prediction_frame["id"].tolist())
+            self.assertEqual(result["label"].tolist(), ensemble["final_label"].tolist())
+            probability_columns = [
+                f"mean_prob_{label.lower().replace('-', '_').replace(' ', '_')}"
+                for label in task.labels
+            ]
+            expected_ids = ensemble[probability_columns].to_numpy().argmax(axis=1)
+            self.assertEqual(
+                result["label"].tolist(),
+                [task.labels[index] for index in expected_ids],
+            )
+            with zipfile.ZipFile(output / task.submission_zip_name) as archive:
+                self.assertEqual(archive.namelist(), ["predictions.csv"])
+
+            self.assertEqual(len(loaded_models), 5 + len(retrain_seeds))
+            self.assertEqual(
+                [call["rows"] for call in train_calls],
+                [rows_per_fold * 4 + len(task.labels) * 4] * (5 * config.max_epochs)
+                + [rows_per_fold * 5 + len(task.labels) * 5] * len(retrain_seeds),
+            )
+            self.assertTrue(
+                all(call["class_weights"] is not None for call in train_calls)
+            )
+            self.assertFalse((output / "downsampled_rows.csv").exists())
+            for seed in retrain_seeds:
+                self.assertTrue(
+                    (
+                        root
+                        / "checkpoints"
+                        / task.checkpoint_subdir
+                        / f"seed_{seed}"
+                        / "final_full_data_adapter"
+                    ).is_dir()
+                )
 
 
 if __name__ == "__main__":

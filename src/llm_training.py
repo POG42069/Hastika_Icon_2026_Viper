@@ -38,8 +38,8 @@ from transformers import (
 
 from llm_config import (
     CHECKPOINT_ROOT,
-    OUTPUT_ROOT,
     LLM_TRAINING,
+    OUTPUT_ROOT,
     LLMTrainingConfig,
     TaskConfig,
 )
@@ -64,11 +64,11 @@ from src.training import (
     stratified_holdout_indices,
     unwrap_model,
     write_downsampled_rows,
+    write_seed_selection_results,
     write_split_manifest,
     write_validation_confusion_history,
     write_validation_confusion_matrix,
     write_validation_predictions,
-    write_seed_selection_results,
 )
 
 
@@ -98,6 +98,36 @@ def validate_config(config: LLMTrainingConfig) -> None:
         raise ValueError("initial_loss_scale must be positive")
     if not 0 <= config.warmup_ratio < 1 or not 0 <= config.lora_dropout < 1:
         raise ValueError("warmup_ratio and lora_dropout must be in [0, 1)")
+
+
+def compute_class_weights(
+    label_ids: np.ndarray,
+    n_classes: int,
+    power: float,
+    minimum: float,
+    maximum: float,
+) -> tuple[torch.Tensor, np.ndarray]:
+    """Return mild inverse-frequency weights with mean sample weight one."""
+
+    labels = np.asarray(label_ids, dtype=np.int64)
+    if labels.ndim != 1 or labels.size == 0:
+        raise ValueError("Class weighting requires a non-empty one-dimensional label array.")
+    if np.any((labels < 0) | (labels >= n_classes)):
+        raise ValueError("Class weighting received an invalid label index.")
+    if not 0 < power <= 1:
+        raise ValueError("class_weight_power must be in (0, 1].")
+    if not 0 < minimum <= maximum:
+        raise ValueError("Class-weight bounds must satisfy 0 < minimum <= maximum.")
+    counts = np.bincount(labels, minlength=n_classes).astype(np.int64)
+    if np.any(counts == 0):
+        raise ValueError("Every class must occur in a class-weighted training split.")
+
+    balanced = labels.size / (n_classes * counts.astype(np.float64))
+    weights = np.power(balanced, power)
+    weights = np.clip(weights, minimum, maximum)
+    sample_mean = float(np.dot(counts, weights) / labels.size)
+    weights /= sample_mean
+    return torch.tensor(weights, dtype=torch.float32), counts
 
 
 def compute_dtype(config: LLMTrainingConfig, runtime: RuntimeContext) -> torch.dtype:
@@ -316,7 +346,11 @@ def completion_log_probs(
     keep = labels.shape[1] - int(positions[:, 1].min()) + 1
     base = unwrap_model(model)
     base = base.get_base_model() if hasattr(base, "get_base_model") else base
-    kwargs = {key: value for key, value in batch.items() if key != "labels"}
+    kwargs = {
+        key: value
+        for key, value in batch.items()
+        if key not in {"labels", "class_ids"}
+    }
     if "logits_to_keep" in inspect.signature(base.forward).parameters:
         kwargs["logits_to_keep"] = keep
     logits = model(**kwargs).logits
@@ -339,11 +373,25 @@ def completion_log_probs(
 
 
 def train_llm_epoch(
-    model, loader, optimizer, scheduler, scaler, config, runtime, epoch, phase="LLM"
+    model,
+    loader,
+    optimizer,
+    scheduler,
+    scaler,
+    config,
+    runtime,
+    epoch,
+    phase="LLM",
+    class_weights: torch.Tensor | None = None,
 ):
     """Mean answer-token NLL per example; correctly scale even a partial group."""
     model.train()
     dtype = compute_dtype(config, runtime)
+    device_class_weights = (
+        class_weights.to(runtime.device, dtype=torch.float32)
+        if class_weights is not None
+        else None
+    )
     total_loss, total_examples, successful_updates, skipped_updates = 0.0, 0, 0, 0
     iterator = iter(loader)
     progress = LineProgress(
@@ -367,9 +415,19 @@ def train_llm_epoch(
                 with _autocast(runtime, dtype):
                     log_probs, counts = completion_log_probs(model, batch)
                     example_losses = -log_probs / counts
-                    loss = example_losses.sum() / group_size
+                    if device_class_weights is None:
+                        optimized_losses = example_losses
+                    else:
+                        if "class_ids" not in batch:
+                            raise ValueError(
+                                "Class-weighted training requires class IDs in every batch."
+                            )
+                        optimized_losses = example_losses * device_class_weights[
+                            batch["class_ids"]
+                        ]
+                    loss = optimized_losses.sum() / group_size
                 scaler.scale(loss).backward()
-            total_loss += float(example_losses.detach().sum())
+            total_loss += float(optimized_losses.detach().sum())
             total_examples += len(example_losses)
             progress.update(
                 1, details=f"mean_loss={total_loss / total_examples:.4f}"
@@ -1108,6 +1166,703 @@ def _run_seed_ensemble(
     on_main(export_ensemble_artifacts, runtime)
 
 
+def _classification_metrics(
+    task: TaskConfig,
+    label_ids: np.ndarray,
+    probabilities: np.ndarray,
+    loss: float,
+) -> dict[str, object]:
+    """Compute the fixed-label metrics used for aggregated OOF predictions."""
+
+    labels = np.asarray(label_ids, dtype=np.int64)
+    predictions = np.asarray(probabilities).argmax(axis=1)
+    label_indices = list(range(len(task.labels)))
+    per_class_scores = f1_score(
+        labels,
+        predictions,
+        labels=label_indices,
+        average=None,
+        zero_division=0,
+    )
+    matrix = confusion_matrix(labels, predictions, labels=label_indices)
+    result: dict[str, object] = {
+        "loss": float(loss),
+        "macro_f1": float(
+            f1_score(
+                labels,
+                predictions,
+                labels=label_indices,
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "accuracy": float(accuracy_score(labels, predictions)),
+        "per_class_f1": {
+            label: float(score)
+            for label, score in zip(task.labels, per_class_scores, strict=True)
+        },
+        "confusion_matrix": {
+            "rows": "actual labels",
+            "columns": "predicted labels",
+            "label_order": list(task.labels),
+            "values": matrix.astype(int).tolist(),
+        },
+    }
+    if task.report_per_class_metrics:
+        precision, recall, class_f1, support = precision_recall_fscore_support(
+            labels,
+            predictions,
+            labels=label_indices,
+            zero_division=0,
+        )
+        result["per_class"] = {
+            label: {
+                "precision": float(precision[index]),
+                "recall": float(recall[index]),
+                "f1": float(class_f1[index]),
+                "support": int(support[index]),
+            }
+            for index, label in enumerate(task.labels)
+        }
+    return result
+
+
+def _class_weight_state(
+    task: TaskConfig, label_ids: np.ndarray
+) -> tuple[torch.Tensor | None, dict[str, object] | None]:
+    """Compute task-configured class weights and a JSON-safe audit summary."""
+
+    if task.class_weight_power is None:
+        return None, None
+    weights, counts = compute_class_weights(
+        label_ids,
+        len(task.labels),
+        task.class_weight_power,
+        task.class_weight_min,
+        task.class_weight_max,
+    )
+    summary: dict[str, object] = {
+        "formula": "clip((N / (K * n_c)) ** power, minimum, maximum), then normalize mean sample weight to 1",
+        "power": task.class_weight_power,
+        "pre_normalization_clip": [task.class_weight_min, task.class_weight_max],
+        "counts": {
+            label: int(count) for label, count in zip(task.labels, counts, strict=True)
+        },
+        "weights": {
+            label: float(weight)
+            for label, weight in zip(task.labels, weights.tolist(), strict=True)
+        },
+    }
+    return weights, summary
+
+
+def _write_prediction_diagnostics(
+    frame: pd.DataFrame,
+    task: TaskConfig,
+    probabilities: np.ndarray,
+    path: Path,
+) -> None:
+    """Write labels, folds and probabilities for OOF or ensemble auditing."""
+
+    label_ids = np.asarray(probabilities).argmax(axis=1)
+    data: dict[str, object] = {
+        "id": frame["id"].astype(str).tolist(),
+    }
+    if task.label_column in frame:
+        data["true_label"] = frame[task.label_column].tolist()
+    if "fold" in frame:
+        data["fold"] = frame["fold"].astype(int).tolist()
+    data["predicted_label"] = [task.labels[index] for index in label_ids]
+    for label_index, label in enumerate(task.labels):
+        safe_label = label.lower().replace("-", "_").replace(" ", "_")
+        data[f"prob_{safe_label}"] = probabilities[:, label_index]
+    pd.DataFrame(data).to_csv(
+        path,
+        index=False,
+        encoding="utf-8",
+        lineterminator="\n",
+    )
+
+
+def _run_oof_full_retrain_ensemble(
+    *,
+    task: TaskConfig,
+    config: LLMTrainingConfig,
+    runtime: RuntimeContext,
+    frame: pd.DataFrame,
+    prediction_frame: pd.DataFrame,
+    prediction_data: CompletionDataset,
+    collator: CompletionCollator,
+    encoder: ChatEncoder,
+    tokenizer: object,
+    output_dir: Path,
+    checkpoint_dir: Path,
+    retrain_seeds: tuple[int, ...],
+    token_diagnostics: list[dict[str, object]],
+) -> None:
+    """Select one epoch with five-fold OOF, then soft-ensemble full-data seeds."""
+
+    folds = task.oof_validation_folds
+    configured_folds = tuple(range(1, len(task.original_fold_filenames) + 1))
+    if tuple(sorted(folds)) != configured_folds or len(set(folds)) != len(folds):
+        raise ValueError("OOF validation folds must contain every configured fold once.")
+    if not task.full_retrain_soft_ensemble:
+        raise ValueError("OOF Task B requires full_retrain_soft_ensemble=True.")
+    if len(retrain_seeds) < 2:
+        raise ValueError("A full-data soft ensemble requires at least two seeds.")
+    if task.selection_train_label_caps:
+        raise ValueError("OOF class-weighted training cannot also downsample labels.")
+    if task.class_weight_power is None:
+        raise ValueError("OOF Task B requires class-weighted loss.")
+
+    n_labels = len(task.labels)
+    fold_epoch_outputs: list[dict[str, object]] = []
+    fold_summaries: list[dict[str, object]] = []
+    resolved_revision = None
+    parameter_counts = None
+
+    log(
+        f"\n=== PHASE 1/2 | {len(folds)}-FOLD OOF EPOCH SELECTION "
+        f"| fixed selection seed={config.seed} ===",
+        runtime,
+    )
+    for fold_number, validation_fold in enumerate(folds, start=1):
+        train_indices, validation_indices = predefined_fold_indices(
+            frame["fold"].to_numpy(),
+            validation_fold,
+            frame["data_origin"].to_numpy(),
+            task.selection_validation_data_origins,
+        )
+        train_frame = frame.iloc[train_indices]
+        validation_frame = frame.iloc[validation_indices]
+        train_data = CompletionDataset(
+            train_frame["text"].tolist(),
+            encoder,
+            train_frame["label_id"].tolist(),
+        )
+        validation_data = CompletionDataset(
+            validation_frame["text"].tolist(),
+            encoder,
+            validation_frame["label_id"].tolist(),
+        )
+        class_weights, class_weight_summary = _class_weight_state(
+            task, train_frame["label_id"].to_numpy()
+        )
+        if class_weight_summary is not None:
+            log(
+                f"OOF fold {validation_fold} class weights: "
+                + " | ".join(
+                    f"{label}={class_weight_summary['weights'][label]:.4f}"
+                    for label in task.labels
+                ),
+                runtime,
+            )
+
+        set_global_seed(config.seed)
+        train_loader, train_sampler = create_train_loader(
+            train_data, collator, config, runtime, config.seed
+        )
+        model = load_lora_model(config, runtime)
+        if parameter_counts is None:
+            base = model.get_base_model()
+            resolved_revision = getattr(base.config, "_commit_hash", None)
+            parameter_counts = {
+                "trainable": sum(
+                    parameter.numel()
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                ),
+                "reported_total": model.num_parameters(),
+            }
+            del base
+        model = _wrap_for_ddp(model, runtime)
+        optimizer, scheduler, scaler = _training_state(
+            model, train_loader, config.max_epochs, config, runtime
+        )
+        fold_history = []
+        epoch_outputs = []
+        log(
+            f"\n--- OOF fold {fold_number}/{len(folds)} | validation fold="
+            f"{validation_fold} | train={len(train_data)} | "
+            f"validation={len(validation_data)} ---",
+            runtime,
+        )
+        for epoch in range(1, config.max_epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            train_loss = train_llm_epoch(
+                model,
+                train_loader,
+                optimizer,
+                scheduler,
+                scaler,
+                config,
+                runtime,
+                epoch,
+                f"OOF fold {validation_fold}",
+                class_weights=class_weights,
+            )
+            metrics = score_candidates(
+                model,
+                validation_data,
+                collator,
+                config,
+                runtime,
+                f"OOF fold {validation_fold} epoch {epoch} validation",
+            )
+            public_record = {
+                "epoch": epoch,
+                "train_weighted_loss": train_loss,
+                **{
+                    key: metrics[key]
+                    for key in (
+                        "loss",
+                        "macro_f1",
+                        "accuracy",
+                        "per_class_f1",
+                        "confusion_matrix",
+                    )
+                },
+            }
+            if "per_class" in metrics:
+                public_record["per_class"] = metrics["per_class"]
+            fold_history.append(public_record)
+            epoch_outputs.append(
+                {
+                    "epoch": epoch,
+                    "validation_indices": validation_indices,
+                    "probabilities": metrics["probabilities"],
+                    "loss": metrics["loss"],
+                }
+            )
+            log(
+                f"OOF fold {validation_fold} epoch {epoch}: "
+                f"train_weighted_loss={train_loss:.5f}, "
+                f"val_loss={metrics['loss']:.5f}, "
+                f"macro_f1={metrics['macro_f1']:.5f}, "
+                f"accuracy={metrics['accuracy']:.5f}",
+                runtime,
+            )
+
+        fold_output_dir = output_dir / f"oof_fold_{validation_fold}"
+
+        def export_fold_history(
+            fold_output_dir=fold_output_dir,
+            validation_fold=validation_fold,
+            fold_history=fold_history,
+            class_weight_summary=class_weight_summary,
+        ) -> None:
+            fold_output_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                fold_output_dir / "selection_training_history.json",
+                {
+                    "validation_fold": validation_fold,
+                    "selection_seed": config.seed,
+                    "class_weighting": class_weight_summary,
+                    "epochs": fold_history,
+                },
+            )
+
+        on_main(export_fold_history, runtime)
+        fold_epoch_outputs.extend(epoch_outputs)
+        fold_summaries.append(
+            {
+                "validation_fold": validation_fold,
+                "selection_seed": config.seed,
+                "train_rows": len(train_data),
+                "validation_rows": len(validation_data),
+                "train_label_distribution": train_frame[task.label_column]
+                .value_counts()
+                .to_dict(),
+                "validation_label_distribution": validation_frame[task.label_column]
+                .value_counts()
+                .to_dict(),
+                "class_weighting": class_weight_summary,
+                "truncated_train_comments": train_data.truncated_count,
+                "truncated_validation_comments": validation_data.truncated_count,
+            }
+        )
+        del model, optimizer, scheduler, scaler, train_loader, train_data, validation_data
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    original_indices = np.flatnonzero(
+        frame["data_origin"].to_numpy() == "original"
+    ).astype(np.int64)
+    original_labels = frame.iloc[original_indices]["label_id"].to_numpy()
+    oof_history = []
+    oof_probabilities_by_epoch: dict[int, np.ndarray] = {}
+    best_epoch, best_metric, best_loss = 0, -math.inf, math.inf
+    for epoch in range(1, config.max_epochs + 1):
+        probabilities_by_row = np.full((len(frame), n_labels), np.nan, dtype=np.float64)
+        seen = np.zeros(len(frame), dtype=bool)
+        loss_sum = 0.0
+        validation_rows = 0
+        for output in fold_epoch_outputs:
+            if output["epoch"] != epoch:
+                continue
+            indices = output["validation_indices"]
+            if seen[indices].any():
+                raise RuntimeError("An original row received duplicate OOF predictions.")
+            probabilities_by_row[indices] = output["probabilities"]
+            seen[indices] = True
+            loss_sum += float(output["loss"]) * len(indices)
+            validation_rows += len(indices)
+        if validation_rows != len(original_indices) or not seen[original_indices].all():
+            raise RuntimeError("OOF predictions do not cover every original row exactly once.")
+        probabilities = probabilities_by_row[original_indices]
+        metrics = _classification_metrics(
+            task,
+            original_labels,
+            probabilities,
+            loss_sum / validation_rows,
+        )
+        record = {"epoch": epoch, **metrics}
+        oof_history.append(record)
+        oof_probabilities_by_epoch[epoch] = probabilities
+        log(
+            f"OOF aggregate epoch {epoch}: loss={metrics['loss']:.5f}, "
+            f"macro_f1={metrics['macro_f1']:.5f}, "
+            f"accuracy={metrics['accuracy']:.5f}",
+            runtime,
+        )
+        if is_better_checkpoint(
+            metrics["macro_f1"], metrics["loss"], best_metric, best_loss
+        ):
+            best_epoch = epoch
+            best_metric = metrics["macro_f1"]
+            best_loss = metrics["loss"]
+
+    best_oof_record = oof_history[best_epoch - 1]
+    original_frame = frame.iloc[original_indices]
+
+    def export_oof_artifacts() -> None:
+        scalar_rows = [
+            {
+                "epoch": record["epoch"],
+                "loss": record["loss"],
+                "macro_f1": record["macro_f1"],
+                "accuracy": record["accuracy"],
+                "selected": record["epoch"] == best_epoch,
+            }
+            for record in oof_history
+        ]
+        pd.DataFrame(scalar_rows).to_csv(
+            output_dir / "oof_epoch_results.csv", index=False, encoding="utf-8"
+        )
+        _write_json(
+            output_dir / "oof_selection_summary.json",
+            {
+                "selection_rule": (
+                    "highest aggregate OOF macro_f1; lowest aggregate OOF loss "
+                    "breaks exact ties"
+                ),
+                "selection_seed": config.seed,
+                "validation_folds": list(folds),
+                "best_epoch": best_epoch,
+                "best_macro_f1": best_metric,
+                "best_loss": best_loss,
+                "folds": fold_summaries,
+                "epochs": oof_history,
+            },
+        )
+        write_validation_confusion_history(oof_history, output_dir)
+        for record in oof_history:
+            write_validation_confusion_matrix(
+                record["confusion_matrix"], record["epoch"], output_dir
+            )
+            _write_prediction_diagnostics(
+                original_frame,
+                task,
+                oof_probabilities_by_epoch[record["epoch"]],
+                output_dir / f"oof_predictions_epoch_{record['epoch']}.csv",
+            )
+        _write_prediction_diagnostics(
+            original_frame,
+            task,
+            oof_probabilities_by_epoch[best_epoch],
+            output_dir / "oof_predictions.csv",
+        )
+        for validation_fold in folds:
+            fold_indices = np.flatnonzero(
+                original_frame["fold"].to_numpy() == validation_fold
+            )
+            _write_prediction_diagnostics(
+                original_frame.iloc[fold_indices],
+                task,
+                oof_probabilities_by_epoch[best_epoch][fold_indices],
+                output_dir
+                / f"oof_fold_{validation_fold}"
+                / "validation_predictions.csv",
+            )
+
+    on_main(export_oof_artifacts, runtime)
+    log(
+        f"\nOOF selected global epoch={best_epoch}, "
+        f"Macro-F1={best_metric:.5f}, loss={best_loss:.5f}.",
+        runtime,
+    )
+
+    full_train_data = CompletionDataset(
+        frame["text"].tolist(), encoder, frame["label_id"].tolist()
+    )
+    full_class_weights, full_class_weight_summary = _class_weight_state(
+        task, frame["label_id"].to_numpy()
+    )
+    log(
+        "Full-data class weights: "
+        + " | ".join(
+            f"{label}={full_class_weight_summary['weights'][label]:.4f}"
+            for label in task.labels
+        ),
+        runtime,
+    )
+    retrained_results = []
+    for seed_number, seed in enumerate(retrain_seeds, start=1):
+        seed_output_dir = output_dir / f"seed_{seed}"
+        seed_checkpoint_dir = checkpoint_dir / f"seed_{seed}"
+        final_adapter_dir = seed_checkpoint_dir / "final_full_data_adapter"
+        on_main(
+            partial(seed_output_dir.mkdir, parents=True, exist_ok=True), runtime
+        )
+        on_main(
+            partial(seed_checkpoint_dir.mkdir, parents=True, exist_ok=True), runtime
+        )
+        log(
+            f"\n=== PHASE 2/2 | FULL-DATA MODEL {seed_number}/{len(retrain_seeds)} "
+            f"| seed={seed} | rows={len(full_train_data)} | epochs={best_epoch} ===",
+            runtime,
+        )
+        set_global_seed(seed)
+        full_loader, full_sampler = create_train_loader(
+            full_train_data, collator, config, runtime, seed
+        )
+        model = _wrap_for_ddp(load_lora_model(config, runtime), runtime)
+        optimizer, scheduler, scaler = _training_state(
+            model, full_loader, best_epoch, config, runtime
+        )
+        full_history = []
+        for epoch in range(1, best_epoch + 1):
+            if full_sampler is not None:
+                full_sampler.set_epoch(epoch)
+            train_loss = train_llm_epoch(
+                model,
+                full_loader,
+                optimizer,
+                scheduler,
+                scaler,
+                config,
+                runtime,
+                epoch,
+                f"Full-data retrain seed {seed}",
+                class_weights=full_class_weights,
+            )
+            full_history.append(
+                {"epoch": epoch, "train_weighted_loss": train_loss}
+            )
+            log(
+                f"Seed {seed} full-data epoch {epoch}/{best_epoch}: "
+                f"train_weighted_loss={train_loss:.5f}",
+                runtime,
+            )
+            on_main(
+                lambda seed_output_dir=seed_output_dir,
+                seed=seed,
+                full_history=list(full_history): _write_json(
+                    seed_output_dir / "full_data_training_history.json",
+                    {
+                        "seed": seed,
+                        "class_weighting": full_class_weight_summary,
+                        "epochs": full_history,
+                    },
+                ),
+                runtime,
+            )
+
+        del optimizer, scheduler, scaler
+        on_main(partial(save_adapter, model, tokenizer, final_adapter_dir), runtime)
+        restore_adapter(model, final_adapter_dir)
+        predictions = score_candidates(
+            model,
+            prediction_data,
+            collator,
+            config,
+            runtime,
+            f"Development prediction seed {seed}",
+        )
+        probabilities = predictions["probabilities"]
+        label_ids = probabilities.argmax(axis=1)
+        summary = {
+            "seed": seed,
+            "epochs": best_epoch,
+            "training_rows": len(full_train_data),
+            "checkpoint": str(final_adapter_dir),
+            "prediction_source": "seed_specific_full_data_adapter",
+        }
+
+        def export_seed_predictions(
+            seed_output_dir=seed_output_dir,
+            label_ids=label_ids,
+            summary=summary,
+        ) -> None:
+            write_submission(
+                prediction_frame["id"].tolist(),
+                [task.labels[index] for index in label_ids],
+                task.labels,
+                seed_output_dir,
+                task.submission_zip_name,
+            )
+            _write_json(seed_output_dir / "seed_summary.json", summary)
+
+        on_main(export_seed_predictions, runtime)
+        retrained_results.append(
+            {
+                "seed": seed,
+                "probabilities": probabilities,
+                "label_ids": label_ids,
+                "summary": summary,
+            }
+        )
+        del model, full_loader
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    stacked_probabilities = np.stack(
+        [result["probabilities"] for result in retrained_results], axis=0
+    )
+    mean_probabilities = stacked_probabilities.mean(axis=0)
+    final_ids = mean_probabilities.argmax(axis=1)
+    final_labels = [task.labels[index] for index in final_ids]
+
+    def export_final_ensemble() -> None:
+        ensemble_data: dict[str, object] = {
+            "id": prediction_frame["id"].astype(str).tolist()
+        }
+        for result in retrained_results:
+            ensemble_data[f"seed_{result['seed']}"] = [
+                task.labels[index] for index in result["label_ids"]
+            ]
+        for label_index, label in enumerate(task.labels):
+            safe_label = label.lower().replace("-", "_").replace(" ", "_")
+            ensemble_data[f"mean_prob_{safe_label}"] = mean_probabilities[
+                :, label_index
+            ]
+            ensemble_data[f"votes_{safe_label}"] = np.sum(
+                np.stack(
+                    [result["label_ids"] for result in retrained_results], axis=0
+                )
+                == label_index,
+                axis=0,
+            )
+        ensemble_data["final_label"] = final_labels
+        pd.DataFrame(ensemble_data).to_csv(
+            output_dir / "ensemble_predictions.csv",
+            index=False,
+            encoding="utf-8",
+            lineterminator="\n",
+        )
+        csv_path, zip_path = write_submission(
+            prediction_frame["id"].tolist(),
+            final_labels,
+            task.labels,
+            output_dir,
+            task.submission_zip_name,
+        )
+        ensemble_summary = {
+            "method": "equal-weight mean of per-seed candidate probabilities",
+            "seeds": list(retrain_seeds),
+            "models": len(retrained_results),
+            "prediction_file": str(csv_path),
+            "audit_file": str(output_dir / "ensemble_predictions.csv"),
+            "submission": str(zip_path),
+        }
+        retrain_summaries = [result["summary"] for result in retrained_results]
+        _write_json(
+            checkpoint_dir / "metrics.json",
+            {
+                "oof_selection": best_oof_record,
+                "full_data_retrains": retrain_summaries,
+                "ensemble": ensemble_summary,
+            },
+        )
+        _write_json(
+            output_dir / "run_summary.json",
+            {
+                "task": task.task_name,
+                "method": (
+                    "LoRA answer-only causal LM with five-fold OOF epoch "
+                    "selection and full-data soft seed ensemble"
+                ),
+                "model": config.model_name,
+                "resolved_model_revision": resolved_revision,
+                "world_size": runtime.world_size,
+                "compute_dtype": str(compute_dtype(config, runtime)),
+                "quantization": None,
+                "effective_train_batch_size": config.train_batch_size_per_gpu
+                * config.gradient_accumulation_steps
+                * runtime.world_size,
+                "oof": {
+                    "selection_seed": config.seed,
+                    "validation_folds": list(folds),
+                    "validation_origins": list(
+                        task.selection_validation_data_origins
+                    ),
+                    "best_epoch": best_epoch,
+                    "best_macro_f1": best_metric,
+                    "best_loss": best_loss,
+                    "original_rows": len(original_indices),
+                    "folds": fold_summaries,
+                    "epochs": oof_history,
+                },
+                "class_weighting": {
+                    "downsampling": None,
+                    "full_data": full_class_weight_summary,
+                },
+                "full_data_retrains": retrain_summaries,
+                "ensemble": ensemble_summary,
+                "development_rows": len(prediction_data),
+                "training_config": asdict(config),
+                "parameters": parameter_counts,
+                "system_prompt": encoder.system_text,
+                "label_order": list(task.labels),
+                "completion_token_ids": encoder.completions,
+                "completion_token_diagnostics": token_diagnostics,
+                "inference": (
+                    "mean token log likelihood per allowed code, softmax per model, "
+                    "then equal-weight mean probabilities across full-data seeds"
+                ),
+                "truncated_comments": {
+                    "full_train": full_train_data.truncated_count,
+                    "development": prediction_data.truncated_count,
+                },
+                "input_sha256": {
+                    name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
+                    for name in (*task.labeled_filenames(), task.prediction_filename)
+                },
+                "packages": {
+                    name: version(name)
+                    for name in (
+                        "torch",
+                        "transformers",
+                        "peft",
+                        "accelerate",
+                        "scikit-learn",
+                    )
+                },
+            },
+        )
+        log(
+            f"\n=== COMPLETE | {task.task_name} ===\n"
+            f"OOF best epoch: {best_epoch} | Macro-F1={best_metric:.5f}\n"
+            f"Full-data seeds: {list(retrain_seeds)}\n"
+            f"Ensemble: equal-weight soft probability mean\n"
+            f"Predictions: {csv_path}\nSubmission: {zip_path}",
+            runtime,
+        )
+
+    on_main(export_final_ensemble, runtime)
+
+
 def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
     """Select epochs, retrain configured seeds, then predict development."""
 
@@ -1124,6 +1879,13 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             raise ValueError(
                 "ensemble_all_seeds currently supports binary Non-Hate/Hate only"
             )
+    if task.oof_validation_folds:
+        if task.ensemble_all_seeds:
+            raise ValueError("OOF soft ensembling and binary hard voting are exclusive.")
+        if not task.original_fold_filenames:
+            raise ValueError("OOF selection requires predefined fold files.")
+        if not task.full_retrain_soft_ensemble:
+            raise ValueError("OOF selection requires a full-data soft ensemble.")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     runtime = initialize_runtime()
     try:
@@ -1144,7 +1906,11 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         for name, data in (("train", frame), ("development", prediction_frame)):
             if data.empty:
                 raise ValueError(f"{name} input must contain at least one row.")
-        if task.selection_validation_fold is None:
+        if task.oof_validation_folds:
+            base_train_indices = val_indices = None
+            split_strategy = "five_fold_oof"
+            split_heading = "five-fold OOF epoch selection"
+        elif task.selection_validation_fold is None:
             base_train_indices, val_indices = stratified_holdout_indices(
                 frame["label_id"].to_numpy(), config.validation_size, config.seed
             )
@@ -1180,10 +1946,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         encoder = ChatEncoder(tokenizer, task, config.max_length)
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
-        val_frame = frame.iloc[val_indices]
-        val_data = CompletionDataset(
-            val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
-        )
         prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
         collator = CompletionCollator(tokenizer.pad_token_id)
 
@@ -1192,6 +1954,29 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         final_adapter_dir = checkpoint_dir / "final_full_data_adapter"
         on_main(lambda: output_dir.mkdir(parents=True, exist_ok=True), runtime)
         on_main(lambda: checkpoint_dir.mkdir(parents=True, exist_ok=True), runtime)
+
+        if task.oof_validation_folds:
+            _run_oof_full_retrain_ensemble(
+                task=task,
+                config=config,
+                runtime=runtime,
+                frame=frame,
+                prediction_frame=prediction_frame,
+                prediction_data=prediction_data,
+                collator=collator,
+                encoder=encoder,
+                tokenizer=tokenizer,
+                output_dir=output_dir,
+                checkpoint_dir=checkpoint_dir,
+                retrain_seeds=selection_seeds,
+                token_diagnostics=token_diagnostics,
+            )
+            return
+
+        val_frame = frame.iloc[val_indices]
+        val_data = CompletionDataset(
+            val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
+        )
 
         seed_results = []
         resolved_revision = None
@@ -1383,7 +2168,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     stale += 1
                 on_main(
                     lambda seed_output_dir=seed_output_dir,
-                    selection_history=selection_history: _write_json(
+                    selection_history=selection_history,
+                    selection_seed=selection_seed: _write_json(
                         seed_output_dir / "selection_training_history.json",
                         {"seed": selection_seed, "epochs": selection_history},
                     ),

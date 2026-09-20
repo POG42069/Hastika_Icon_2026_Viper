@@ -1,4 +1,4 @@
-"""Select and retrain Qwen with LoRA, then export Task B predictions."""
+"""Select an epoch by five-fold OOF, retrain five LoRA models, and ensemble."""
 
 from llm_config import LLM_TRAINING_B, TASK_B_LLM
 from src.llm_training import run_llm_cli
