@@ -14,22 +14,26 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Task A chia stratified 80% train và 20% validation với seed 42. Task B dùng
+1. Cả hai task dùng predefined folds để giữ câu nguồn và augment cùng một fold.
+   Task A dùng `binary_original_1..4 + binary_augment1..4` để train và chỉ
+   `binary_original_5` để validation. Task B dùng
    `original_1..4 + augment1..4` để train và `original_5` để validation.
-2. Task B chạy độc lập với 5 seed `42, 52, 62, 72, 82`. Mỗi seed lấy ngẫu
-   nhiên một tập Gender khác nhau xuống tối đa 870 câu, train LoRA và chọn
-   checkpoint tốt nhất trên cùng một validation cố định. Macro-F1 cao hơn
-   thắng; validation loss thấp hơn dùng để phá hòa.
-3. Chọn seed tốt nhất, lấy `best_epoch` của seed đó, khởi tạo lại backbone và
-   LoRA từ đầu, rồi train
-   đúng số epoch đó trên toàn bộ dữ liệu được giữ lại. Task A dùng toàn bộ dữ
-   liệu gốc. Task B dùng cả `original_1..5 + augment1..5`, ngoại trừ các câu
-   Gender bị seed chiến thắng loại khỏi fold 1-4. Không validation hoặc early
-   stopping ở giai đoạn này.
-4. Dùng adapter retrain 100% để dự đoán development inputs và tạo
-   `predictions.csv` cùng file ZIP nộp CodaBench.
+2. Task A và Task B đều chạy 5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
+   và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
+   thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
+   lấy ngẫu nhiên một tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
+3. Với Task A, cả 5 seed đều khởi tạo lại backbone và LoRA từ đầu, rồi retrain
+   trên `binary_original_1..5 + binary_augment1..5` theo `best_epoch` riêng.
+   Năm adapter dự đoán development độc lập; nhãn cuối là hard majority vote,
+   tức `Hate` khi có ít nhất 3 phiếu, ngược lại là `Non-Hate`.
+4. Task B vẫn chọn seed tốt nhất, khởi tạo lại từ đầu và retrain trên
+   `original_1..5 + augment1..5`, ngoại trừ các câu Gender bị seed chiến thắng
+   loại khỏi fold 1-4.
+5. Adapter full-retrain dùng để dự đoán development inputs và tạo
+   `predictions.csv` cùng file ZIP nộp CodaBench. Full-retrain không đánh giá
+   lại fold 5 vì fold này đã được đưa vào dữ liệu huấn luyện đầy đủ.
 
-Việc khởi tạo lại ở bước 3 giúp tất cả mẫu được học số epoch như nhau. Nếu
+Việc khởi tạo lại ở bước full-retrain giúp tất cả mẫu được học số epoch như nhau. Nếu
 tiếp tục trực tiếp từ adapter 80%, nhóm 80% ban đầu sẽ được học nhiều lần hơn
 nhóm validation cũ.
 
@@ -53,7 +57,6 @@ Cấu hình mặc định trong `llm_config.py`:
 | Tham số | Giá trị |
 |---|---:|
 | Backbone | `Qwen/Qwen2.5-3B-Instruct` |
-| Task B model revision | `aa8e72537993ba99e69dfaafa59ed015b17504d1` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
@@ -89,7 +92,8 @@ hoặc một Kaggle Dataset dưới `/kaggle/input`.
 Task A:
 
 ```text
-binary_train.csv
+binary_original_1.csv ... binary_original_5.csv
+binary_augment1.csv ... binary_augment5.csv
 binary_validation_inputs.csv
 ```
 
@@ -101,17 +105,32 @@ augment1.csv ... augment5.csv
 multiclass_validation_inputs.csv
 ```
 
-`Train_B_LLM.py` tái hiện cấu hình của lượt Task B đạt `0.66`. Trước khi train,
-script đối chiếu cấu hình, hai GPU worker, FP16, các phiên bản package đã ghi
-nhận và SHA-256 của cả 11 file input với `reproduction_task_b_066.json`. Nếu
-có bất kỳ sai khác nào, script dừng trước khi tốn thời gian GPU. Bộ input khớp
-tham chiếu đang được lưu riêng trong `New_Hastika_1.zip`; dữ liệu vẫn bị
-`.gitignore` loại khỏi Git.
-
 Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Development CSV
 cần `id`, `Comment`. Các file `augment*.csv` cần thêm `source_id`,
 `source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn nằm cùng fold,
 nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
+
+Tạo lại dữ liệu Task A cân bằng từ bộ dữ liệu đã làm sạch:
+
+```bash
+python scripts/build_task_a_balanced_data.py \
+  --input-dir ../hastika_regenerated_augments \
+  --output-dir ../task_a_balanced
+```
+
+Script không sửa dữ liệu nguồn. Nó audit Hate augment, khôi phục các câu nguồn
+Task B còn thiếu trong binary data, gán fold có seed cố định, sinh Non-Hate
+variants bảo thủ, tạo hàng chờ human review và xuất các fold Task A. Đặt
+`HASTIKA_DATA_DIR` trỏ tới thư mục output trước khi train.
+
+Chạy sanity check nhẹ trước khi dùng GPU:
+
+```bash
+python scripts/evaluate_task_a_data_sanity.py --data-dir ../task_a_balanced
+```
+
+Đây chỉ là kiểm tra hồi quy dữ liệu bằng character n-gram Naive Bayes. Quyết
+định cuối cùng vẫn dựa trên LoRA experiment với original-only fold 5.
 
 ## Chạy trên Kaggle
 
@@ -143,18 +162,22 @@ Có thể đặt thư mục bằng biến môi trường trước khi chạy:
 
 ## Tokenization, loss và dự đoán
 
-Mỗi mẫu có dạng:
+Task A dùng trực tiếp nhãn chính thức trong assistant response:
 
 ```text
-System: Classify ... Reply with exactly one allowed label.
+System: Classify ... Allowed labels: Non-Hate; Hate.
 User: Comment:\n<normalized Comment>
-Assistant: <official label>
+Assistant: Non-Hate hoặc Hate
 ```
+
+Task B vẫn dùng các mã nội bộ `A`–`F` để giữ các candidate completion ngắn.
 
 Code gọi `apply_chat_template` của tokenizer. Prompt và padding được mask bằng
 `-100`; loss chỉ áp dụng cho các token của assistant label và phần kết thúc
-chat. Khi dự đoán, pipeline tính tổng log-likelihood cho từng nhãn hợp lệ và
-chọn nhãn có điểm lớn nhất; không sinh văn bản tự do và không regex sửa kết quả.
+chat. Khi dự đoán, pipeline tính mean token log-likelihood cho từng câu trả lời
+hợp lệ và chọn nhãn có điểm lớn nhất; phép chuẩn hóa này tránh thiên vị câu trả
+lời ngắn khi Task A dùng trực tiếp tên nhãn. Pipeline không sinh văn bản tự do
+và không regex sửa kết quả.
 
 Tiến trình train, validation và prediction được ghi thành dòng cố định mỗi 10%
 với số batch/candidate, elapsed time, ETA, tốc độ và mean loss khi train. Cách
@@ -166,33 +189,42 @@ nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện,
 
 ## Artifacts
 
-Ví dụ Task A:
+Task A:
 
 ```text
-checkpoints/task_a_lora/best_holdout_adapter/
-checkpoints/task_a_lora/final_full_data_adapter/
+checkpoints/task_a_lora/seed_42/best_holdout_adapter/
+checkpoints/task_a_lora/seed_42/final_full_data_adapter/
+checkpoints/task_a_lora/seed_52/...
+checkpoints/task_a_lora/seed_62/...
+checkpoints/task_a_lora/seed_72/...
+checkpoints/task_a_lora/seed_82/...
 checkpoints/task_a_lora/metrics.json
+outputs/task_a_lora/seed_42/validation_predictions.csv
+outputs/task_a_lora/seed_42/predictions.csv
+outputs/task_a_lora/seed_52/...
 outputs/task_a_lora/selection_training_history.json
-outputs/task_a_lora/full_data_training_history.json
 outputs/task_a_lora/split_manifest.csv
 outputs/task_a_lora/validation_predictions.csv
+outputs/task_a_lora/seed_selection_results.csv
+outputs/task_a_lora/voting_predictions.csv
 outputs/task_a_lora/predictions.csv
 outputs/task_a_lora/task_a_submission.zip
 outputs/task_a_lora/run_summary.json
 ```
 
-`validation_predictions.csv` được tạo bằng best holdout adapter để phân tích.
-`predictions.csv` và ZIP luôn được tạo bằng `final_full_data_adapter`.
+`validation_predictions.csv` ở thư mục gốc là kết quả của seed có holdout tốt
+nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 5 seed,
+số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
+kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
 Task B còn tạo một thư mục riêng cho từng seed, ví dụ
 `outputs/task_b_lora/seed_42/`, cùng `seed_selection_results.csv` và
 `seed_selection_summary.json`. Các artifact ở trực tiếp
 `outputs/task_b_lora/` luôn tương ứng với seed chiến thắng.
 
-Lưu ý: chọn seed tốt nhất trên cùng một validation cũng là một dạng tối ưu theo
-validation, nên Macro-F1 của seed thắng có thể lạc quan hơn khả năng tổng quát
-thực tế. File tổng hợp vì vậy lưu cả điểm trung bình và độ lệch chuẩn của 5
-seed; test/development chính thức vẫn là đánh giá cuối cùng.
+Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
+tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức
+vẫn là đánh giá cuối cùng.
 
 ## Kiểm thử
 

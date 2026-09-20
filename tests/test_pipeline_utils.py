@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +28,14 @@ class TextNormalizationTests(unittest.TestCase):
             "Français CARS & <b>@person https://example.com</b> "
             "#Kannada!!! 😊 soooo"
         )
+        task = replace(
+            TASK_A,
+            original_fold_filenames=(),
+            augmentation_fold_filenames=(),
+            use_augmentation=False,
+            selection_validation_fold=None,
+            selection_validation_data_origins=(),
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pd.DataFrame(
@@ -35,12 +44,12 @@ class TextNormalizationTests(unittest.TestCase):
                     "Comment": [raw, None],
                     "Label": ["Non-Hate", "Hate"],
                 }
-            ).to_csv(root / TASK_A.train_filename, index=False)
+            ).to_csv(root / task.train_filename, index=False)
             pd.DataFrame(
                 {"id": ["003"], "Comment": ["Soooo GOOD!!!!!"]}
-            ).to_csv(root / TASK_A.prediction_filename, index=False)
+            ).to_csv(root / task.prediction_filename, index=False)
             with patch("src.data.resolve_data_file", side_effect=root.joinpath):
-                train, development = load_task_frames(TASK_A)
+                train, development = load_task_frames(task)
         self.assertEqual(train["text"].tolist(), [normalized, ""])
         self.assertEqual(development["text"].tolist(), ["Soooo GOOD!!!!!"])
 

@@ -27,6 +27,7 @@ from llm_config import LLMTrainingConfig, TASK_A, TASK_B, llm_task
 from src.distributed import RuntimeContext
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
+    binary_majority_vote,
     completion_token_diagnostics,
     completion_log_probs,
     compute_dtype,
@@ -54,10 +55,7 @@ class TestChatTokenizer:
         return [ord(character) + 10 for character in text]
 
     def decode(self, ids, skip_special_tokens=False):
-        return "".join(
-            "<end>" if value == self.eos_token_id else chr(value - 10)
-            for value in ids
-        )
+        return "".join(chr(value - 10) for value in ids)
 
     def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
         role_ids = {"system": 3, "user": 4, "assistant": 5}
@@ -147,25 +145,28 @@ class LLMTests(unittest.TestCase):
         )
 
     def test_answer_mask_and_truncation_preserve_full_labels(self):
+        self.assertEqual(TASK_A.label_codes, TASK_A.labels)
+        self.assertIn("Allowed labels: Non-Hate; Hate", self.encoder.system_text)
+        self.assertNotIn("Code mapping", self.encoder.system_text)
         for task in (TASK_A, TASK_B):
             encoder = ChatEncoder(self.tokenizer, task, 512)
             prompt, truncated = encoder.encode_prompt("long comment " * 300)
             self.assertTrue(truncated)
-            for label_id, label in enumerate(task.labels):
+            for label_id, code in enumerate(task.label_codes):
                 feature = encoder.feature(prompt, label_id)
                 self.assertLessEqual(len(feature["input_ids"]), 512)
                 self.assertEqual(feature["labels"][: len(prompt)], [-100] * len(prompt))
                 self.assertEqual(
-                    feature["labels"][len(prompt) :], self.tokenizer.encode(label) + [2]
+                    feature["labels"][len(prompt) :], self.tokenizer.encode(code) + [2]
                 )
                 self.assertEqual(feature["input_ids"][: len(prompt)], prompt)
 
     def test_encoding_matches_full_training_chat(self):
         prompt, _ = self.encoder.encode_prompt("hello")
-        for label_id, label in enumerate(TASK_A.labels):
+        for label_id, code in enumerate(TASK_A.label_codes):
             expected = self.tokenizer.apply_chat_template(
                 self.encoder.messages("hello")
-                + [{"role": "assistant", "content": label}]
+                + [{"role": "assistant", "content": code}]
             )
             self.assertEqual(
                 self.encoder.feature(prompt, label_id)["input_ids"], expected
@@ -377,6 +378,48 @@ class LLMTests(unittest.TestCase):
         )
         self.assertTrue(all(item["token_pieces"] is None for item in diagnostics))
 
+    def test_task_a_direct_labels_use_length_normalized_candidate_scores(self):
+        encoder = ChatEncoder(self.tokenizer, TASK_A, 512)
+        self.assertNotEqual(len(encoder.completions[0]), len(encoder.completions[1]))
+        data = CompletionDataset(["a direct-label example"], encoder)
+        result = score_candidates(
+            tiny_model().eval(),
+            data,
+            self.collator,
+            self.config,
+            cpu_runtime(),
+            "direct-label test",
+        )
+        np.testing.assert_allclose(
+            result["mean_token_log_probs"],
+            result["sequence_log_probs"] / result["completion_token_counts"],
+        )
+        expected = torch.softmax(
+            torch.from_numpy(result["mean_token_log_probs"]), dim=1
+        ).numpy()
+        np.testing.assert_allclose(result["probabilities"], expected)
+
+    def test_binary_majority_vote_uses_all_five_seeds(self):
+        seed_predictions = np.asarray(
+            [
+                [1, 0, 1, 0],
+                [1, 0, 0, 1],
+                [0, 0, 1, 1],
+                [1, 1, 0, 0],
+                [0, 0, 1, 1],
+            ]
+        )
+        final_ids, hate_votes, nonhate_votes = binary_majority_vote(
+            seed_predictions, TASK_A.labels
+        )
+        np.testing.assert_array_equal(hate_votes, [3, 1, 3, 3])
+        np.testing.assert_array_equal(nonhate_votes, [2, 4, 2, 2])
+        np.testing.assert_array_equal(final_ids, [1, 0, 1, 1])
+
+    def test_binary_majority_vote_rejects_even_seed_count(self):
+        with self.assertRaisesRegex(ValueError, "odd number of seeds"):
+            binary_majority_vote(np.asarray([[0, 1], [1, 0]]), TASK_A.labels)
+
     def test_cpu_production_run_fails_clearly(self):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
             require_cuda(cpu_runtime())
@@ -388,7 +431,10 @@ class LLMTests(unittest.TestCase):
                 tempfile.TemporaryDirectory() as directory,
             ):
                 root = Path(directory)
-                task = replace(llm_task(original_task), selection_seeds=(42,))
+                test_seeds = (
+                    (42, 52, 62) if original_task.ensemble_all_seeds else (42,)
+                )
+                task = replace(llm_task(original_task), selection_seeds=test_seeds)
                 if task.original_fold_filenames:
                     task = replace(
                         task, selection_train_label_caps=(("Gender", 4),)
@@ -557,20 +603,57 @@ class LLMTests(unittest.TestCase):
                         (output / "predictions.csv").read_bytes(),
                     )
                 summary = json.loads((output / "run_summary.json").read_text())
-                self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
                 self.assertEqual(summary["quantization"], None)
-                self.assertEqual(summary["full_data_retrain"]["epochs"], 1)
-                self.assertEqual(
-                    summary["full_data_retrain"]["training_rows"], len(full_train)
+                if task.ensemble_all_seeds:
+                    self.assertEqual(
+                        summary["best_validation_checkpoint_for_reporting"][
+                            "best_epoch"
+                        ],
+                        1,
+                    )
+                    self.assertEqual(
+                        len(summary["full_data_retrains"]), len(test_seeds)
+                    )
+                    for retrain_summary in summary["full_data_retrains"]:
+                        self.assertEqual(retrain_summary["epochs"], 1)
+                        self.assertEqual(
+                            retrain_summary["training_rows"], len(full_train)
+                        )
+                        self.assertEqual(
+                            retrain_summary["downsampled_rows_excluded"],
+                            len(downsampled),
+                        )
+                    voting = pd.read_csv(
+                        output / "voting_predictions.csv", dtype={"id": str}
+                    )
+                    self.assertEqual(voting["id"].tolist(), result["id"].tolist())
+                    self.assertEqual(
+                        voting["final_label"].tolist(), result["label"].tolist()
+                    )
+                    self.assertEqual(
+                        (voting["hate_votes"] + voting["nonhate_votes"]).tolist(),
+                        [len(test_seeds)] * len(voting),
+                    )
+                else:
+                    self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
+                    self.assertEqual(summary["full_data_retrain"]["epochs"], 1)
+                    self.assertEqual(
+                        summary["full_data_retrain"]["training_rows"],
+                        len(full_train),
+                    )
+                    self.assertEqual(
+                        summary["full_data_retrain"]["downsampled_rows_excluded"],
+                        len(downsampled),
+                    )
+                expected_model_count = (
+                    len(test_seeds) * 2 if task.ensemble_all_seeds else 2
                 )
-                self.assertEqual(
-                    summary["full_data_retrain"]["downsampled_rows_excluded"],
-                    len(downsampled),
+                self.assertEqual(len(loaded_models), expected_model_count)
+                expected_train_sizes = [len(train), len(train)] * len(test_seeds)
+                expected_train_sizes += [len(full_train)] * (
+                    len(test_seeds) if task.ensemble_all_seeds else 1
                 )
-                self.assertEqual(len(loaded_models), 2)
-                self.assertEqual(
-                    train_sizes, [len(train), len(train), len(full_train)]
-                )
+                self.assertEqual(train_sizes, expected_train_sizes)
                 manifest = pd.read_csv(output / "split_manifest.csv", dtype={"id": str})
                 self.assertEqual(
                     manifest.loc[val, "split"].tolist(),
@@ -594,26 +677,60 @@ class LLMTests(unittest.TestCase):
                         ["selection_excluded"] * len(excluded),
                     )
                 self.assertIn("Best holdout adapter validation", calls)
-                self.assertIn(
-                    "Development prediction from full-data adapter", calls
-                )
-                # The exported result comes from the second, full-data adapter.
-                final_model = loaded_models[1]
-                restore_adapter(
-                    final_model,
-                    root
-                    / "checkpoints"
-                    / task.checkpoint_subdir
-                    / "final_full_data_adapter",
+                self.assertEqual(
+                    calls.count("Development prediction from full-data adapter"),
+                    len(test_seeds) if task.ensemble_all_seeds else 1,
                 )
                 encoder = ChatEncoder(self.tokenizer, task, config.max_length)
                 data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
-                scores = real_score(
-                    final_model, data, self.collator, config, cpu_runtime(), "verify"
-                )
-                expected = [
-                    task.labels[i] for i in scores["probabilities"].argmax(axis=1)
-                ]
+                if task.ensemble_all_seeds:
+                    seed_label_ids = []
+                    for index, seed in enumerate(test_seeds):
+                        final_model = loaded_models[len(test_seeds) + index]
+                        restore_adapter(
+                            final_model,
+                            root
+                            / "checkpoints"
+                            / task.checkpoint_subdir
+                            / f"seed_{seed}"
+                            / "final_full_data_adapter",
+                        )
+                        scores = real_score(
+                            final_model,
+                            data,
+                            self.collator,
+                            config,
+                            cpu_runtime(),
+                            "verify",
+                        )
+                        seed_label_ids.append(
+                            scores["probabilities"].argmax(axis=1)
+                        )
+                    expected_ids, _, _ = binary_majority_vote(
+                        np.stack(seed_label_ids), task.labels
+                    )
+                    expected = [task.labels[index] for index in expected_ids]
+                else:
+                    final_model = loaded_models[1]
+                    restore_adapter(
+                        final_model,
+                        root
+                        / "checkpoints"
+                        / task.checkpoint_subdir
+                        / "final_full_data_adapter",
+                    )
+                    scores = real_score(
+                        final_model,
+                        data,
+                        self.collator,
+                        config,
+                        cpu_runtime(),
+                        "verify",
+                    )
+                    expected = [
+                        task.labels[index]
+                        for index in scores["probabilities"].argmax(axis=1)
+                    ]
                 self.assertEqual(result["label"].tolist(), expected)
 
 

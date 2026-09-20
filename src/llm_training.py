@@ -19,6 +19,7 @@ from itertools import islice
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.metrics import (
     accuracy_score,
@@ -37,8 +38,8 @@ from transformers import (
 
 from llm_config import (
     CHECKPOINT_ROOT,
-    LLM_TRAINING,
     OUTPUT_ROOT,
+    LLM_TRAINING,
     LLMTrainingConfig,
     TaskConfig,
 )
@@ -51,11 +52,6 @@ from src.distributed import (
     relaunch_with_torchrun_if_needed,
 )
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
-from src.reproduction import (
-    verify_reproduction_manifest,
-    verify_reproduction_model,
-    verify_reproduction_tokenization,
-)
 from src.submission import write_submission
 from src.training import (
     build_optimizer,
@@ -68,11 +64,11 @@ from src.training import (
     stratified_holdout_indices,
     unwrap_model,
     write_downsampled_rows,
-    write_seed_selection_results,
     write_split_manifest,
     write_validation_confusion_history,
     write_validation_confusion_matrix,
     write_validation_predictions,
+    write_seed_selection_results,
 )
 
 
@@ -165,8 +161,8 @@ def completion_token_diagnostics(encoder: ChatEncoder) -> list[dict[str, object]
     tokenizer = encoder.tokenizer
     convert_ids_to_tokens = getattr(tokenizer, "convert_ids_to_tokens", None)
     diagnostics = []
-    for label, token_ids in zip(
-        encoder.task.labels, encoder.completions, strict=True
+    for label, code, token_ids in zip(
+        encoder.task.labels, encoder.task.label_codes, encoder.completions, strict=True
     ):
         ids = list(token_ids)
         token_pieces = (
@@ -177,6 +173,7 @@ def completion_token_diagnostics(encoder: ChatEncoder) -> list[dict[str, object]
         diagnostics.append(
             {
                 "label": label,
+                "code": code,
                 "token_count": len(ids),
                 "token_ids": ids,
                 "token_pieces": token_pieces,
@@ -195,7 +192,7 @@ def log_completion_token_diagnostics(
 
     for item in diagnostics:
         log(
-            f"Completion tokens | label={item['label']!r} | "
+            f"Completion tokens | label={item['label']!r} | code={item['code']!r} | "
             f"count={item['token_count']} | ids={item['token_ids']} | "
             f"pieces={item['token_pieces']} | "
             f"decoded={item['decoded_completion']!r}",
@@ -407,9 +404,10 @@ def train_llm_epoch(
 def score_candidates(model, dataset, collator, config, runtime, description):
     """Score every full legal answer, restore row order and compute fixed-class F1.
 
-    Sum token log probabilities including the chat end suffix. Softmax produces
-    probabilities conditional on this finite candidate set (not calibrated
-    confidence). No sampling or free-text label parsing is used.
+    Mean token log probabilities include the chat end suffix and avoid favoring
+    shorter answers when official labels have different token counts. Softmax
+    produces probabilities conditional on this finite candidate set (not
+    calibrated confidence). No sampling or free-text label parsing is used.
     """
     model = unwrap_model(model)  # No DDP forward collectives on uneven eval shards.
     model.eval()
@@ -475,10 +473,14 @@ def score_candidates(model, dataset, collator, config, runtime, description):
         raise RuntimeError(
             "Non-finite candidate scores; check AMP and training stability."
         )
-    probabilities = torch.softmax(torch.from_numpy(scores), dim=1).numpy()
+    normalized_scores = scores / counts
+    probabilities = torch.softmax(
+        torch.from_numpy(normalized_scores), dim=1
+    ).numpy()
     result = {
         "probabilities": probabilities,
         "sequence_log_probs": scores,
+        "mean_token_log_probs": normalized_scores,
         "completion_token_counts": counts,
     }
     if dataset.labels is not None:
@@ -648,8 +650,466 @@ def _training_state(model, loader, epochs, config, runtime):
     return optimizer, scheduler, scaler
 
 
+def binary_majority_vote(
+    seed_label_ids: np.ndarray,
+    labels: tuple[str, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return final binary labels and per-class votes for an odd seed ensemble."""
+
+    values = np.asarray(seed_label_ids, dtype=np.int64)
+    if values.ndim != 2 or values.shape[0] < 1:
+        raise ValueError("seed_label_ids must have shape (seeds, prediction rows)")
+    if values.shape[0] % 2 == 0:
+        raise ValueError("Binary majority voting requires an odd number of seeds")
+    if set(labels) != {"Non-Hate", "Hate"} or len(labels) != 2:
+        raise ValueError("Binary majority voting requires Non-Hate and Hate labels")
+    if np.any((values < 0) | (values >= len(labels))):
+        raise ValueError("seed_label_ids contains an invalid label index")
+
+    hate_index = labels.index("Hate")
+    nonhate_index = labels.index("Non-Hate")
+    hate_votes = np.sum(values == hate_index, axis=0)
+    nonhate_votes = np.sum(values == nonhate_index, axis=0)
+    final_ids = np.where(hate_votes > nonhate_votes, hate_index, nonhate_index)
+    return final_ids, hate_votes, nonhate_votes
+
+
+def _best_validation_result(seed_results: list[dict]) -> dict:
+    """Return the best holdout result for reporting, not final prediction."""
+
+    best = seed_results[0]
+    for candidate in seed_results[1:]:
+        candidate_summary = candidate["summary"]
+        best_summary = best["summary"]
+        if is_better_checkpoint(
+            candidate_summary["macro_f1"],
+            candidate_summary["loss"],
+            best_summary["macro_f1"],
+            best_summary["loss"],
+        ):
+            best = candidate
+    return best
+
+
+def _run_seed_ensemble(
+    *,
+    task: TaskConfig,
+    config: LLMTrainingConfig,
+    runtime: RuntimeContext,
+    frame: pd.DataFrame,
+    prediction_frame: pd.DataFrame,
+    val_frame: pd.DataFrame,
+    val_data: CompletionDataset,
+    prediction_data: CompletionDataset,
+    collator: CompletionCollator,
+    encoder: ChatEncoder,
+    tokenizer: object,
+    seed_results: list[dict],
+    selection_seeds: tuple[int, ...],
+    output_dir: Path,
+    checkpoint_dir: Path,
+    split_strategy: str,
+    resolved_revision: str | None,
+    parameter_counts: dict[str, int] | None,
+    token_diagnostics: list[dict[str, object]],
+) -> None:
+    """Retrain every selected seed, predict, and hard-vote Task A outputs."""
+
+    if len(seed_results) != len(selection_seeds):
+        raise RuntimeError("Every configured seed must finish before ensembling")
+    if len(selection_seeds) % 2 == 0:
+        raise ValueError("ensemble_all_seeds requires an odd number of seeds")
+
+    reporting_best = _best_validation_result(seed_results)
+    reporting_summary = reporting_best["summary"]
+    reporting_seed = int(reporting_summary["seed"])
+    scalar_results = [
+        {
+            "seed": result["summary"]["seed"],
+            "best_epoch": result["summary"]["best_epoch"],
+            "macro_f1": result["summary"]["macro_f1"],
+            "loss": result["summary"]["loss"],
+            "accuracy": result["summary"]["accuracy"],
+            "selection_train_rows": result["summary"]["selection_train_rows"],
+            "full_retrain_rows": result["summary"]["full_retrain_rows"],
+            "downsampled_rows": result["summary"]["downsampled_rows"],
+            "checkpoint": result["summary"]["checkpoint"],
+            "selected": True,
+        }
+        for result in seed_results
+    ]
+
+    def export_selection_overview() -> None:
+        write_split_manifest(
+            frame,
+            reporting_best["train_indices"],
+            reporting_best["validation_indices"],
+            output_dir,
+            reporting_best["downsampled_indices"],
+        )
+        write_downsampled_rows(
+            frame, task, reporting_best["downsampled_indices"], output_dir
+        )
+        write_validation_predictions(
+            val_frame,
+            task,
+            reporting_best["validation_probabilities"],
+            output_dir,
+        )
+        _write_json(
+            output_dir / "selection_training_history.json",
+            {
+                "seed": reporting_seed,
+                "purpose": "best holdout seed for reporting only; all seeds are retrained",
+                "epochs": reporting_best["selection_history"],
+            },
+        )
+        for record in reporting_best["selection_history"]:
+            if "confusion_matrix" in record:
+                write_validation_confusion_matrix(
+                    record["confusion_matrix"], record["epoch"], output_dir
+                )
+        write_validation_confusion_history(
+            reporting_best["selection_history"], output_dir
+        )
+        write_seed_selection_results(scalar_results, output_dir)
+        macro_scores = [row["macro_f1"] for row in scalar_results]
+        _write_json(
+            output_dir / "seed_selection_summary.json",
+            {
+                "selection_rule": (
+                    "best epoch per seed by highest macro_f1; lowest loss breaks "
+                    "exact ties; every seed proceeds to full-data retraining"
+                ),
+                "validation_is_fixed_across_seeds": True,
+                "split_seed": config.seed,
+                "reporting_best_seed": reporting_seed,
+                "reporting_best_seed_is_not_an_ensemble_winner": True,
+                "all_seeds_retrained": True,
+                "macro_f1_mean": float(np.mean(macro_scores)),
+                "macro_f1_std": float(np.std(macro_scores)),
+                "results": [result["summary"] for result in seed_results],
+            },
+        )
+
+    on_main(export_selection_overview, runtime)
+    log(
+        "Seed holdout results: "
+        + " | ".join(
+            f"seed={result['summary']['seed']} "
+            f"Macro-F1={result['summary']['macro_f1']:.5f} "
+            f"best_epoch={result['summary']['best_epoch']}"
+            for result in seed_results
+        ),
+        runtime,
+    )
+
+    retrained_results = []
+    for seed_number, result in enumerate(seed_results, start=1):
+        summary = result["summary"]
+        seed = int(summary["seed"])
+        best_epoch = int(summary["best_epoch"])
+        full_train_indices = result["full_train_indices"]
+        full_train_frame = frame.iloc[full_train_indices]
+        full_train_data = CompletionDataset(
+            full_train_frame["text"].tolist(),
+            encoder,
+            full_train_frame["label_id"].tolist(),
+        )
+        seed_output_dir = result["seed_output_dir"]
+        seed_checkpoint_dir = result["seed_checkpoint_dir"]
+        final_adapter_dir = seed_checkpoint_dir / "final_full_data_adapter"
+
+        log(
+            f"\n=== PHASE 2/2 | SEED {seed_number}/{len(seed_results)} "
+            f"| seed={seed} | FULL-DATA RETRAIN "
+            f"({len(full_train_data)} rows / {best_epoch} epoch(s)) ===",
+            runtime,
+        )
+        set_global_seed(seed)
+        full_loader, full_sampler = create_train_loader(
+            full_train_data, collator, config, runtime, seed
+        )
+        final_model = _wrap_for_ddp(load_lora_model(config, runtime), runtime)
+        optimizer, scheduler, scaler = _training_state(
+            final_model, full_loader, best_epoch, config, runtime
+        )
+        full_history = []
+        for epoch in range(1, best_epoch + 1):
+            if full_sampler is not None:
+                full_sampler.set_epoch(epoch)
+            train_loss = train_llm_epoch(
+                final_model,
+                full_loader,
+                optimizer,
+                scheduler,
+                scaler,
+                config,
+                runtime,
+                epoch,
+                f"Full-data retrain seed {seed}",
+            )
+            full_history.append({"epoch": epoch, "train_loss": train_loss})
+            log(
+                f"Seed {seed} full-data epoch {epoch}/{best_epoch}: "
+                f"train_loss={train_loss:.5f}",
+                runtime,
+            )
+            on_main(
+                lambda seed_output_dir=seed_output_dir,
+                seed=seed,
+                full_history=list(full_history): _write_json(
+                    seed_output_dir / "full_data_training_history.json",
+                    {"seed": seed, "epochs": full_history},
+                ),
+                runtime,
+            )
+
+        del optimizer, scheduler, scaler
+        on_main(
+            partial(save_adapter, final_model, tokenizer, final_adapter_dir), runtime
+        )
+        restore_adapter(final_model, final_adapter_dir)
+        predictions = score_candidates(
+            final_model,
+            prediction_data,
+            collator,
+            config,
+            runtime,
+            "Development prediction from full-data adapter",
+        )
+        label_ids = predictions["probabilities"].argmax(axis=1)
+        predicted_labels = [task.labels[index] for index in label_ids]
+        final_summary = {
+            "seed": seed,
+            "epochs": best_epoch,
+            "training_rows": len(full_train_data),
+            "loaded_rows": len(frame),
+            "downsampled_rows_excluded": len(result["downsampled_indices"]),
+            "label_distribution": full_train_frame[task.label_column]
+            .value_counts()
+            .to_dict(),
+            "checkpoint": str(final_adapter_dir),
+            "prediction_source": "seed_specific_final_full_data_adapter",
+        }
+
+        def export_seed_retrain_artifacts(
+            seed_output_dir=seed_output_dir,
+            predicted_labels=predicted_labels,
+            summary=summary,
+            final_summary=final_summary,
+        ) -> None:
+            write_submission(
+                prediction_frame["id"].tolist(),
+                predicted_labels,
+                task.labels,
+                seed_output_dir,
+                task.submission_zip_name,
+            )
+            _write_json(
+                seed_output_dir / "seed_summary.json",
+                {**summary, "full_data_retrain": final_summary},
+            )
+
+        on_main(export_seed_retrain_artifacts, runtime)
+        retrained_results.append(
+            {
+                "seed": seed,
+                "label_ids": label_ids,
+                "probabilities": predictions["probabilities"],
+                "summary": final_summary,
+                "full_train_truncated": full_train_data.truncated_count,
+            }
+        )
+        del final_model, full_loader, full_train_data
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    if len(retrained_results) != len(selection_seeds):
+        raise RuntimeError("Voting requires a completed prediction from every seed")
+    stacked_label_ids = np.stack(
+        [result["label_ids"] for result in retrained_results], axis=0
+    )
+    final_ids, hate_votes, nonhate_votes = binary_majority_vote(
+        stacked_label_ids, task.labels
+    )
+    final_labels = [task.labels[index] for index in final_ids]
+    mean_probabilities = np.mean(
+        np.stack(
+            [result["probabilities"] for result in retrained_results], axis=0
+        ),
+        axis=0,
+    )
+
+    voting_data: dict[str, object] = {
+        "id": prediction_frame["id"].astype(str).tolist()
+    }
+    for row, seed_result in zip(
+        stacked_label_ids, retrained_results, strict=True
+    ):
+        voting_data[f"seed_{seed_result['seed']}"] = [
+            task.labels[index] for index in row
+        ]
+    voting_data["hate_votes"] = hate_votes
+    voting_data["nonhate_votes"] = nonhate_votes
+    for label_index, label in enumerate(task.labels):
+        safe_label = label.lower().replace("-", "_").replace(" ", "_")
+        voting_data[f"mean_prob_{safe_label}"] = mean_probabilities[:, label_index]
+    voting_data["final_label"] = final_labels
+    voting_frame = pd.DataFrame(voting_data)
+
+    def export_ensemble_artifacts() -> None:
+        voting_frame.to_csv(
+            output_dir / "voting_predictions.csv",
+            index=False,
+            encoding="utf-8",
+            lineterminator="\n",
+        )
+        csv_path, zip_path = write_submission(
+            prediction_frame["id"].tolist(),
+            final_labels,
+            task.labels,
+            output_dir,
+            task.submission_zip_name,
+        )
+        ensemble_summary = {
+            "method": "hard majority vote",
+            "seeds": list(selection_seeds),
+            "required_votes": len(selection_seeds) // 2 + 1,
+            "tie_possible": False,
+            "vote_rule": "Hate if hate_votes > nonhate_votes; otherwise Non-Hate",
+            "prediction_file": str(csv_path),
+            "voting_audit_file": str(output_dir / "voting_predictions.csv"),
+            "submission": str(zip_path),
+        }
+        retrain_summaries = [result["summary"] for result in retrained_results]
+        _write_json(
+            checkpoint_dir / "metrics.json",
+            {
+                "selection": [result["summary"] for result in seed_results],
+                "reporting_best_selection": reporting_summary,
+                "full_data_retrains": retrain_summaries,
+                "ensemble": ensemble_summary,
+            },
+        )
+        reporting_train_frame = frame.iloc[reporting_best["train_indices"]]
+        _write_json(
+            output_dir / "run_summary.json",
+            {
+                "task": task.task_name,
+                "method": "LoRA answer-only causal LM with hard-vote seed ensemble",
+                "model": config.model_name,
+                "resolved_model_revision": resolved_revision,
+                "world_size": runtime.world_size,
+                "compute_dtype": str(compute_dtype(config, runtime)),
+                "quantization": None,
+                "text_input": (
+                    "ftfy + Unicode NFKC + HTML entity decoding + whitespace "
+                    "normalization; URLs, mentions, and HTML tags preserved"
+                ),
+                "effective_train_batch_size": config.train_batch_size_per_gpu
+                * config.gradient_accumulation_steps
+                * runtime.world_size,
+                "selection_seeds": list(selection_seeds),
+                "reporting_best_seed": reporting_seed,
+                "reporting_best_seed_used_only_for_validation_summary": True,
+                "selection_split": {
+                    "strategy": split_strategy,
+                    "split_seed": config.seed,
+                    "validation_fold": task.selection_validation_fold,
+                    "validation_data_origins": list(
+                        task.selection_validation_data_origins
+                    ),
+                    "actual_validation_fraction": len(val_data) / len(frame),
+                    "validation_rows": len(val_data),
+                    "validation_label_distribution": val_frame[task.label_column]
+                    .value_counts()
+                    .to_dict(),
+                    "reporting_seed_train_rows": len(
+                        reporting_best["train_indices"]
+                    ),
+                    "reporting_seed_train_label_distribution": reporting_train_frame[
+                        task.label_column
+                    ]
+                    .value_counts()
+                    .to_dict(),
+                    "per_seed_downsampled_rows": {
+                        str(result["summary"]["seed"]): len(
+                            result["downsampled_indices"]
+                        )
+                        for result in seed_results
+                    },
+                },
+                "seed_selection": [
+                    result["summary"] for result in seed_results
+                ],
+                "best_validation_checkpoint_for_reporting": reporting_summary,
+                "full_data_retrains": retrain_summaries,
+                "ensemble": ensemble_summary,
+                "development_rows": len(prediction_data),
+                "training_config": asdict(config),
+                "parameters": parameter_counts,
+                "system_prompt": encoder.system_text,
+                "label_order": list(task.labels),
+                "completion_token_ids": encoder.completions,
+                "completion_token_diagnostics": token_diagnostics,
+                "completion_token_lengths_equal": len(
+                    {int(item["token_count"]) for item in token_diagnostics}
+                )
+                == 1,
+                "inference": (
+                    "per-seed argmax mean token log P(answer including chat end | "
+                    "prompt), followed by hard majority vote"
+                ),
+                "probabilities": (
+                    "softmax over mean token log likelihoods; mean probabilities "
+                    "are diagnostic only and do not determine the final vote"
+                ),
+                "loss": "mean per-example answer-token NLL; not class cross-entropy",
+                "truncated_comments": {
+                    "selection_train_by_seed": {
+                        str(result["summary"]["seed"]): result[
+                            "selection_train_truncated"
+                        ]
+                        for result in seed_results
+                    },
+                    "validation": val_data.truncated_count,
+                    "full_train_by_seed": {
+                        str(result["seed"]): result["full_train_truncated"]
+                        for result in retrained_results
+                    },
+                    "development": prediction_data.truncated_count,
+                },
+                "input_sha256": {
+                    name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
+                    for name in (*task.labeled_filenames(), task.prediction_filename)
+                },
+                "packages": {
+                    name: version(name)
+                    for name in (
+                        "torch",
+                        "transformers",
+                        "peft",
+                        "accelerate",
+                        "scikit-learn",
+                    )
+                },
+            },
+        )
+        log(
+            f"\n=== COMPLETE | {task.task_name} ===\n"
+            f"Retrained seeds: {list(selection_seeds)}\n"
+            f"Voting rule: at least {len(selection_seeds) // 2 + 1} votes.\n"
+            f"Voting audit: {output_dir / 'voting_predictions.csv'}\n"
+            f"Predictions: {csv_path}\nSubmission: {zip_path}",
+            runtime,
+        )
+
+    on_main(export_ensemble_artifacts, runtime)
+
+
 def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
-    """Compare downsampling seeds, retrain the winner, then predict development."""
+    """Select epochs, retrain configured seeds, then predict development."""
 
     validate_config(config)
     selection_seeds = task.selection_seeds or (config.seed,)
@@ -657,23 +1117,18 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         raise ValueError("selection_seeds must not contain duplicates")
     if any(seed < 0 for seed in selection_seeds):
         raise ValueError("selection_seeds must contain non-negative integers")
+    if task.ensemble_all_seeds:
+        if len(selection_seeds) % 2 == 0:
+            raise ValueError("ensemble_all_seeds requires an odd number of seeds")
+        if set(task.labels) != {"Non-Hate", "Hate"} or len(task.labels) != 2:
+            raise ValueError(
+                "ensemble_all_seeds currently supports binary Non-Hate/Hate only"
+            )
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     runtime = initialize_runtime()
     try:
         require_cuda(runtime)
         set_global_seed(config.seed)
-        reproduction_manifest = verify_reproduction_manifest(
-            task,
-            config,
-            runtime,
-            str(compute_dtype(config, runtime)),
-        )
-        if reproduction_manifest:
-            log(
-                "Task B 0.66 reproduction preflight passed: code settings, "
-                "package versions, runtime shape and all input SHA-256 values match.",
-                runtime,
-            )
         log(
             f"\n{task.task_name} | LoRA {config.model_name} | rank={config.lora_rank} "
             f"| world_size={runtime.world_size} | selection_seeds={selection_seeds}",
@@ -723,11 +1178,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
         encoder = ChatEncoder(tokenizer, task, config.max_length)
-        verify_reproduction_tokenization(
-            reproduction_manifest,
-            encoder.system_text,
-            [list(token_ids) for token_ids in encoder.completions],
-        )
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
         val_frame = frame.iloc[val_indices]
@@ -835,11 +1285,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     ),
                     "reported_total": selection_model.num_parameters(),
                 }
-                verify_reproduction_model(
-                    reproduction_manifest,
-                    resolved_revision,
-                    parameter_counts,
-                )
                 del base
             selection_model = _wrap_for_ddp(selection_model, runtime)
             optimizer, scheduler, scaler = _training_state(
@@ -938,8 +1383,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     stale += 1
                 on_main(
                     lambda seed_output_dir=seed_output_dir,
-                    selection_history=selection_history,
-                    selection_seed=selection_seed: _write_json(
+                    selection_history=selection_history: _write_json(
                         seed_output_dir / "selection_training_history.json",
                         {"seed": selection_seed, "epochs": selection_history},
                     ),
@@ -1003,6 +1447,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "selection_train_truncated": selection_train_data.truncated_count,
                     "selection_history": selection_history,
                     "validation_probabilities": best_validation["probabilities"],
+                    "validation_indices": val_indices,
+                    "seed_output_dir": seed_output_dir,
+                    "seed_checkpoint_dir": seed_checkpoint_dir,
                 }
             )
             log(
@@ -1013,6 +1460,30 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             del selection_model, selection_loader, selection_train_data
             gc.collect()
             torch.cuda.empty_cache()
+
+        if task.ensemble_all_seeds:
+            _run_seed_ensemble(
+                task=task,
+                config=config,
+                runtime=runtime,
+                frame=frame,
+                prediction_frame=prediction_frame,
+                val_frame=val_frame,
+                val_data=val_data,
+                prediction_data=prediction_data,
+                collator=collator,
+                encoder=encoder,
+                tokenizer=tokenizer,
+                seed_results=seed_results,
+                selection_seeds=selection_seeds,
+                output_dir=output_dir,
+                checkpoint_dir=checkpoint_dir,
+                split_strategy=split_strategy,
+                resolved_revision=resolved_revision,
+                parameter_counts=parameter_counts,
+                token_diagnostics=token_diagnostics,
+            )
+            return
 
         winner = seed_results[0]
         for candidate in seed_results[1:]:
@@ -1179,31 +1650,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 output_dir,
                 task.submission_zip_name,
             )
-            reproduction_check = None
-            if reproduction_manifest:
-                reference = reproduction_manifest["reference"]
-                actual_prediction_hash = hashlib.sha256(csv_path.read_bytes()).hexdigest()
-                actual_losses = [record["train_loss"] for record in full_history]
-                reference_losses = reference["full_retrain_losses"]
-                reproduction_check = {
-                    "reference_leaderboard_macro_f1": reference[
-                        "leaderboard_macro_f1"
-                    ],
-                    "predictions_csv_sha256": actual_prediction_hash,
-                    "reference_predictions_csv_sha256": reference[
-                        "predictions_csv_sha256"
-                    ],
-                    "predictions_match_reference": actual_prediction_hash
-                    == reference["predictions_csv_sha256"],
-                    "full_retrain_losses": actual_losses,
-                    "reference_full_retrain_losses": reference_losses,
-                    "loss_absolute_differences": [
-                        abs(actual - expected)
-                        for actual, expected in zip(
-                            actual_losses, reference_losses, strict=False
-                        )
-                    ],
-                }
             final_summary = {
                 "seed": winning_seed,
                 "epochs": best_epoch,
@@ -1222,7 +1668,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "selection": selection_summary,
                     "all_seed_results": [result["summary"] for result in seed_results],
                     "full_data_retrain": final_summary,
-                    "reproduction_check": reproduction_check,
                 },
             )
             _write_json(
@@ -1281,7 +1726,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     ],
                     "best_checkpoint": selection_summary,
                     "full_data_retrain": final_summary,
-                    "reproduction_check": reproduction_check,
                     "development_rows": len(prediction_data),
                     "training_config": asdict(config),
                     "parameters": parameter_counts,
@@ -1293,8 +1737,12 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         {int(item["token_count"]) for item in token_diagnostics}
                     )
                     == 1,
-                    "inference": "argmax sum log P(answer tokens including chat end | prompt)",
-                    "probabilities": "softmax over allowed full-answer log likelihoods; not calibrated",
+                    "inference": (
+                        "argmax mean token log P(answer including chat end | prompt)"
+                    ),
+                    "probabilities": (
+                        "softmax over allowed mean token log likelihoods; not calibrated"
+                    ),
                     "loss": "mean per-example answer-token NLL; not class cross-entropy",
                     "truncated_comments": {
                         "winning_selection_train": winner[
@@ -1335,14 +1783,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"Final adapter: {final_adapter_dir}",
                 runtime,
             )
-            if reproduction_check is not None:
-                log(
-                    "0.66 reference prediction match: "
-                    f"{reproduction_check['predictions_match_reference']} | "
-                    f"generated SHA-256="
-                    f"{reproduction_check['predictions_csv_sha256']}",
-                    runtime,
-                )
 
         on_main(export_artifacts, runtime)
         del final_model, full_loader

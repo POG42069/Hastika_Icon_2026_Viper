@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("HASTIKA_DATA_DIR", str(PROJECT_ROOT / "data")))
 CHECKPOINT_ROOT = Path(
@@ -23,6 +24,8 @@ class TaskConfig:
     prediction_filename: str
     label_column: str
     labels: tuple[str, ...]
+    # Short answer codes used internally by the LLM. Their order must match labels.
+    label_codes: tuple[str, ...]
     checkpoint_subdir: str
     output_subdir: str
     submission_zip_name: str
@@ -33,8 +36,12 @@ class TaskConfig:
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
     selection_seeds: tuple[int, ...] = ()
+    ensemble_all_seeds: bool = False
     report_per_class_metrics: bool = False
-    reproduction_manifest: str | None = None
+    enable_augmentation_audit: bool = True
+    augmentation_audit_action: str = "report"
+    augmentation_near_duplicate_threshold: float = 0.92
+    augmentation_min_source_similarity: float = 0.20
 
     def labeled_filenames(self) -> tuple[str, ...]:
         """Return every labeled CSV used by this task."""
@@ -89,9 +96,24 @@ TASK_A = TaskConfig(
     prediction_filename="binary_validation_inputs.csv",
     label_column="Label",
     labels=("Non-Hate", "Hate"),
+    # Task A trains and scores the official labels directly. Task B keeps short
+    # internal codes because its six category names vary substantially in length.
+    label_codes=("Non-Hate", "Hate"),
     checkpoint_subdir="task_a_lora",
     output_subdir="task_a_lora",
     submission_zip_name="task_a_submission.zip",
+    original_fold_filenames=tuple(
+        f"binary_original_{fold}.csv" for fold in range(1, 6)
+    ),
+    augmentation_fold_filenames=tuple(
+        f"binary_augment{fold}.csv" for fold in range(1, 6)
+    ),
+    use_augmentation=True,
+    selection_validation_fold=5,
+    selection_validation_data_origins=("original",),
+    selection_seeds=(42, 52, 62, 72, 82),
+    ensemble_all_seeds=True,
+    report_per_class_metrics=True,
 )
 
 TASK_B = TaskConfig(
@@ -107,6 +129,7 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
+    label_codes=("A", "B", "C", "D", "E", "F"),
     checkpoint_subdir="task_b_lora",
     output_subdir="task_b_lora",
     submission_zip_name="task_b_submission.zip",
@@ -117,7 +140,9 @@ TASK_B = TaskConfig(
     selection_validation_data_origins=("original",),
     selection_train_label_caps=(("Gender", 870),),
     selection_seeds=(42, 52, 62, 72, 82),
-    report_per_class_metrics=True,
+    report_per_class_metrics=False,
+    enable_augmentation_audit=True,
+    augmentation_audit_action="report",
 )
 
 
@@ -128,13 +153,7 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-TASK_B_066_MODEL_REVISION = "aa8e72537993ba99e69dfaafa59ed015b17504d1"
-TASK_B_066_MANIFEST = PROJECT_ROOT / "reproduction_task_b_066.json"
-# Pin the exact Qwen snapshot resolved by the recorded 0.66 run. All other
-# hyperparameters remain the values recorded in that run summary.
-LLM_TRAINING_B = replace(
-    LLM_TRAINING,
-    model_revision=TASK_B_066_MODEL_REVISION,
-)
+# Standard LoRA consumes more VRAM than QLoRA, so Task B also starts at batch/GPU=1.
+LLM_TRAINING_B = replace(LLM_TRAINING)
 TASK_A_LLM = TASK_A
-TASK_B_LLM = replace(TASK_B, reproduction_manifest=str(TASK_B_066_MANIFEST))
+TASK_B_LLM = TASK_B
