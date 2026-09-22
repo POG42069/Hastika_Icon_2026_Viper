@@ -98,7 +98,13 @@ class ChatEncoder:
     def _template(self, messages: list[dict[str, str]], generation: bool) -> list[int]:
         return list(
             self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=generation
+                messages,
+                tokenize=True,
+                add_generation_prompt=generation,
+                # Candidate scoring/training must predict the label directly.
+                # Qwen3 thinking-capable templates otherwise prepend a
+                # <think> block before the assistant answer.
+                enable_thinking=False,
             )
         )
 

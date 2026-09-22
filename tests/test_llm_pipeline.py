@@ -58,7 +58,15 @@ class TestChatTokenizer:
     def decode(self, ids, skip_special_tokens=False):
         return "".join(chr(value - 10) for value in ids)
 
-    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        enable_thinking=None,
+    ):
+        self.thinking_values = getattr(self, "thinking_values", [])
+        self.thinking_values.append(enable_thinking)
         role_ids = {"system": 3, "user": 4, "assistant": 5}
         ids = []
         for message in messages:
@@ -146,6 +154,8 @@ class LLMTests(unittest.TestCase):
         )
 
     def test_answer_mask_and_truncation_preserve_configured_answers(self):
+        self.assertTrue(self.tokenizer.thinking_values)
+        self.assertTrue(all(value is False for value in self.tokenizer.thinking_values))
         self.assertEqual(TASK_A.label_codes, TASK_A.labels)
         self.assertIn(
             "Allowed labels: Non-Hate; Hate", self.encoder.system_text
