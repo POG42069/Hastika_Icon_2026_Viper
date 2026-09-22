@@ -176,13 +176,18 @@ Task A dùng nhãn chính thức làm assistant response:
 
 ```text
 System: Classify ... Allowed labels: Non-Hate; Hate.
-User: Comment:\n<normalized Comment>
+User content:
+### Comment
+<normalized Comment>
 Assistant: Non-Hate hoặc Hate
 ```
 
 Task B cũng dùng trực tiếp sáu tên nhãn chính thức làm assistant response:
 `Gender`, `Political`, `Religion`, `Geo-political`, `Violence`, `Others`.
 Prompt liệt kê các nhãn hợp lệ; file submission giữ nguyên tên nhãn chính thức.
+Task B dùng cùng tiêu đề Markdown tối giản `### Comment` trong nội dung user.
+Định dạng này được áp dụng giống nhau khi train, validation và dự đoán;
+các file CSV dữ liệu không đổi.
 
 Code gọi `apply_chat_template`. Prompt và padding được mask bằng `-100`;
 loss chỉ áp dụng cho token của assistant label và token kết thúc chat. Khi dự

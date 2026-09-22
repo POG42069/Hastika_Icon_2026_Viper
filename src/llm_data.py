@@ -88,7 +88,7 @@ class ChatEncoder:
     def messages(self, text: str) -> list[dict[str, str]]:
         return [
             {"role": "system", "content": self.system_text},
-            {"role": "user", "content": "Comment:\n" + text},
+            {"role": "user", "content": "### Comment\n" + text},
         ]
 
     def _template(self, messages: list[dict[str, str]], generation: bool) -> list[int]:
