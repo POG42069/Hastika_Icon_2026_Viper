@@ -51,7 +51,12 @@ from src.distributed import (
     initialize_runtime,
     relaunch_with_torchrun_if_needed,
 )
-from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
+from src.llm_data import (
+    PROMPT_STYLES,
+    ChatEncoder,
+    CompletionCollator,
+    CompletionDataset,
+)
 from src.submission import write_submission
 from src.training import (
     build_optimizer,
@@ -92,6 +97,8 @@ def validate_config(config: LLMTrainingConfig) -> None:
         raise ValueError("progress_log_percent must be between 1 and 100")
     if config.compute_dtype not in {"auto", "float16", "bfloat16"}:
         raise ValueError("compute_dtype must be auto, float16 or bfloat16")
+    if config.prompt_style not in PROMPT_STYLES:
+        raise ValueError(f"prompt_style must be one of {PROMPT_STYLES}")
     if config.learning_rate <= 0 or config.max_grad_norm <= 0:
         raise ValueError("learning_rate and max_grad_norm must be positive")
     if config.initial_loss_scale <= 0:
@@ -1201,7 +1208,8 @@ def _run_seed_ensemble(
                 "development_rows": len(prediction_data),
                 "training_config": asdict(config),
                 "parameters": parameter_counts,
-                "system_prompt": encoder.system_text,
+                "prompt_style": encoder.prompt_style,
+                "prompt_template": encoder.system_text,
                 "label_order": list(task.labels),
                 "completion_token_ids": encoder.completions,
                 "completion_token_diagnostics": token_diagnostics,
@@ -1330,7 +1338,12 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
-        encoder = ChatEncoder(tokenizer, task, config.max_length)
+        encoder = ChatEncoder(
+            tokenizer,
+            task,
+            config.max_length,
+            prompt_style=config.prompt_style,
+        )
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
         val_frame = frame.iloc[val_indices]
@@ -1882,7 +1895,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "development_rows": len(prediction_data),
                     "training_config": asdict(config),
                     "parameters": parameter_counts,
-                    "system_prompt": encoder.system_text,
+                    "prompt_style": encoder.prompt_style,
+                    "prompt_template": encoder.system_text,
                     "label_order": list(task.labels),
                     "completion_token_ids": encoder.completions,
                     "completion_token_diagnostics": token_diagnostics,
@@ -1951,8 +1965,16 @@ def run_llm_cli(
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=defaults.model_name)
     parser.add_argument("--revision", default=defaults.model_revision)
+    parser.add_argument(
+        "--prompt-style",
+        choices=PROMPT_STYLES,
+        default=defaults.prompt_style,
+    )
     parser.add_argument("--max-epochs", type=int, default=defaults.max_epochs)
     parser.add_argument("--max-length", type=int, default=defaults.max_length)
+    parser.add_argument(
+        "--learning-rate", type=float, default=defaults.learning_rate
+    )
     parser.add_argument(
         "--batch-size", type=int, default=defaults.train_batch_size_per_gpu
     )
@@ -1972,8 +1994,10 @@ def run_llm_cli(
         defaults,
         model_name=args.model,
         model_revision=args.revision,
+        prompt_style=args.prompt_style,
         max_epochs=args.max_epochs,
         max_length=args.max_length,
+        learning_rate=args.learning_rate,
         train_batch_size_per_gpu=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation,
         use_all_available_gpus=defaults.use_all_available_gpus

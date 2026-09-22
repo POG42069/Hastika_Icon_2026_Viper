@@ -192,6 +192,29 @@ class LLMTests(unittest.TestCase):
                 self.encoder.feature(prompt, label_id)["input_ids"], expected
             )
 
+    def test_sarvam_completion_prompt_is_compact_and_answer_only(self):
+        encoder = ChatEncoder(
+            self.tokenizer,
+            TASK_B,
+            512,
+            prompt_style="sarvam_completion",
+        )
+        messages = encoder.messages("sample comment")
+        self.assertEqual([message["role"] for message in messages], ["user"])
+        self.assertIn("Kannada-English", messages[0]["content"])
+        self.assertIn("Choose exactly one label", messages[0]["content"])
+        self.assertIn("Comment:\nsample comment\nAnswer:", messages[0]["content"])
+        self.assertNotIn("untrusted text", messages[0]["content"])
+        prompt, truncated = encoder.encode_prompt("sample comment")
+        self.assertFalse(truncated)
+        for label_id, answer in enumerate(TASK_B.label_codes):
+            expected = self.tokenizer.apply_chat_template(
+                messages + [{"role": "assistant", "content": answer}]
+            )
+            self.assertEqual(
+                encoder.feature(prompt, label_id)["input_ids"], expected
+            )
+
     def test_shifted_answer_loss_matches_full_qwen_loss(self):
         model = tiny_model().eval()
         dataset = CompletionDataset(
@@ -792,7 +815,12 @@ class LLMTests(unittest.TestCase):
                     calls.count("Development prediction from full-data adapter"),
                     len(test_seeds) if task.ensemble_all_seeds else 1,
                 )
-                encoder = ChatEncoder(self.tokenizer, task, config.max_length)
+                encoder = ChatEncoder(
+                    self.tokenizer,
+                    task,
+                    config.max_length,
+                    prompt_style=config.prompt_style,
+                )
                 data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
                 if task.ensemble_all_seeds:
                     seed_label_ids = []

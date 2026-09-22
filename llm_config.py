@@ -60,13 +60,17 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"
+            "HASTIKA_LLM_MODEL", "sarvamai/sarvam-1"
         )
     )
-    model_revision: str = "main"
+    # Pin the model snapshot so a later Hub update cannot silently change a run.
+    model_revision: str = "f7c5f371d2e0bbe082caede3b3b0e1e403fc5839"
+    # Sarvam-1 is a base completion model, so use a compact downstream-task
+    # prompt rather than the verbose system/user instruction used by Qwen.
+    prompt_style: str = "sarvam_completion"
     validation_size: float = 0.20
     seed: int = 42
-    max_length: int = 256  # Full chat, including instructions, answer and EOS.
+    max_length: int = 256  # Full prompt, including the answer and EOS.
     max_epochs: int = 5
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
@@ -97,8 +101,8 @@ TASK_A = TaskConfig(
     label_column="Label",
     labels=("Non-Hate", "Hate"),
     label_codes=("Non-Hate", "Hate"),
-    checkpoint_subdir="task_a_lora",
-    output_subdir="task_a_lora",
+    checkpoint_subdir="task_a_sarvam1_lora",
+    output_subdir="task_a_sarvam1_lora",
     submission_zip_name="task_a_submission.zip",
     original_fold_filenames=tuple(
         f"binary_original_{fold}.csv" for fold in range(1, 6)
@@ -136,8 +140,8 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    checkpoint_subdir="task_b_lora",
-    output_subdir="task_b_lora",
+    checkpoint_subdir="task_b_sarvam1_lora",
+    output_subdir="task_b_sarvam1_lora",
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
