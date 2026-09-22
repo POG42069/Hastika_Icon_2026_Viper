@@ -180,8 +180,9 @@ User: Comment:\n<normalized Comment>
 Assistant: Non-Hate hoặc Hate
 ```
 
-Task B dùng mã nội bộ `A`–`F`, ánh xạ theo thứ tự label trong
-`llm_config.py`. File submission luôn được giải mã về tên nhãn chính thức.
+Task B cũng dùng trực tiếp sáu tên nhãn chính thức làm assistant response:
+`Gender`, `Political`, `Religion`, `Geo-political`, `Violence`, `Others`.
+Prompt liệt kê các nhãn hợp lệ; file submission giữ nguyên tên nhãn chính thức.
 
 Code gọi `apply_chat_template`. Prompt và padding được mask bằng `-100`;
 loss chỉ áp dụng cho token của assistant label và token kết thúc chat. Khi dự

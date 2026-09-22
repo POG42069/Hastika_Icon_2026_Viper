@@ -160,6 +160,9 @@ class LLMTests(unittest.TestCase):
         self.assertNotIn("Code mapping", self.encoder.system_text)
         for task in (TASK_A, TASK_B):
             encoder = ChatEncoder(self.tokenizer, task, 512)
+            self.assertEqual(task.label_codes, task.labels)
+            self.assertIn("Allowed labels: " + "; ".join(task.labels), encoder.system_text)
+            self.assertNotIn("Code mapping", encoder.system_text)
             prompt, truncated = encoder.encode_prompt("long comment " * 300)
             self.assertTrue(truncated)
             for label_id, code in enumerate(task.label_codes):
