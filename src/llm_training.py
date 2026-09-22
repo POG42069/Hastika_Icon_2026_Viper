@@ -31,8 +31,11 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
+    AutoProcessor,
     AutoTokenizer,
+    Gemma3ForConditionalGeneration,
     get_linear_schedule_with_warmup,
 )
 
@@ -283,13 +286,34 @@ class LineProgress:
             self.next_percent += self.log_every_percent
 
 
+def lora_target_modules(model_type: str, target_modules: str) -> str:
+    """Keep Gemma 3's image encoder frozen for text-only training."""
+
+    if model_type == "gemma3" and target_modules == "all-linear":
+        return (
+            r"^model\.language_model\.layers\.\d+\."
+            r"(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)"
+            r"|mlp\.(?:gate_proj|up_proj|down_proj))$"
+        )
+    return target_modules
+
+
 def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
     """Load an unquantized backbone and attach rank-r LoRA adapters."""
     require_cuda(runtime)
     from peft import LoraConfig, get_peft_model
 
     dtype = compute_dtype(config, runtime)
-    model = AutoModelForCausalLM.from_pretrained(
+    backbone_config = AutoConfig.from_pretrained(
+        config.model_name,
+        revision=config.model_revision,
+        trust_remote_code=False,
+    )
+    is_gemma3 = backbone_config.model_type == "gemma3"
+    model_class = (
+        Gemma3ForConditionalGeneration if is_gemma3 else AutoModelForCausalLM
+    )
+    model = model_class.from_pretrained(
         config.model_name,
         revision=config.model_revision,
         dtype=dtype,
@@ -302,6 +326,8 @@ def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
     ):
         raise RuntimeError("Expected a non-quantized backbone for standard LoRA.")
     model.config.use_cache = False
+    if is_gemma3:
+        model.config.text_config.use_cache = False
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -313,7 +339,9 @@ def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
             r=config.lora_rank,
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
-            target_modules=config.target_modules,
+            target_modules=lora_target_modules(
+                backbone_config.model_type, config.target_modules
+            ),
             bias="none",
         ),
     )
@@ -322,6 +350,8 @@ def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
     ]
     if not trainable or any("lora_" not in name for name in trainable):
         raise RuntimeError("Expected only LoRA adapters to be trainable.")
+    if is_gemma3 and any("vision_tower" in name for name in trainable):
+        raise RuntimeError("Gemma 3 vision tower must stay frozen for text-only data.")
     if runtime.is_main_process:
         model.print_trainable_parameters()
     return model
@@ -334,7 +364,7 @@ def completion_log_probs(
 
     Supervision is shifted exactly once: logits BEFORE each answer token predict
     that token. Project only the short suffix to the large vocabulary where the
-    architecture supports logits_to_keep (Qwen2.5); preserve the full attention
+    architecture supports logits_to_keep; preserve the full attention
     context. Left padding lets different prompt lengths share a short suffix.
     """
     labels = batch["labels"]
@@ -1935,15 +1965,32 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"{validation_origin_heading} validation"
             )
 
-        tokenizer = AutoTokenizer.from_pretrained(
+        backbone_config = AutoConfig.from_pretrained(
             config.model_name,
             revision=config.model_revision,
             trust_remote_code=False,
         )
+        chat_processor = None
+        if backbone_config.model_type == "gemma3":
+            chat_processor = AutoProcessor.from_pretrained(
+                config.model_name,
+                revision=config.model_revision,
+                trust_remote_code=False,
+            )
+            tokenizer = chat_processor.tokenizer
+            tokenizer.chat_template = chat_processor.chat_template
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.model_name,
+                revision=config.model_revision,
+                trust_remote_code=False,
+            )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
-        encoder = ChatEncoder(tokenizer, task, config.max_length)
+        encoder = ChatEncoder(
+            tokenizer, task, config.max_length, chat_processor=chat_processor
+        )
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
         prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
