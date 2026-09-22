@@ -31,11 +31,8 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import (
-    AutoConfig,
     AutoModelForCausalLM,
-    AutoProcessor,
     AutoTokenizer,
-    Gemma3ForConditionalGeneration,
     get_linear_schedule_with_warmup,
 )
 
@@ -160,20 +157,7 @@ def require_cuda(runtime: RuntimeContext) -> None:
         )
 
 
-def _gemma3_fp16_base(model: nn.Module, dtype: torch.dtype) -> bool:
-    base = unwrap_model(model)
-    base = base.get_base_model() if hasattr(base, "get_base_model") else base
-    return (
-        dtype == torch.float16
-        and getattr(base.config, "model_type", None) == "gemma3"
-    )
-
-
-def _autocast(runtime: RuntimeContext, dtype: torch.dtype, model: nn.Module):
-    # The Gemma 3 checkpoint is already loaded in FP16 on T4. Applying FP16 AMP
-    # on top of those half-precision weights has produced non-finite losses.
-    if _gemma3_fp16_base(model, dtype):
-        return nullcontext()
+def _autocast(runtime: RuntimeContext, dtype: torch.dtype):
     return (
         torch.autocast("cuda", dtype=dtype)
         if runtime.device.type == "cuda"
@@ -299,34 +283,13 @@ class LineProgress:
             self.next_percent += self.log_every_percent
 
 
-def lora_target_modules(model_type: str, target_modules: str) -> str:
-    """Keep Gemma 3's image encoder frozen for text-only training."""
-
-    if model_type == "gemma3" and target_modules == "all-linear":
-        return (
-            r"^model\.language_model\.layers\.\d+\."
-            r"(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)"
-            r"|mlp\.(?:gate_proj|up_proj|down_proj))$"
-        )
-    return target_modules
-
-
 def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
     """Load an unquantized backbone and attach rank-r LoRA adapters."""
     require_cuda(runtime)
     from peft import LoraConfig, get_peft_model
 
     dtype = compute_dtype(config, runtime)
-    backbone_config = AutoConfig.from_pretrained(
-        config.model_name,
-        revision=config.model_revision,
-        trust_remote_code=False,
-    )
-    is_gemma3 = backbone_config.model_type == "gemma3"
-    model_class = (
-        Gemma3ForConditionalGeneration if is_gemma3 else AutoModelForCausalLM
-    )
-    model = model_class.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         revision=config.model_revision,
         dtype=dtype,
@@ -339,8 +302,6 @@ def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
     ):
         raise RuntimeError("Expected a non-quantized backbone for standard LoRA.")
     model.config.use_cache = False
-    if is_gemma3:
-        model.config.text_config.use_cache = False
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -352,9 +313,7 @@ def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
             r=config.lora_rank,
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
-            target_modules=lora_target_modules(
-                backbone_config.model_type, config.target_modules
-            ),
+            target_modules=config.target_modules,
             bias="none",
         ),
     )
@@ -363,8 +322,6 @@ def load_lora_model(config: LLMTrainingConfig, runtime: RuntimeContext):
     ]
     if not trainable or any("lora_" not in name for name in trainable):
         raise RuntimeError("Expected only LoRA adapters to be trainable.")
-    if is_gemma3 and any("vision_tower" in name for name in trainable):
-        raise RuntimeError("Gemma 3 vision tower must stay frozen for text-only data.")
     if runtime.is_main_process:
         model.print_trainable_parameters()
     return model
@@ -377,7 +334,7 @@ def completion_log_probs(
 
     Supervision is shifted exactly once: logits BEFORE each answer token predict
     that token. Project only the short suffix to the large vocabulary where the
-    architecture supports logits_to_keep; preserve the full attention
+    architecture supports logits_to_keep (Qwen2.5); preserve the full attention
     context. Left padding lets different prompt lengths share a short suffix.
     """
     labels = batch["labels"]
@@ -406,12 +363,6 @@ def completion_log_probs(
     token_losses = F.cross_entropy(
         shifted_logits[mask].float(), targets[mask], reduction="none"
     )
-    if not bool(torch.isfinite(token_losses).all()):
-        raise FloatingPointError(
-            "Non-finite answer-token loss during model forward. "
-            "Gemma 3 can overflow in FP16 on T4; this run cannot produce a "
-            "valid checkpoint."
-        )
     row_ids = torch.arange(labels.shape[0], device=labels.device)[:, None].expand_as(
         mask
     )[mask]
@@ -461,7 +412,7 @@ def train_llm_epoch(
                 else nullcontext()
             )
             with sync:
-                with _autocast(runtime, dtype, model):
+                with _autocast(runtime, dtype):
                     log_probs, counts = completion_log_probs(model, batch)
                     example_losses = -log_probs / counts
                     if device_class_weights is None:
@@ -475,11 +426,6 @@ def train_llm_epoch(
                             batch["class_ids"]
                         ]
                     loss = optimized_losses.sum() / group_size
-                if not bool(torch.isfinite(loss)):
-                    raise FloatingPointError(
-                        f"{phase} epoch {epoch}: non-finite training loss; "
-                        "stopping before backward or optimizer update."
-                    )
                 scaler.scale(loss).backward()
             total_loss += float(optimized_losses.detach().sum())
             total_examples += len(example_losses)
@@ -488,24 +434,13 @@ def train_llm_epoch(
             )
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(
-            model.parameters(), config.max_grad_norm, error_if_nonfinite=True
+            model.parameters(), config.max_grad_norm, error_if_nonfinite=False
         )
         old_scale = scaler.get_scale()
-        if old_scale <= 0:
-            raise FloatingPointError(
-                f"{phase} epoch {epoch}: FP16 loss scale reached zero. "
-                "No further optimizer updates are possible."
-            )
         scaler.step(optimizer)
         scaler.update()
-        new_scale = scaler.get_scale()
-        if new_scale <= 0:
-            raise FloatingPointError(
-                f"{phase} epoch {epoch}: FP16 loss scale reached zero. "
-                "No further optimizer updates are possible."
-            )
         # An FP16 overflow skips the optimizer update; don't advance LR then.
-        if new_scale >= old_scale:
+        if scaler.get_scale() >= old_scale:
             scheduler.step()
             successful_updates += 1
         else:
@@ -555,7 +490,7 @@ def score_candidates(model, dataset, collator, config, runtime, description):
             key: value.to(runtime.device)
             for key, value in collator([x[2] for x in group]).items()
         }
-        with _autocast(runtime, dtype, model):
+        with _autocast(runtime, dtype):
             scores, counts = completion_log_probs(model, batch)
         for (row, label, _), score, tokens in zip(
             group, scores.cpu().tolist(), counts.cpu().tolist(), strict=True
@@ -767,10 +702,7 @@ def _training_state(model, loader, epochs, config, runtime):
     )
     scaler = torch.amp.GradScaler(
         "cuda",
-        enabled=(
-            compute_dtype(config, runtime) == torch.float16
-            and not _gemma3_fp16_base(model, torch.float16)
-        ),
+        enabled=compute_dtype(config, runtime) == torch.float16,
         init_scale=config.initial_loss_scale,
     )
     return optimizer, scheduler, scaler
@@ -2003,32 +1935,15 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"{validation_origin_heading} validation"
             )
 
-        backbone_config = AutoConfig.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
             revision=config.model_revision,
             trust_remote_code=False,
         )
-        chat_processor = None
-        if backbone_config.model_type == "gemma3":
-            chat_processor = AutoProcessor.from_pretrained(
-                config.model_name,
-                revision=config.model_revision,
-                trust_remote_code=False,
-            )
-            tokenizer = chat_processor.tokenizer
-            tokenizer.chat_template = chat_processor.chat_template
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(
-                config.model_name,
-                revision=config.model_revision,
-                trust_remote_code=False,
-            )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
-        encoder = ChatEncoder(
-            tokenizer, task, config.max_length, chat_processor=chat_processor
-        )
+        encoder = ChatEncoder(tokenizer, task, config.max_length)
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
         prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)

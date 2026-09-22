@@ -9,14 +9,12 @@ from __future__ import annotations
 
 import copy
 import json
-import re
 import tempfile
 import unittest
 import zipfile
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -25,20 +23,16 @@ from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from llm_config import TASK_A, TASK_B, LLM_TRAINING, LLMTrainingConfig, llm_task
+from llm_config import TASK_A, TASK_B, LLMTrainingConfig, llm_task
 from src.distributed import RuntimeContext
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
-    _autocast,
-    _training_state,
     binary_majority_vote,
     completion_log_probs,
     completion_token_diagnostics,
     compute_class_weights,
     compute_dtype,
     format_per_class_diagnostics,
-    lora_target_modules,
-    load_lora_model,
     require_cuda,
     restore_adapter,
     run_llm_task,
@@ -119,71 +113,6 @@ def cpu_runtime():
 
 
 class LLMTests(unittest.TestCase):
-    def test_gemma_defaults_preserve_effective_batch_and_exclude_vision_lora(self):
-        self.assertEqual(LLM_TRAINING.model_name, "google/gemma-3-4b-it")
-        self.assertEqual(LLM_TRAINING.train_batch_size_per_gpu, 1)
-        self.assertEqual(LLM_TRAINING.gradient_accumulation_steps, 8)
-        self.assertEqual(
-            LLM_TRAINING.train_batch_size_per_gpu
-            * LLM_TRAINING.gradient_accumulation_steps
-            * 2,
-            16,
-        )
-        targets = lora_target_modules("gemma3", "all-linear")
-        self.assertIsNotNone(
-            re.fullmatch(targets, "model.language_model.layers.0.self_attn.q_proj")
-        )
-        self.assertIsNotNone(
-            re.fullmatch(targets, "model.language_model.layers.0.mlp.down_proj")
-        )
-        self.assertIsNone(
-            re.fullmatch(targets, "model.vision_tower.encoder.layers.0.self_attn.q_proj")
-        )
-        self.assertEqual(lora_target_modules("qwen2", "all-linear"), "all-linear")
-
-    def test_gemma_loader_uses_conditional_model_and_text_only_lora(self):
-        runtime = RuntimeContext(torch.device("cuda", 1), 1, 1, 2, True)
-        backbone = MagicMock()
-        backbone.is_loaded_in_4bit = False
-        backbone.is_loaded_in_8bit = False
-        adapter = MagicMock()
-        adapter.named_parameters.return_value = [
-            (
-                "base_model.model.model.language_model.layers.0."
-                "self_attn.q_proj.lora_A.default.weight",
-                torch.nn.Parameter(torch.ones(1)),
-            )
-        ]
-        with (
-            patch("src.llm_training.require_cuda"),
-            patch("src.llm_training.compute_dtype", return_value=torch.float16),
-            patch(
-                "src.llm_training.AutoConfig.from_pretrained",
-                return_value=SimpleNamespace(model_type="gemma3"),
-            ),
-            patch(
-                "src.llm_training.Gemma3ForConditionalGeneration.from_pretrained",
-                return_value=backbone,
-            ) as gemma_loader,
-            patch("peft.get_peft_model", return_value=adapter) as attach_lora,
-        ):
-            self.assertIs(load_lora_model(self.config, runtime), adapter)
-        gemma_loader.assert_called_once()
-        self.assertFalse(backbone.config.text_config.use_cache)
-        target_pattern = attach_lora.call_args.args[1].target_modules
-        self.assertIsNotNone(
-            re.fullmatch(
-                target_pattern,
-                "model.language_model.layers.0.self_attn.q_proj",
-            )
-        )
-        self.assertIsNone(
-            re.fullmatch(
-                target_pattern,
-                "model.vision_tower.encoder.layers.0.self_attn.q_proj",
-            )
-        )
-
     def test_t4_uses_fp16_even_when_pytorch_supports_emulated_bf16(self):
         runtime = RuntimeContext(torch.device("cuda", 0), 0, 0, 1, False)
         config = LLMTrainingConfig()
@@ -194,25 +123,6 @@ class LLMTests(unittest.TestCase):
             self.assertEqual(compute_dtype(config, runtime), torch.float16)
             with self.assertRaisesRegex(ValueError, "select auto or float16"):
                 compute_dtype(replace(config, compute_dtype="bfloat16"), runtime)
-
-    def test_gemma_fp16_disables_second_amp_pass_and_loss_scaling(self):
-        runtime = RuntimeContext(torch.device("cuda", 0), 0, 0, 1, False)
-        model = tiny_model()
-        with (
-            patch(
-                "src.llm_training.unwrap_model",
-                return_value=SimpleNamespace(
-                    config=SimpleNamespace(model_type="gemma3")
-                ),
-            ),
-            patch("src.llm_training.compute_dtype", return_value=torch.float16),
-            patch("src.llm_training.torch.autocast") as autocast,
-        ):
-            with _autocast(runtime, torch.float16, model):
-                pass
-            autocast.assert_not_called()
-            _, _, scaler = _training_state(model, [0], 1, self.config, runtime)
-        self.assertFalse(scaler.is_enabled())
 
     def test_native_bf16_gpu_auto_and_explicit_fp16(self):
         runtime = RuntimeContext(torch.device("cuda", 0), 0, 0, 1, False)
@@ -275,38 +185,6 @@ class LLMTests(unittest.TestCase):
                 self.encoder.feature(prompt, label_id)["input_ids"], expected
             )
 
-    def test_gemma_processor_renders_text_only_chat_and_complete_label(self):
-        class TextOnlyProcessor:
-            chat_template = "test-gemma3-template"
-
-            def apply_chat_template(
-                self, messages, tokenize=False, add_generation_prompt=False
-            ):
-                assert not tokenize
-                pieces = ["<bos>"]
-                for message in messages:
-                    assert len(message["content"]) == 1
-                    content = message["content"][0]
-                    assert content["type"] == "text"
-                    role = "model" if message["role"] == "assistant" else message["role"]
-                    pieces.append(f"<{role}>{content['text']}</>")
-                if add_generation_prompt:
-                    pieces.append("<model>")
-                return "".join(pieces)
-
-        encoder = ChatEncoder(
-            self.tokenizer,
-            TASK_B,
-            512,
-            chat_processor=TextOnlyProcessor(),
-        )
-        prompt, _ = encoder.encode_prompt("hello")
-        self.assertIn("Comment:\nhello", self.tokenizer.decode(prompt))
-        for label_id, label in enumerate(TASK_B.labels):
-            feature = encoder.feature(prompt, label_id)
-            self.assertEqual(feature["labels"][: len(prompt)], [-100] * len(prompt))
-            self.assertIn(label, self.tokenizer.decode(feature["input_ids"]))
-
     def test_shifted_answer_loss_matches_full_qwen_loss(self):
         model = tiny_model().eval()
         dataset = CompletionDataset(
@@ -324,23 +202,6 @@ class LLMTests(unittest.TestCase):
         prompt_position = len(batch["labels"][0]) - len(self.encoder.completions[0]) - 1
         self.assertEqual(batch["attention_mask"][0, prompt_position].item(), 1)
         self.assertEqual(batch["labels"][0, prompt_position].item(), -100)
-
-    def test_nonfinite_answer_loss_fails_before_training_continues(self):
-        model = tiny_model().eval()
-        dataset = CompletionDataset(["hello"], self.encoder, [0])
-        batch = self.collator([dataset[0]])
-
-        def nan_token_losses(logits, targets, reduction):
-            self.assertEqual(reduction, "none")
-            return logits.new_full((targets.numel(),), float("nan"))
-
-        with patch(
-            "src.llm_training.F.cross_entropy", side_effect=nan_token_losses
-        ):
-            with self.assertRaisesRegex(
-                FloatingPointError, "Non-finite answer-token loss"
-            ):
-                completion_log_probs(model, batch)
 
     def test_causal_mask_blocks_future_answer(self):
         model = tiny_model().eval()
@@ -772,10 +633,6 @@ class LLMTests(unittest.TestCase):
                         "src.llm_training.AutoTokenizer.from_pretrained",
                         return_value=self.tokenizer,
                     ),
-                    patch(
-                        "src.llm_training.AutoConfig.from_pretrained",
-                        return_value=SimpleNamespace(model_type="qwen2"),
-                    ),
                     patch("src.data.resolve_data_file", side_effect=root.joinpath),
                     patch(
                         "src.llm_training.resolve_data_file", side_effect=root.joinpath
@@ -1041,10 +898,6 @@ class LLMTests(unittest.TestCase):
                 patch(
                     "src.llm_training.AutoTokenizer.from_pretrained",
                     return_value=self.tokenizer,
-                ),
-                patch(
-                    "src.llm_training.AutoConfig.from_pretrained",
-                    return_value=SimpleNamespace(model_type="qwen2"),
                 ),
                 patch("src.data.resolve_data_file", side_effect=root.joinpath),
                 patch(

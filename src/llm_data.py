@@ -51,20 +51,12 @@ class ChatEncoder:
     single-token labels, newlines, EOS IDs, or role-token spellings are made.
     """
 
-    def __init__(
-        self,
-        tokenizer: object,
-        task: TaskConfig,
-        max_length: int,
-        chat_processor: object | None = None,
-    ) -> None:
-        template_owner = chat_processor if chat_processor is not None else tokenizer
-        if not template_owner.chat_template:
+    def __init__(self, tokenizer: object, task: TaskConfig, max_length: int) -> None:
+        if not tokenizer.chat_template:
             raise ValueError("The LLM tokenizer must provide a chat template.")
         if tokenizer.pad_token_id is None:
             raise ValueError("The LLM tokenizer must have a padding token.")
         self.tokenizer = tokenizer
-        self.chat_processor = chat_processor
         self.task = task
         self.max_length = max_length
         self.system_text = system_prompt(task)
@@ -81,7 +73,7 @@ class ChatEncoder:
             if full[: len(empty_prompt)] != empty_prompt:
                 raise ValueError(
                     "Chat template response prefix is incompatible with answer-only training. "
-                    "Use an instruct checkpoint with a compatible chat template."
+                    "Use a non-thinking instruct checkpoint such as Qwen2.5-Instruct."
                 )
             completion = full[len(empty_prompt) :]
             if not completion:
@@ -100,20 +92,6 @@ class ChatEncoder:
         ]
 
     def _template(self, messages: list[dict[str, str]], generation: bool) -> list[int]:
-        if self.chat_processor is not None:
-            structured = [
-                {
-                    "role": message["role"],
-                    "content": [{"type": "text", "text": message["content"]}],
-                }
-                for message in messages
-            ]
-            rendered = self.chat_processor.apply_chat_template(
-                structured, tokenize=False, add_generation_prompt=generation
-            )
-            if not isinstance(rendered, str):
-                raise TypeError("Gemma 3 chat processor must render a text string.")
-            return list(self.tokenizer.encode(rendered, add_special_tokens=False))
         return list(
             self.tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=generation

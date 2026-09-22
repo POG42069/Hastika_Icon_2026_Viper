@@ -10,13 +10,6 @@ Pipeline dùng **LoRA chuẩn, không lượng tử hóa**. Backbone được n�
 trên T4 hoặc BF16 trên GPU hỗ trợ BF16 native. Trọng số backbone đóng băng;
 optimizer chỉ cập nhật các ma trận LoRA.
 
-**Lưu ý Gemma 3 trên T4:** FP16 có thể tạo loss NaN. Khi backbone Gemma 3
-đã được nạp FP16, code không bật thêm AMP FP16 hoặc loss scaling và sẽ dừng
-ngay ở batch đầu tiên có loss/gradient không hữu hạn. Đây là biện pháp tránh
-tiếp tục một lượt train hỏng, chưa bảo đảm Gemma 3 FP16 ổn định trên T4; hãy
-kiểm tra train loss hữu hạn trong log trước khi chạy dài. GPU hỗ trợ BF16 native
-vẫn dùng nhánh BF16 như trước.
-
 ## Quy trình huấn luyện
 
 ### Task A
@@ -113,19 +106,19 @@ assistant label vẫn nằm trong `max_length`.
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `google/gemma-3-4b-it` |
+| Backbone | `Qwen/Qwen2.5-3B-Instruct` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
-| Target modules | `all-linear` trong phần ngôn ngữ; không gắn LoRA vào vision tower |
+| Target modules | `all-linear` |
 | Max epochs | 5 |
 | Early-stopping patience | 2, chỉ áp dụng quy trình Task A |
 | Max chat length | 256 |
 | Learning rate | `1e-4` |
 | Weight decay | 0.01 |
 | Warmup ratio | 0.10 |
-| Batch/GPU | 1 |
-| Gradient accumulation | 8 |
+| Batch/GPU | 4 |
+| Gradient accumulation | 2 |
 | Effective batch trên T4 x2 | 16 |
 | Eval batch/GPU | 2 candidate completions |
 | Max gradient norm | 1.0 |
@@ -140,10 +133,8 @@ Với `r=32`, `alpha=64`, hệ số scale là 2. Backbone `W0` không được
 optimizer cập nhật.
 
 Đây không phải QLoRA: code không dùng NF4, double quantization hay
-`BitsAndBytesConfig`. Gemma 3 4B được nạp bằng
-`Gemma3ForConditionalGeneration` cho dữ liệu chỉ có văn bản; vision tower
-được giữ đóng băng. DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone
-đầy đủ. Batch 1/GPU và accumulation 8 giữ effective batch bằng 16.
+`BitsAndBytesConfig`. Qwen2.5-3B phù hợp với T4 16 GB hơn bản 7B khi dùng
+LoRA FP16. DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
 
 ## Dữ liệu
 
@@ -193,8 +184,7 @@ Task B cũng dùng trực tiếp sáu tên nhãn chính thức làm assistant re
 `Gender`, `Political`, `Religion`, `Geo-political`, `Violence`, `Others`.
 Prompt liệt kê các nhãn hợp lệ; file submission giữ nguyên tên nhãn chính thức.
 
-Code dùng chat template của Gemma 3 qua `AutoProcessor`. Prompt và padding
-được mask bằng `-100`;
+Code gọi `apply_chat_template`. Prompt và padding được mask bằng `-100`;
 loss chỉ áp dụng cho token của assistant label và token kết thúc chat. Khi dự
 đoán, pipeline tính mean token log-likelihood cho từng câu trả lời hợp lệ,
 softmax sáu candidate scores để lấy xác suất, rồi chọn nhãn theo quy tắc
@@ -210,15 +200,12 @@ kết quả.
 ```
 
 Khi Kaggle có T4 x2, entry point tự relaunch bằng DDP với hai worker.
-Gemma 3 là model có điều kiện truy cập: tài khoản Hugging Face cần chấp nhận
-điều khoản trên trang `google/gemma-3-4b-it` và notebook cần có `HF_TOKEN`
-được cấp quyền trước khi tải model.
 
 Có thể đổi tham số qua CLI:
 
 ```bash
-!python Train_B_LLM.py --model google/gemma-3-4b-it
-!python Train_B_LLM.py --max-epochs 5 --batch-size 1 --gradient-accumulation 8
+!python Train_B_LLM.py --model Qwen/Qwen2.5-3B-Instruct
+!python Train_B_LLM.py --max-epochs 5 --batch-size 4 --gradient-accumulation 2
 !python Train_B_LLM.py --single-gpu
 !python Train_B_LLM.py --prediction-file /path/to/official_inputs.csv
 ```

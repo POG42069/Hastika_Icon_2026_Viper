@@ -64,7 +64,7 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "google/gemma-3-4b-it"
+            "HASTIKA_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"
         )
     )
     model_revision: str = "main"
@@ -75,10 +75,10 @@ class LLMTrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
-    train_batch_size_per_gpu: int = 1
+    train_batch_size_per_gpu: int = 4
     # Number of candidate completions per forward, NOT number of comments.
     eval_batch_size_per_gpu: int = 2
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 2
     max_grad_norm: float = 1.0
     early_stopping_patience: int = 2
     lora_rank: int = 32
