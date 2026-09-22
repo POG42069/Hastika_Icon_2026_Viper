@@ -29,6 +29,8 @@ from llm_config import TASK_A, TASK_B, LLM_TRAINING, LLMTrainingConfig, llm_task
 from src.distributed import RuntimeContext
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
+    _autocast,
+    _training_state,
     binary_majority_vote,
     completion_log_probs,
     completion_token_diagnostics,
@@ -193,6 +195,25 @@ class LLMTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "select auto or float16"):
                 compute_dtype(replace(config, compute_dtype="bfloat16"), runtime)
 
+    def test_gemma_fp16_disables_second_amp_pass_and_loss_scaling(self):
+        runtime = RuntimeContext(torch.device("cuda", 0), 0, 0, 1, False)
+        model = tiny_model()
+        with (
+            patch(
+                "src.llm_training.unwrap_model",
+                return_value=SimpleNamespace(
+                    config=SimpleNamespace(model_type="gemma3")
+                ),
+            ),
+            patch("src.llm_training.compute_dtype", return_value=torch.float16),
+            patch("src.llm_training.torch.autocast") as autocast,
+        ):
+            with _autocast(runtime, torch.float16, model):
+                pass
+            autocast.assert_not_called()
+            _, _, scaler = _training_state(model, [0], 1, self.config, runtime)
+        self.assertFalse(scaler.is_enabled())
+
     def test_native_bf16_gpu_auto_and_explicit_fp16(self):
         runtime = RuntimeContext(torch.device("cuda", 0), 0, 0, 1, False)
         config = LLMTrainingConfig()
@@ -303,6 +324,23 @@ class LLMTests(unittest.TestCase):
         prompt_position = len(batch["labels"][0]) - len(self.encoder.completions[0]) - 1
         self.assertEqual(batch["attention_mask"][0, prompt_position].item(), 1)
         self.assertEqual(batch["labels"][0, prompt_position].item(), -100)
+
+    def test_nonfinite_answer_loss_fails_before_training_continues(self):
+        model = tiny_model().eval()
+        dataset = CompletionDataset(["hello"], self.encoder, [0])
+        batch = self.collator([dataset[0]])
+
+        def nan_token_losses(logits, targets, reduction):
+            self.assertEqual(reduction, "none")
+            return logits.new_full((targets.numel(),), float("nan"))
+
+        with patch(
+            "src.llm_training.F.cross_entropy", side_effect=nan_token_losses
+        ):
+            with self.assertRaisesRegex(
+                FloatingPointError, "Non-finite answer-token loss"
+            ):
+                completion_log_probs(model, batch)
 
     def test_causal_mask_blocks_future_answer(self):
         model = tiny_model().eval()

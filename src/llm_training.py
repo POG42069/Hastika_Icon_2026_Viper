@@ -160,7 +160,20 @@ def require_cuda(runtime: RuntimeContext) -> None:
         )
 
 
-def _autocast(runtime: RuntimeContext, dtype: torch.dtype):
+def _gemma3_fp16_base(model: nn.Module, dtype: torch.dtype) -> bool:
+    base = unwrap_model(model)
+    base = base.get_base_model() if hasattr(base, "get_base_model") else base
+    return (
+        dtype == torch.float16
+        and getattr(base.config, "model_type", None) == "gemma3"
+    )
+
+
+def _autocast(runtime: RuntimeContext, dtype: torch.dtype, model: nn.Module):
+    # The Gemma 3 checkpoint is already loaded in FP16 on T4. Applying FP16 AMP
+    # on top of those half-precision weights has produced non-finite losses.
+    if _gemma3_fp16_base(model, dtype):
+        return nullcontext()
     return (
         torch.autocast("cuda", dtype=dtype)
         if runtime.device.type == "cuda"
@@ -393,6 +406,12 @@ def completion_log_probs(
     token_losses = F.cross_entropy(
         shifted_logits[mask].float(), targets[mask], reduction="none"
     )
+    if not bool(torch.isfinite(token_losses).all()):
+        raise FloatingPointError(
+            "Non-finite answer-token loss during model forward. "
+            "Gemma 3 can overflow in FP16 on T4; this run cannot produce a "
+            "valid checkpoint."
+        )
     row_ids = torch.arange(labels.shape[0], device=labels.device)[:, None].expand_as(
         mask
     )[mask]
@@ -442,7 +461,7 @@ def train_llm_epoch(
                 else nullcontext()
             )
             with sync:
-                with _autocast(runtime, dtype):
+                with _autocast(runtime, dtype, model):
                     log_probs, counts = completion_log_probs(model, batch)
                     example_losses = -log_probs / counts
                     if device_class_weights is None:
@@ -456,6 +475,11 @@ def train_llm_epoch(
                             batch["class_ids"]
                         ]
                     loss = optimized_losses.sum() / group_size
+                if not bool(torch.isfinite(loss)):
+                    raise FloatingPointError(
+                        f"{phase} epoch {epoch}: non-finite training loss; "
+                        "stopping before backward or optimizer update."
+                    )
                 scaler.scale(loss).backward()
             total_loss += float(optimized_losses.detach().sum())
             total_examples += len(example_losses)
@@ -464,13 +488,24 @@ def train_llm_epoch(
             )
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(
-            model.parameters(), config.max_grad_norm, error_if_nonfinite=False
+            model.parameters(), config.max_grad_norm, error_if_nonfinite=True
         )
         old_scale = scaler.get_scale()
+        if old_scale <= 0:
+            raise FloatingPointError(
+                f"{phase} epoch {epoch}: FP16 loss scale reached zero. "
+                "No further optimizer updates are possible."
+            )
         scaler.step(optimizer)
         scaler.update()
+        new_scale = scaler.get_scale()
+        if new_scale <= 0:
+            raise FloatingPointError(
+                f"{phase} epoch {epoch}: FP16 loss scale reached zero. "
+                "No further optimizer updates are possible."
+            )
         # An FP16 overflow skips the optimizer update; don't advance LR then.
-        if scaler.get_scale() >= old_scale:
+        if new_scale >= old_scale:
             scheduler.step()
             successful_updates += 1
         else:
@@ -520,7 +555,7 @@ def score_candidates(model, dataset, collator, config, runtime, description):
             key: value.to(runtime.device)
             for key, value in collator([x[2] for x in group]).items()
         }
-        with _autocast(runtime, dtype):
+        with _autocast(runtime, dtype, model):
             scores, counts = completion_log_probs(model, batch)
         for (row, label, _), score, tokens in zip(
             group, scores.cpu().tolist(), counts.cpu().tolist(), strict=True
@@ -732,7 +767,10 @@ def _training_state(model, loader, epochs, config, runtime):
     )
     scaler = torch.amp.GradScaler(
         "cuda",
-        enabled=compute_dtype(config, runtime) == torch.float16,
+        enabled=(
+            compute_dtype(config, runtime) == torch.float16
+            and not _gemma3_fp16_base(model, torch.float16)
+        ),
         init_scale=config.initial_loss_scale,
     )
     return optimizer, scheduler, scaler

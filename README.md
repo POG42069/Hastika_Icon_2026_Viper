@@ -10,6 +10,13 @@ Pipeline dùng **LoRA chuẩn, không lượng tử hóa**. Backbone được n�
 trên T4 hoặc BF16 trên GPU hỗ trợ BF16 native. Trọng số backbone đóng băng;
 optimizer chỉ cập nhật các ma trận LoRA.
 
+**Lưu ý Gemma 3 trên T4:** FP16 có thể tạo loss NaN. Khi backbone Gemma 3
+đã được nạp FP16, code không bật thêm AMP FP16 hoặc loss scaling và sẽ dừng
+ngay ở batch đầu tiên có loss/gradient không hữu hạn. Đây là biện pháp tránh
+tiếp tục một lượt train hỏng, chưa bảo đảm Gemma 3 FP16 ổn định trên T4; hãy
+kiểm tra train loss hữu hạn trong log trước khi chạy dài. GPU hỗ trợ BF16 native
+vẫn dùng nhánh BF16 như trước.
+
 ## Quy trình huấn luyện
 
 ### Task A
