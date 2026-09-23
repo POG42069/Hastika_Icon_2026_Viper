@@ -67,7 +67,7 @@ Cấu hình mặc định trong `llm_config.py`:
 | Max epochs để chọn | 10 |
 | Early-stopping patience | 6 |
 | Max chat length | 256 |
-| Learning rate | `1e-5` |
+| Learning rate | `2e-4` |
 | Batch/GPU | 4 |
 | Gradient accumulation | 2 |
 | Eval batch/GPU | 2 candidate completions |
@@ -89,7 +89,7 @@ https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507. Không cần truyền
 `enable_thinking=False` cho chat template. DDP không cộng VRAM của hai GPU:
 mỗi GPU giữ một bản backbone. Revision model được pin để tránh thay đổi
 checkpoint giữa các lần chạy.
-Mức `1e-5` là thiết lập thí nghiệm, chưa được xác nhận là LR tối ưu trên dev.
+Mức `2e-4` là thiết lập thí nghiệm, chưa được xác nhận là LR tối ưu trên dev.
 Nếu đặt `HASTIKA_LLM_MODEL` trong môi trường, giá trị đó sẽ ghi đè model mặc
 định; khi đổi sang model khác, cần truyền `--revision` phù hợp với model đó.
 
