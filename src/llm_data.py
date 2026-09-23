@@ -70,8 +70,8 @@ class ChatEncoder:
             )
             if full[: len(empty_prompt)] != empty_prompt:
                 raise ValueError(
-                    "Chat template response prefix is incompatible with answer-only training. "
-                    "Use a non-thinking instruct checkpoint such as Qwen2.5-Instruct."
+                    "Chat template response prefix is incompatible with "
+                    "answer-only training."
                 )
             completion = full[len(empty_prompt) :]
             if not completion:
@@ -101,10 +101,6 @@ class ChatEncoder:
                 messages,
                 tokenize=True,
                 add_generation_prompt=generation,
-                # Candidate scoring/training must predict the label directly.
-                # Qwen3 thinking-capable templates otherwise prepend a
-                # <think> block before the assistant answer.
-                enable_thinking=False,
             )
         )
 

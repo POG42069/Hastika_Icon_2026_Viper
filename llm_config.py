@@ -60,15 +60,16 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"
+            "HASTIKA_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507"
         )
     )
-    model_revision: str = "main"
+    # Exact Hugging Face revision for Qwen3-4B-Instruct-2507.
+    model_revision: str = "cdbee75f17c01a7cc42f958dc650907174af0554"
     validation_size: float = 0.20
     seed: int = 42
     max_length: int = 256  # Full chat, including instructions, answer and EOS.
     max_epochs: int = 5
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-5
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
     train_batch_size_per_gpu: int = 4
@@ -97,8 +98,8 @@ TASK_A = TaskConfig(
     label_column="Label",
     labels=("Non-Hate", "Hate"),
     label_codes=("Non-Hate", "Hate"),
-    checkpoint_subdir="task_a_lora",
-    output_subdir="task_a_lora",
+    checkpoint_subdir="task_a_qwen3_4b_2507_lora",
+    output_subdir="task_a_qwen3_4b_2507_lora",
     submission_zip_name="task_a_submission.zip",
     original_fold_filenames=tuple(
         f"binary_original_{fold}.csv" for fold in range(1, 6)
@@ -136,8 +137,8 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    checkpoint_subdir="task_b_lora",
-    output_subdir="task_b_lora",
+    checkpoint_subdir="task_b_qwen3_4b_2507_lora",
+    output_subdir="task_b_qwen3_4b_2507_lora",
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
@@ -160,7 +161,7 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-# Standard LoRA consumes more VRAM than QLoRA, so Task B also starts at batch/GPU=1.
+# Task B currently uses the same training defaults as Task A.
 LLM_TRAINING_B = replace(LLM_TRAINING)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B
