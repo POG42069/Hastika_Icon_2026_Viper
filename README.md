@@ -64,7 +64,7 @@ Cấu hình mặc định trong `llm_config.py`:
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
-| Max epochs để chọn | 5 |
+| Max epochs để chọn | 10 |
 | Early-stopping patience | 2 |
 | Max chat length | 256 |
 | Learning rate | `1e-5` |

@@ -68,7 +68,7 @@ class LLMTrainingConfig:
     validation_size: float = 0.20
     seed: int = 42
     max_length: int = 256  # Full chat, including instructions, answer and EOS.
-    max_epochs: int = 5
+    max_epochs: int = 10
     learning_rate: float = 1e-5
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
