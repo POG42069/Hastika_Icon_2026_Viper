@@ -106,7 +106,7 @@ assistant label vẫn nằm trong `max_length`.
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone | `Qwen/Qwen3-4B-Instruct-2507` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
@@ -133,8 +133,11 @@ Với `r=32`, `alpha=64`, hệ số scale là 2. Backbone `W0` không được
 optimizer cập nhật.
 
 Đây không phải QLoRA: code không dùng NF4, double quantization hay
-`BitsAndBytesConfig`. Qwen2.5-3B phù hợp với T4 16 GB hơn bản 7B khi dùng
-LoRA FP16. DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
+`BitsAndBytesConfig`. `Qwen3-4B-Instruct-2507` có 4.0B tham số (3.6B không
+tính embedding) và chỉ hỗ trợ non-thinking mode, nên prompt không sinh block
+`<think>...</think>` và không cần truyền `enable_thinking=False`. Trên T4,
+backbone được nạp bằng FP16. DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản
+backbone đầy đủ.
 
 ## Dữ liệu
 
@@ -205,11 +208,14 @@ kết quả.
 ```
 
 Khi Kaggle có T4 x2, entry point tự relaunch bằng DDP với hai worker.
+Mặc định vẫn dùng batch 4/GPU và accumulation 2. Nếu Qwen3 4B vượt bộ nhớ
+T4 trong một môi trường Kaggle cụ thể, dùng
+`--batch-size 2 --gradient-accumulation 4` để giữ effective batch bằng 16.
 
 Có thể đổi tham số qua CLI:
 
 ```bash
-!python Train_B_LLM.py --model Qwen/Qwen2.5-3B-Instruct
+!python Train_B_LLM.py --model Qwen/Qwen3-4B-Instruct-2507
 !python Train_B_LLM.py --max-epochs 5 --batch-size 4 --gradient-accumulation 2
 !python Train_B_LLM.py --single-gpu
 !python Train_B_LLM.py --prediction-file /path/to/official_inputs.csv

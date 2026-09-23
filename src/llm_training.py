@@ -334,7 +334,7 @@ def completion_log_probs(
 
     Supervision is shifted exactly once: logits BEFORE each answer token predict
     that token. Project only the short suffix to the large vocabulary where the
-    architecture supports logits_to_keep (Qwen2.5); preserve the full attention
+    architecture supports logits_to_keep; preserve the full attention
     context. Left padding lets different prompt lengths share a short suffix.
     """
     labels = batch["labels"]

@@ -73,7 +73,7 @@ class ChatEncoder:
             if full[: len(empty_prompt)] != empty_prompt:
                 raise ValueError(
                     "Chat template response prefix is incompatible with answer-only training. "
-                    "Use a non-thinking instruct checkpoint such as Qwen2.5-Instruct."
+                    "Use a non-thinking instruct checkpoint."
                 )
             completion = full[len(empty_prompt) :]
             if not completion:

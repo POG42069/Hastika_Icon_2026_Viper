@@ -64,7 +64,7 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"
+            "HASTIKA_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507"
         )
     )
     model_revision: str = "main"
