@@ -70,7 +70,7 @@ Cấu hình mặc định trong `llm_config.py`:
 | Max epochs để chọn | 5 |
 | Early-stopping patience | 2 |
 | Max sequence length | 256 |
-| Learning rate | `1e-4` |
+| Learning rate | `2e-4` |
 | Batch/GPU | 4 |
 | Gradient accumulation | 2 |
 | Eval batch/GPU | 2 candidate completions |

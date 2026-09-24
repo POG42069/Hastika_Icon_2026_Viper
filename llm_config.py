@@ -72,7 +72,7 @@ class LLMTrainingConfig:
     seed: int = 42
     max_length: int = 256  # Full prompt, including the answer and EOS.
     max_epochs: int = 5
-    learning_rate: float = 1e-4
+    learning_rate: float = 2e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
     train_batch_size_per_gpu: int = 4
