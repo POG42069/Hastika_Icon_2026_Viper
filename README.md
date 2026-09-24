@@ -24,29 +24,20 @@ optimizer chỉ cập nhật các ma trận LoRA.
 4. Năm model dự đoán development độc lập. Nhãn cuối được chọn bằng hard
    majority vote: ít nhất 3 phiếu `Hate` thì trả `Hate`.
 
-### Task B: five-fold OOF + năm full-data model
+### Task B: thí nghiệm fixed epoch + năm full-data model
 
 Task B không còn downsample Gender và không loại bất kỳ câu train nào.
 
-1. Pipeline chạy năm lượt OOF với selection seed cố định là `42`.
-   - Lượt k validation trên `original_k.csv`.
-   - Train trên cả original và augment của bốn fold còn lại.
-   - `augmentk.csv` không được đưa vào train ở lượt đang validation fold k,
-     nên câu augment của validation source không rò rỉ sang train.
-2. Mỗi fold chạy đủ 5 epoch. OOF không early stop vì cần dự đoán từ đủ năm
-   fold ở cùng từng epoch.
-3. Ở mỗi epoch, pipeline ghép dự đoán validation của năm fold. Như vậy mỗi câu
-   original có đúng một dự đoán từ model chưa từng học fold chứa câu đó.
-4. Chọn **một global best epoch** theo Macro-F1 của toàn bộ OOF; OOF loss thấp
-   hơn dùng để phá hòa.
-5. Khởi tạo mới năm model với seed `42, 52, 62, 72, 82`. Mỗi model train trên
-   toàn bộ `original_1..5 + augment1..5` trong đúng global best epoch.
-6. Mỗi model trả xác suất cho sáu nhãn. Pipeline lấy trung bình xác suất của
+1. Tạm bỏ toàn bộ giai đoạn five-fold OOF và không chọn global best epoch.
+2. Đặt số epoch full-data cố định bằng `2` để chạy nhanh thí nghiệm phương sai.
+3. Khởi tạo mới năm model với seed `42, 52, 62, 72, 82`. Mỗi model train trên
+   toàn bộ `original_1..5 + augment1..5` trong đúng hai epoch.
+4. Mỗi model trả xác suất cho sáu nhãn. Pipeline lấy trung bình xác suất của
    năm model với trọng số bằng nhau rồi lấy nhãn có xác suất trung bình cao
    nhất. Đây là soft ensemble, không phải hard voting.
 
-Hai giai đoạn đều dùng class-weighted loss của Task B. Full-data retrain khởi
-tạo model mới để mọi hàng dữ liệu được học số epoch như nhau.
+Class-weighted loss vẫn được áp dụng cho cả năm model. Mỗi model được khởi tạo
+mới để mọi hàng dữ liệu được học đúng hai epoch như nhau.
 
 ## Class-weighted loss của Task B
 
@@ -70,9 +61,8 @@ Trong đó `N` là tổng số mẫu train, `K=6`, và `n_c` là số mẫu củ
 ngăn class hiếm chi phối gradient. Bước chuẩn hóa giữ mean sample weight bằng
 1, nên độ lớn loss và learning rate gần với pipeline cũ.
 
-Weights được tính lại chỉ từ bốn train folds ở từng lượt OOF. Validation fold
-không tham gia tính weights. Khi full-data retrain, weights được tính lại từ cả
-10 file.
+Trong thí nghiệm fixed epoch hiện tại, weights được tính từ toàn bộ 10 file
+trước khi train năm full-data model.
 
 Với dữ liệu Task B hiện tại:
 
@@ -111,7 +101,7 @@ assistant label vẫn nằm trong `max_length`.
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
-| Max epochs | 5 |
+| Max epochs | 5 cho Task A; Task B cố định 2 epoch |
 | Early-stopping patience | 2, chỉ áp dụng quy trình Task A |
 | Max chat length | 256 |
 | Learning rate | `1e-4` |
@@ -205,10 +195,14 @@ Có thể đổi tham số qua CLI:
 
 ```bash
 !python Train_B_LLM.py --model Qwen/Qwen2.5-3B-Instruct
-!python Train_B_LLM.py --max-epochs 5 --batch-size 4 --gradient-accumulation 2
+!python Train_B_LLM.py --batch-size 4 --gradient-accumulation 2
 !python Train_B_LLM.py --single-gpu
 !python Train_B_LLM.py --prediction-file /path/to/official_inputs.csv
 ```
+
+Số epoch của thí nghiệm Task B hiện được khóa bằng
+`TASK_B.fixed_full_retrain_epochs=2`; tùy chọn `--max-epochs` không thay đổi
+giá trị cố định này.
 
 Có thể đặt thư mục bằng biến môi trường:
 
@@ -218,22 +212,13 @@ Có thể đặt thư mục bằng biến môi trường:
 %env HASTIKA_CHECKPOINT_DIR=/kaggle/working/checkpoints
 ```
 
-Task B chạy nặng hơn trước: năm OOF model đều chạy đủ `max_epochs`, sau đó
-năm full-data model được train theo global best epoch.
+Task B hiện bỏ qua OOF và chỉ train năm full-data model, mỗi model đúng 2 epoch.
 
 ## Artifacts
 
 Task B tạo các artifact chính:
 
 ```text
-outputs/task_b_lora/oof_fold_1/selection_training_history.json
-outputs/task_b_lora/oof_fold_1/validation_predictions.csv
-outputs/task_b_lora/oof_fold_2/...
-outputs/task_b_lora/oof_epoch_results.csv
-outputs/task_b_lora/oof_selection_summary.json
-outputs/task_b_lora/oof_predictions_epoch_1.csv
-outputs/task_b_lora/oof_predictions.csv
-outputs/task_b_lora/validation_confusion_history.csv
 outputs/task_b_lora/seed_42/full_data_training_history.json
 outputs/task_b_lora/seed_42/predictions.csv
 outputs/task_b_lora/seed_52/...
@@ -246,10 +231,12 @@ checkpoints/task_b_lora/seed_52/...
 checkpoints/task_b_lora/metrics.json
 ```
 
-`oof_predictions.csv` chứa OOF prediction ở global best epoch.
 `ensemble_predictions.csv` chứa nhãn từng seed, xác suất trung bình, số phiếu
 chẩn đoán và nhãn cuối. File để nộp là
 `outputs/task_b_lora/task_b_submission.zip`.
+
+Một lượt chạy mới không tạo artifact OOF. Pipeline không tự động xóa artifact
+OOF cũ nếu cùng thư mục output từng được dùng cho phiên bản trước.
 
 Task A tiếp tục tạo per-seed holdout history, full-data adapters,
 `voting_predictions.csv`, `predictions.csv` và

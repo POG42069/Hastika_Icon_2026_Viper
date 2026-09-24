@@ -38,6 +38,7 @@ class TaskConfig:
     ensemble_all_seeds: bool = False
     oof_validation_folds: tuple[int, ...] = ()
     full_retrain_soft_ensemble: bool = False
+    fixed_full_retrain_epochs: int | None = None
     class_weight_power: float | None = None
     class_weight_min: float = 0.75
     class_weight_max: float = 1.50
@@ -151,6 +152,9 @@ TASK_B = TaskConfig(
     selection_seeds=(42, 52, 62, 72, 82),
     oof_validation_folds=(1, 2, 3, 4, 5),
     full_retrain_soft_ensemble=True,
+    # Temporary variance experiment: skip OOF and train every full-data seed
+    # for exactly two epochs.
+    fixed_full_retrain_epochs=2,
     class_weight_power=0.50,
     class_weight_min=0.75,
     class_weight_max=1.50,

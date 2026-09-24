@@ -791,7 +791,7 @@ class LLMTests(unittest.TestCase):
                     ]
                 self.assertEqual(result["label"].tolist(), expected)
 
-    def test_task_b_oof_selects_global_epoch_then_soft_ensembles_full_models(self):
+    def test_task_b_skips_oof_and_soft_ensembles_fixed_epoch_full_models(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             retrain_seeds = (42, 52)
@@ -868,25 +868,6 @@ class LLMTests(unittest.TestCase):
                 )
                 return train_llm_epoch(*args, **kwargs)
 
-            def controlled_score(*args):
-                result = real_score(*args)
-                description = args[-1]
-                dataset = args[1]
-                if description.startswith("OOF fold") and "validation" in description:
-                    epoch = int(description.split(" epoch ", 1)[1].split()[0])
-                    gold = np.asarray(dataset.labels, dtype=np.int64)
-                    predicted = gold if epoch == 1 else (gold + 1) % len(task.labels)
-                    probabilities = np.full(
-                        (len(gold), len(task.labels)), 0.01, dtype=np.float64
-                    )
-                    probabilities[np.arange(len(gold)), predicted] = 0.95
-                    probabilities /= probabilities.sum(axis=1, keepdims=True)
-                    result["probabilities"] = probabilities
-                    result["loss"] = 0.1 if epoch == 1 else 1.0
-                    result["macro_f1"] = 1.0 if epoch == 1 else 0.0
-                    result["accuracy"] = 1.0 if epoch == 1 else 0.0
-                return result
-
             with (
                 patch("src.llm_training.require_cuda"),
                 patch(
@@ -906,7 +887,7 @@ class LLMTests(unittest.TestCase):
                 patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
                 patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
                 patch(
-                    "src.llm_training.score_candidates", side_effect=controlled_score
+                    "src.llm_training.score_candidates", side_effect=real_score
                 ),
                 patch(
                     "src.llm_training.train_llm_epoch", side_effect=tracked_train
@@ -916,18 +897,19 @@ class LLMTests(unittest.TestCase):
 
             output = root / "outputs" / task.output_subdir
             summary = json.loads((output / "run_summary.json").read_text())
-            self.assertEqual(summary["oof"]["best_epoch"], 1)
-            self.assertEqual(summary["oof"]["validation_folds"], [1, 2, 3, 4, 5])
+            self.assertEqual(summary["epoch_selection"]["fixed_epoch"], 2)
+            self.assertTrue(summary["epoch_selection"]["oof_skipped"])
+            self.assertEqual(
+                summary["epoch_selection"]["strategy"], "fixed_without_oof"
+            )
             self.assertEqual(summary["class_weighting"]["downsampling"], None)
             self.assertEqual(len(summary["full_data_retrains"]), len(retrain_seeds))
             self.assertEqual(summary["ensemble"]["method"], (
                 "equal-weight mean of per-seed candidate probabilities"
             ))
 
-            oof = pd.read_csv(output / "oof_predictions.csv", dtype={"id": str})
-            self.assertEqual(len(oof), rows_per_fold * 5)
-            self.assertEqual(set(oof["fold"]), {1, 2, 3, 4, 5})
-            self.assertTrue((oof["true_label"] == oof["predicted_label"]).all())
+            self.assertFalse((output / "oof_predictions.csv").exists())
+            self.assertFalse((output / "oof_selection_summary.json").exists())
 
             result = pd.read_csv(output / "predictions.csv", dtype={"id": str})
             ensemble = pd.read_csv(
@@ -947,11 +929,11 @@ class LLMTests(unittest.TestCase):
             with zipfile.ZipFile(output / task.submission_zip_name) as archive:
                 self.assertEqual(archive.namelist(), ["predictions.csv"])
 
-            self.assertEqual(len(loaded_models), 5 + len(retrain_seeds))
+            self.assertEqual(len(loaded_models), len(retrain_seeds))
             self.assertEqual(
                 [call["rows"] for call in train_calls],
-                [rows_per_fold * 4 + len(task.labels) * 4] * (5 * config.max_epochs)
-                + [rows_per_fold * 5 + len(task.labels) * 5] * len(retrain_seeds),
+                [rows_per_fold * 5 + len(task.labels) * 5]
+                * (len(retrain_seeds) * task.fixed_full_retrain_epochs),
             )
             self.assertTrue(
                 all(call["class_weights"] is not None for call in train_calls)
