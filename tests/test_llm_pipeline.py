@@ -897,7 +897,7 @@ class LLMTests(unittest.TestCase):
 
             output = root / "outputs" / task.output_subdir
             summary = json.loads((output / "run_summary.json").read_text())
-            self.assertEqual(summary["epoch_selection"]["fixed_epoch"], 2)
+            self.assertEqual(summary["epoch_selection"]["fixed_epoch"], 5)
             self.assertTrue(summary["epoch_selection"]["oof_skipped"])
             self.assertEqual(
                 summary["epoch_selection"]["strategy"], "fixed_without_oof"

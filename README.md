@@ -29,15 +29,15 @@ optimizer chỉ cập nhật các ma trận LoRA.
 Task B không còn downsample Gender và không loại bất kỳ câu train nào.
 
 1. Tạm bỏ toàn bộ giai đoạn five-fold OOF và không chọn global best epoch.
-2. Đặt số epoch full-data cố định bằng `2` để chạy nhanh thí nghiệm phương sai.
+2. Đặt số epoch full-data cố định bằng `5` cho thí nghiệm phương sai.
 3. Khởi tạo mới năm model với seed `42, 52, 62, 72, 82`. Mỗi model train trên
-   toàn bộ `original_1..5 + augment1..5` trong đúng hai epoch.
+   toàn bộ `original_1..5 + augment1..5` trong đúng năm epoch.
 4. Mỗi model trả xác suất cho sáu nhãn. Pipeline lấy trung bình xác suất của
    năm model với trọng số bằng nhau rồi lấy nhãn có xác suất trung bình cao
    nhất. Đây là soft ensemble, không phải hard voting.
 
 Class-weighted loss vẫn được áp dụng cho cả năm model. Mỗi model được khởi tạo
-mới để mọi hàng dữ liệu được học đúng hai epoch như nhau.
+mới để mọi hàng dữ liệu được học đúng năm epoch như nhau.
 
 ## Class-weighted loss của Task B
 
@@ -101,7 +101,7 @@ assistant label vẫn nằm trong `max_length`.
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
-| Max epochs | 5 cho Task A; Task B cố định 2 epoch |
+| Max epochs | 5 cho Task A; Task B cố định 5 epoch |
 | Early-stopping patience | 2, chỉ áp dụng quy trình Task A |
 | Max chat length | 256 |
 | Learning rate | `1e-4` |
@@ -201,7 +201,7 @@ Có thể đổi tham số qua CLI:
 ```
 
 Số epoch của thí nghiệm Task B hiện được khóa bằng
-`TASK_B.fixed_full_retrain_epochs=2`; tùy chọn `--max-epochs` không thay đổi
+`TASK_B.fixed_full_retrain_epochs=5`; tùy chọn `--max-epochs` không thay đổi
 giá trị cố định này.
 
 Có thể đặt thư mục bằng biến môi trường:
@@ -212,7 +212,7 @@ Có thể đặt thư mục bằng biến môi trường:
 %env HASTIKA_CHECKPOINT_DIR=/kaggle/working/checkpoints
 ```
 
-Task B hiện bỏ qua OOF và chỉ train năm full-data model, mỗi model đúng 2 epoch.
+Task B hiện bỏ qua OOF và chỉ train năm full-data model, mỗi model đúng 5 epoch.
 
 ## Artifacts
 

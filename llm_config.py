@@ -153,8 +153,8 @@ TASK_B = TaskConfig(
     oof_validation_folds=(1, 2, 3, 4, 5),
     full_retrain_soft_ensemble=True,
     # Temporary variance experiment: skip OOF and train every full-data seed
-    # for exactly two epochs.
-    fixed_full_retrain_epochs=2,
+    # for exactly five epochs.
+    fixed_full_retrain_epochs=5,
     class_weight_power=0.50,
     class_weight_min=0.75,
     class_weight_max=1.50,
