@@ -1,5 +1,9 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
+Nếu lần chạy Task A trên Kaggle bị dừng sau 12 giờ và bạn có
+`results-7.zip`, xem [RESUME_KAGGLE.md](RESUME_KAGGLE.md) để chạy tiếp theo từng
+seed bằng `Resume_A_LLM.py`.
+
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
 
 - Task A: phát hiện `Non-Hate` / `Hate`.
@@ -64,8 +68,8 @@ Cấu hình mặc định trong `llm_config.py`:
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
-| Max epochs để chọn | 5 |
-| Early-stopping patience | 3 |
+| Max epochs để chọn | 10 |
+| Early-stopping patience | 6 |
 | Max chat length | 256 |
 | Learning rate | `2e-4` |
 | Batch/GPU | 4 |
