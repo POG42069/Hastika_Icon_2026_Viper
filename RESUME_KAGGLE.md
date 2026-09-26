@@ -1,5 +1,11 @@
 # Tiếp tục Task A sau khi Kaggle dừng ở 12 giờ
 
+**Không chạy `python Train_A_LLM.py` để tiếp tục.** Entry point đó luôn bắt
+đầu selection từ epoch 1, dù đã gắn checkpoint vào Kaggle Input. Với seed
+42/52/62/72, lệnh đúng là `python Resume_A_LLM.py train-seed ...`; log đầu
+tiên của giai đoạn train sẽ ghi `Full-data retrain seed <N>`, không phải
+`Selection train | epoch 1`.
+
 ## Trạng thái của `results-7.zip`
 
 ZIP được tạo từ `Nhotest` commit `911bef44cebdf31c500f503648a56b151148e69b`.
@@ -16,6 +22,8 @@ khi dùng `best_epoch`.
 
 File nhỏ `task_a_resume_metadata.zip` đã được tạo từ `results-7.zip`, chứa
 selection summary, history và manifest cần thiết. Nó không chứa model weights.
+`--archive` chấp nhận cả đường dẫn đến ZIP lẫn thư mục Kaggle Dataset đã giải
+nén các file trong `results-7.zip`.
 
 ## Chuẩn bị trên Kaggle
 
@@ -51,6 +59,17 @@ Mỗi version chỉ xử lý **một seed**. Với seed 42, dùng:
   --seed 42
 ```
 
+Nếu Dataset “Checkpoint 24/9” đã chứa `results-7.zip` hoặc các thư mục
+`Hastika_Icon_2026_Viper/outputs/...`, có thể truyền **đường dẫn thư mục
+Dataset** cho `--archive` thay vì tải lại file metadata. Kiểm tra đường dẫn
+trong notebook bằng:
+
+```python
+from pathlib import Path
+print(*Path("/kaggle/input").rglob("seed_42/seed_summary.json"), sep="\n")
+print(*Path("/kaggle/input").rglob("results-7.zip"), sep="\n")
+```
+
 Lặp lại bằng `--seed 52`, `--seed 62`, `--seed 72`, mỗi seed trong một Save &
 Run All riêng. Chúng bỏ qua selection đã hoàn tất và retrain trên toàn bộ dữ
 liệu theo `best_epoch` của seed đó. Output nằm ở
@@ -67,6 +86,7 @@ Lệnh này dùng pipeline gốc để chọn epoch từ đầu rồi full-data 
 output nằm ở `/kaggle/working/hastika_resume/seed_82/`. Đây là cách giữ nguyên
 quy trình hai giai đoạn. Adapter epoch 2 trong ZIP vẫn hữu ích cho phân tích
 hoặc inference dự phòng, nhưng không thể thay thế optimizer state đã mất.
+Vì vậy `Selection train | epoch 1` là **dự kiến** nếu bạn chọn lệnh này.
 
 Sau mỗi lần **Save & Run All thành công**, trong notebook tiếp theo dùng
 **Add Input → Notebook Output Files** để gắn output version đó. Kaggle lưu

@@ -15,8 +15,10 @@ import json
 import sys
 import zipfile
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from typing import Iterator
 
 
 SEEDS = (42, 52, 62, 72, 82)
@@ -26,11 +28,67 @@ DEFAULT_OUTPUT_ROOT = Path("/kaggle/working/hastika_resume")
 DEFAULT_CHECKPOINT_ROOT = Path("/kaggle/working/hastika_resume_checkpoints")
 
 
+class DirectoryArchive:
+    """Read the same artifact paths when Kaggle extracted the ZIP as a Dataset."""
+
+    def __init__(self, directory: Path):
+        candidates = [directory / "Hastika_Icon_2026_Viper", directory]
+        self.project_root = next(
+            (path for path in candidates if (path / "outputs" / "task_a_qwen3_4b_2507_lora").is_dir()),
+            None,
+        )
+        if self.project_root is None:
+            for history in directory.rglob("selection_training_history.json"):
+                if (history.parent.name == "seed_42"
+                        and history.parent.parent.name == "task_a_qwen3_4b_2507_lora"):
+                    self.project_root = history.parents[3]
+                    break
+        if self.project_root is None:
+            raise ValueError(f"Không tìm thấy kết quả Task A trong {directory}")
+
+    def _file(self, member: str) -> Path:
+        prefix = "Hastika_Icon_2026_Viper/"
+        if not member.startswith(prefix):
+            raise KeyError(member)
+        path = self.project_root / member[len(prefix):]
+        if not path.is_file():
+            raise KeyError(member)
+        return path
+
+    def read(self, member: str) -> bytes:
+        return self._file(member).read_bytes()
+
+    def namelist(self) -> list[str]:
+        prefix = "Hastika_Icon_2026_Viper/"
+        return [prefix + str(path.relative_to(self.project_root))
+                for path in self.project_root.rglob("*") if path.is_file()]
+
+
+@contextmanager
+def open_artifacts(path: Path) -> Iterator[zipfile.ZipFile | DirectoryArchive]:
+    """Accept the original ZIP, a small metadata ZIP, or an extracted Dataset."""
+    if path.is_dir():
+        archives = [
+            candidate for name in ("task_a_resume_metadata.zip", "results-7.zip")
+            for candidate in path.rglob(name)
+        ]
+        if len(archives) > 1:
+            raise ValueError(f"Có nhiều archive trong {path}: {archives}")
+        if archives:
+            with zipfile.ZipFile(archives[0]) as archive:
+                yield archive
+        else:
+            yield DirectoryArchive(path)
+    else:
+        with zipfile.ZipFile(path) as archive:
+            yield archive
+
+
 def archive_member(seed: int, name: str) -> str:
     return f"{ARCHIVE_PREFIX}/seed_{seed}/{name}"
 
 
-def selection_summary(archive: zipfile.ZipFile, seed: int) -> dict:
+def selection_summary(archive: zipfile.ZipFile | DirectoryArchive, seed: int) -> dict:
     member = archive_member(seed, "seed_summary.json")
     try:
         summary = json.loads(archive.read(member))
@@ -54,7 +112,7 @@ def write_metadata(source: Path, destination: Path) -> None:
     """Keep only the artifacts needed to resume; do not copy 1.4 GB of adapters."""
     if source.resolve() == destination.resolve():
         raise ValueError("Archive đầu ra phải khác archive nguồn")
-    with zipfile.ZipFile(source) as archive:
+    with open_artifacts(source) as archive:
         members = []
         for seed in COMPLETE_SELECTION_SEEDS:
             selection_summary(archive, seed)
@@ -88,7 +146,7 @@ def write_metadata(source: Path, destination: Path) -> None:
 
 
 def inspect_archive(path: Path) -> None:
-    with zipfile.ZipFile(path) as archive:
+    with open_artifacts(path) as archive:
         names = set(archive.namelist())
         for seed in SEEDS:
             history_name = archive_member(seed, "selection_training_history.json")
@@ -105,7 +163,7 @@ def inspect_archive(path: Path) -> None:
 
 
 def archive_preflight(archive_path: Path, seed: int, frame, task, config) -> dict:
-    with zipfile.ZipFile(archive_path) as archive:
+    with open_artifacts(archive_path) as archive:
         summary = selection_summary(archive, seed)
         member = archive_member(seed, "split_manifest.csv")
         manifest = list(csv.DictReader(io.StringIO(archive.read(member).decode("utf-8-sig"))))
