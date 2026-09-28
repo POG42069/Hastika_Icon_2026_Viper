@@ -152,6 +152,64 @@ python scripts/evaluate_task_a_data_sanity.py --data-dir ../task_a_balanced
 Chạy tuần tự Task A và Task B. Khi Kaggle có T4 x2, entry point tự relaunch
 bằng DDP với hai worker; mỗi GPU giữ một bản backbone đầy đủ.
 
+### Tự tiếp tục sau timeout 12 giờ
+
+Cơ chế resume nằm trực tiếp trong cả hai entry point. Sau một version bị dừng:
+
+1. Lưu output của version đó thành Kaggle Dataset/Notebook Output.
+2. Gắn **tất cả** output của các version trước vào notebook tiếp theo bằng
+   `Add Input`.
+3. Chạy lại đúng các lệnh cũ:
+
+```bash
+python Train_A_LLM.py
+python Train_B_LLM.py
+```
+
+Pipeline tự quét `/kaggle/input`, kể cả các cây thư mục đã giải nén và file
+`.zip` như `result-7.zip`. Nó chỉ đọc artifact thuộc đúng task đang chạy. Có
+thể chỉ định nguồn rõ ràng (lặp cờ nhiều lần) hoặc tắt auto-scan:
+
+```bash
+python Train_A_LLM.py \
+  --resume-from /kaggle/input/run-01 \
+  --resume-from /kaggle/input/run-02/result-7.zip
+
+python Train_B_LLM.py --no-auto-resume
+```
+
+Thứ tự tận dụng artifact cho từng seed:
+
+- Nếu phase 1 có `seed_summary.json`, split manifest và validation prediction
+  hợp lệ, pipeline bỏ qua toàn bộ holdout selection của seed đó.
+- Nếu phase 2 đã có `prediction_scores.npz`, pipeline dùng ngay prediction và
+  không nạp model. Nếu chỉ có final adapter, pipeline chỉ chạy inference lại,
+  không train lại.
+- Trong các run tạo bởi phiên bản code mới này, cuối **mỗi epoch** pipeline lưu
+  adapter hiện tại, optimizer, scheduler, GradScaler, RNG của từng DDP rank và
+  DataLoader generator. Lần sau tiếp tục chính xác từ epoch kế tiếp. Nếu timeout
+  giữa một epoch thì chỉ epoch đang dở phải chạy lại.
+- Với output cũ chưa có training state, các seed đã hoàn tất vẫn được bỏ qua.
+  Nếu phase 1 còn dở nhưng có history và `best_holdout_adapter`, pipeline tiếp
+  tục từ adapter đó với optimizer/scheduler mới và ghi cảnh báo trong log. Đây
+  là phần tốt nhất có thể khôi phục vì optimizer state cũ không tồn tại.
+- Trường hợp output rất cũ chỉ còn `predictions.csv`, vote của seed vẫn được
+  dùng. Riêng Task B, nếu không còn adapter hoặc candidate scores để phá hòa,
+  log sẽ báo rõ rằng tie-break phải dùng one-hot vote khôi phục.
+
+Artifact mới được kiểm tra bằng hash dữ liệu train, model revision, cấu hình
+LoRA/training, số GPU DDP, ID/thứ tự development và hash file prediction trước
+khi được dùng. Artifact kiểu cũ không có hash được kiểm tra bằng toàn bộ ID,
+split assignment, số dòng, seed và số epoch có sẵn. Để exact-resume, lần chạy
+sau phải giữ cùng tham số CLI và cùng số GPU; nếu không khớp, checkpoint state
+sẽ bị từ chối an toàn và log nêu lý do.
+
+Nên giữ `outputs/` và `checkpoints/` trong `/kaggle/working` (hoặc bên dưới thư
+mục repo đã clone vào đó), vì cả báo cáo nhỏ lẫn adapter/training state đều cần
+có trong Notebook Output. Checkpoint tạm của một phase được dọn sau khi phase
+đã xuất artifact hoàn chỉnh, nên dung lượng tăng thêm chủ yếu chỉ tồn tại cho
+seed đang chạy dở.
+
 Đổi backbone hoặc giới hạn tài nguyên:
 
 ```bash
@@ -211,6 +269,7 @@ checkpoints/task_a_qwen3_4b_2507_lora/seed_82/...
 checkpoints/task_a_qwen3_4b_2507_lora/metrics.json
 outputs/task_a_qwen3_4b_2507_lora/seed_42/validation_predictions.csv
 outputs/task_a_qwen3_4b_2507_lora/seed_42/predictions.csv
+outputs/task_a_qwen3_4b_2507_lora/seed_42/prediction_scores.npz
 outputs/task_a_qwen3_4b_2507_lora/seed_52/...
 outputs/task_a_qwen3_4b_2507_lora/selection_training_history.json
 outputs/task_a_qwen3_4b_2507_lora/split_manifest.csv
@@ -221,6 +280,17 @@ outputs/task_a_qwen3_4b_2507_lora/predictions.csv
 outputs/task_a_qwen3_4b_2507_lora/task_a_submission.zip
 outputs/task_a_qwen3_4b_2507_lora/run_summary.json
 ```
+
+Trong lúc một epoch vừa hoàn tất nhưng phase chưa xong, checkpoint có thêm:
+
+```text
+checkpoints/<task>/seed_<seed>/resume_state/selection/epoch_<N>/
+checkpoints/<task>/seed_<seed>/resume_state/full_retrain/epoch_<N>/
+```
+
+Mỗi phase chỉ giữ checkpoint epoch hoàn chỉnh mới nhất. `latest.json` chỉ được
+cập nhật sau khi adapter và `training_state.pt` đã ghi xong, tránh nhận nhầm
+checkpoint bị cắt giữa lúc Kaggle timeout.
 
 `validation_predictions.csv` ở thư mục gốc là kết quả của seed có holdout tốt
 nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 5 seed,

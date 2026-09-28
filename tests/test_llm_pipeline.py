@@ -850,6 +850,42 @@ class LLMTests(unittest.TestCase):
                     ]
                 self.assertEqual(result["label"].tolist(), expected)
 
+                # A second invocation over the completed local artifacts must
+                # rebuild only the ensemble reports: no model load, inference,
+                # or training is allowed.
+                with (
+                    patch("src.llm_training.require_cuda"),
+                    patch(
+                        "src.llm_training.initialize_runtime",
+                        return_value=cpu_runtime(),
+                    ),
+                    patch(
+                        "src.llm_training.AutoTokenizer.from_pretrained",
+                        return_value=self.tokenizer,
+                    ),
+                    patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                    patch(
+                        "src.llm_training.resolve_data_file", side_effect=root.joinpath
+                    ),
+                    patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                    patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                    patch(
+                        "src.llm_training.load_lora_model",
+                        side_effect=AssertionError("completed resume loaded a model"),
+                    ),
+                    patch(
+                        "src.llm_training.train_llm_epoch",
+                        side_effect=AssertionError("completed resume trained"),
+                    ),
+                    patch(
+                        "src.llm_training.score_candidates",
+                        side_effect=AssertionError("completed resume ran inference"),
+                    ),
+                ):
+                    run_llm_task(task, config, auto_resume=False)
+                resumed = pd.read_csv(output / "predictions.csv", dtype={"id": str})
+                self.assertEqual(resumed.to_dict("records"), result.to_dict("records"))
+
 
 if __name__ == "__main__":
     unittest.main()

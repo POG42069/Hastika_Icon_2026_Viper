@@ -9,6 +9,8 @@ import inspect
 import json
 import math
 import os
+import random
+import shutil
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -50,9 +52,17 @@ from src.distributed import (
     gather_python_objects,
     initialize_runtime,
     relaunch_with_torchrun_if_needed,
+    synchronize,
 )
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.submission import write_submission
+from src.resume import (
+    ResumeCatalog,
+    copy_seed_outputs,
+    prepare_resume_catalogs,
+    read_catalog_manifest,
+    write_catalog_manifest,
+)
 from src.training import (
     build_optimizer,
     cap_training_labels,
@@ -623,6 +633,584 @@ def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _input_hashes(task: TaskConfig) -> tuple[str, str]:
+    """Hash training and prediction inputs separately for safe artifact reuse."""
+
+    training = hashlib.sha256()
+    for name in task.labeled_filenames():
+        training.update(name.encode())
+        training.update(resolve_data_file(name).read_bytes())
+    prediction = hashlib.sha256(
+        resolve_data_file(task.prediction_filename).read_bytes()
+    )
+    return training.hexdigest(), prediction.hexdigest()
+
+
+def _resume_signature(
+    task: TaskConfig,
+    config: LLMTrainingConfig,
+    training_sha256: str,
+    runtime: RuntimeContext,
+) -> dict[str, object]:
+    """Fields that must match before training state can be continued exactly."""
+
+    return {
+        "format_version": 1,
+        "task": task.task_name,
+        "training_sha256": training_sha256,
+        "model": config.model_name,
+        "model_revision": config.model_revision,
+        "labels": list(task.labels),
+        "labeled_filenames": list(task.labeled_filenames()),
+        "split_seed": config.seed,
+        "selection_validation_fold": task.selection_validation_fold,
+        "selection_validation_data_origins": list(
+            task.selection_validation_data_origins
+        ),
+        "selection_train_label_caps": [
+            list(value) for value in task.selection_train_label_caps
+        ],
+        "max_length": config.max_length,
+        "max_epochs": config.max_epochs,
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "warmup_ratio": config.warmup_ratio,
+        "train_batch_size_per_gpu": config.train_batch_size_per_gpu,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "early_stopping_patience": config.early_stopping_patience,
+        "lora_rank": config.lora_rank,
+        "lora_alpha": config.lora_alpha,
+        "lora_dropout": config.lora_dropout,
+        "target_modules": config.target_modules,
+        "compute_dtype": str(compute_dtype(config, runtime)),
+    }
+
+
+def _capture_rng_state() -> dict[str, object]:
+    numpy_state = np.random.get_state()
+    state: dict[str, object] = {
+        "python": random.getstate(),
+        "numpy": {
+            "bit_generator": numpy_state[0],
+            "keys": numpy_state[1].tolist(),
+            "position": numpy_state[2],
+            "has_gauss": numpy_state[3],
+            "cached_gaussian": numpy_state[4],
+        },
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict[str, object]) -> None:
+    random.setstate(state["python"])
+    numpy_state = state["numpy"]
+    np.random.set_state(
+        (
+            numpy_state["bit_generator"],
+            np.asarray(numpy_state["keys"], dtype=np.uint32),
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        )
+    )
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _save_epoch_resume(
+    *,
+    phase: str,
+    epoch: int,
+    total_epochs: int,
+    model,
+    tokenizer,
+    optimizer,
+    scheduler,
+    scaler,
+    loader,
+    history: list[dict],
+    seed_checkpoint_dir: Path,
+    signature: dict[str, object],
+    runtime: RuntimeContext,
+) -> None:
+    """Atomically publish a complete end-of-epoch training checkpoint."""
+
+    rng_states = gather_python_objects(_capture_rng_state(), runtime)
+    resume_root = seed_checkpoint_dir / "resume_state" / phase
+    epoch_name = f"epoch_{epoch:03d}"
+    epoch_dir = resume_root / epoch_name
+
+    def save() -> None:
+        temporary = resume_root / f".{epoch_name}.tmp"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir(parents=True)
+        save_adapter(model, tokenizer, temporary / "adapter")
+        torch.save(
+            {
+                "epoch": epoch,
+                "total_epochs": total_epochs,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "loader_generator": loader.generator.get_state()
+                if getattr(loader, "generator", None) is not None
+                else None,
+                "rng_by_rank": rng_states,
+                "world_size": runtime.world_size,
+                "history": history,
+                "signature": signature,
+            },
+            temporary / "training_state.pt",
+        )
+        _write_json(
+            temporary / "metadata.json",
+            {
+                "phase": phase,
+                "completed_epoch": epoch,
+                "total_epochs": total_epochs,
+                "world_size": runtime.world_size,
+                "signature": signature,
+            },
+        )
+        if epoch_dir.exists():
+            shutil.rmtree(epoch_dir)
+        temporary.replace(epoch_dir)
+        latest_tmp = resume_root / ".latest.json.tmp"
+        _write_json(
+            latest_tmp,
+            {"checkpoint": epoch_name, "completed_epoch": epoch},
+        )
+        latest_tmp.replace(resume_root / "latest.json")
+        for old in resume_root.glob("epoch_*"):
+            if old != epoch_dir:
+                shutil.rmtree(old)
+
+    on_main(save, runtime)
+
+
+def _latest_phase_checkpoint(
+    catalogs: list[ResumeCatalog],
+    seed: int,
+    phase: str,
+    expected_signature: dict[str, object],
+    expected_total_epochs: int,
+    expected_world_size: int,
+) -> tuple[Path, str] | None:
+    candidates: list[tuple[int, Path, str]] = []
+    for catalog in catalogs:
+        seed_checkpoint = catalog.seed_checkpoint(seed)
+        if seed_checkpoint is None:
+            continue
+        latest = seed_checkpoint / "resume_state" / phase / "latest.json"
+        try:
+            value = json.loads(latest.read_text(encoding="utf-8"))
+            checkpoint = latest.parent / value["checkpoint"]
+            epoch = int(value["completed_epoch"])
+            metadata = json.loads(
+                (checkpoint / "metadata.json").read_text(encoding="utf-8")
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            metadata.get("signature") != expected_signature
+            or int(metadata.get("total_epochs", -1)) != expected_total_epochs
+            or int(metadata.get("world_size", -1)) != expected_world_size
+        ):
+            continue
+        if (checkpoint / "adapter").is_dir() and (
+            checkpoint / "training_state.pt"
+        ).is_file():
+            candidates.append((epoch, checkpoint, catalog.source))
+    if not candidates:
+        return None
+    _, checkpoint, source = max(candidates, key=lambda item: item[0])
+    return checkpoint, source
+
+
+def _restore_epoch_resume(
+    *,
+    checkpoint: Path,
+    expected_signature: dict[str, object],
+    expected_total_epochs: int,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    loader,
+    runtime: RuntimeContext,
+) -> tuple[int, list[dict]]:
+    state = torch.load(
+        checkpoint / "training_state.pt", map_location="cpu", weights_only=True
+    )
+    if state.get("signature") != expected_signature:
+        raise ValueError(
+            "resume checkpoint uses different data/model/training settings"
+        )
+    if int(state.get("total_epochs", -1)) != expected_total_epochs:
+        raise ValueError("resume checkpoint uses a different total epoch count")
+    if int(state.get("world_size", -1)) != runtime.world_size:
+        raise ValueError("resume checkpoint uses a different GPU/DDP world size")
+    restore_adapter(model, checkpoint / "adapter")
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    scaler.load_state_dict(state["scaler"])
+    if state.get("loader_generator") is not None and getattr(
+        loader, "generator", None
+    ) is not None:
+        loader.generator.set_state(state["loader_generator"])
+    rng_states = state["rng_by_rank"]
+    _restore_rng_state(rng_states[runtime.rank])
+    return int(state["epoch"]), list(state["history"])
+
+
+def _clear_phase_resume(
+    seed_checkpoint_dir: Path, phase: str, runtime: RuntimeContext
+) -> None:
+    path = seed_checkpoint_dir / "resume_state" / phase
+    on_main(lambda: shutil.rmtree(path) if path.exists() else None, runtime)
+
+
+def _probabilities_from_validation_csv(
+    path: Path, val_frame: pd.DataFrame, task: TaskConfig
+) -> np.ndarray:
+    frame = pd.read_csv(path, dtype={"id": str})
+    if frame["id"].tolist() != val_frame["id"].astype(str).tolist():
+        raise ValueError("validation prediction ids do not match current data")
+    columns = [
+        "prob_" + label.lower().replace("-", "_").replace(" ", "_")
+        for label in task.labels
+    ]
+    if all(column in frame for column in columns):
+        values = frame[columns].to_numpy(dtype=np.float64)
+    else:
+        label_to_id = {label: index for index, label in enumerate(task.labels)}
+        ids = frame["predicted_label"].map(label_to_id)
+        if ids.isna().any():
+            raise ValueError("validation predictions contain unknown labels")
+        values = np.eye(len(task.labels), dtype=np.float64)[ids.astype(int)]
+    return values
+
+
+def _completed_selection_from_catalogs(
+    *,
+    catalogs: list[ResumeCatalog],
+    seed: int,
+    frame: pd.DataFrame,
+    val_frame: pd.DataFrame,
+    task: TaskConfig,
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    downsampled_indices: np.ndarray,
+    full_train_indices: np.ndarray,
+    train_frame: pd.DataFrame,
+    selection_train_truncated: int,
+    seed_output_dir: Path,
+    seed_checkpoint_dir: Path,
+    expected_signature: dict[str, object],
+) -> tuple[dict, str, Path] | None:
+    expected_split = np.full(len(frame), "selection_excluded", dtype=object)
+    expected_split[downsampled_indices] = "selection_downsampled"
+    expected_split[train_indices] = "selection_train"
+    expected_split[val_indices] = "selection_validation"
+    candidates = []
+    for catalog in catalogs:
+        source_output = catalog.seed_output(seed)
+        if source_output is None:
+            continue
+        try:
+            summary = json.loads(
+                (source_output / "seed_summary.json").read_text(encoding="utf-8")
+            )
+            history_value = json.loads(
+                (source_output / "selection_training_history.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            history = list(history_value["epochs"])
+            manifest = pd.read_csv(
+                source_output / "split_manifest.csv", dtype={"id": str}
+            )
+            if int(summary["seed"]) != seed or int(summary["best_epoch"]) < 1:
+                raise ValueError("invalid seed summary")
+            if not history:
+                raise ValueError("selection history is empty")
+            history_best = history[0]
+            for record in history[1:]:
+                if is_better_checkpoint(
+                    record["macro_f1"],
+                    record["loss"],
+                    history_best["macro_f1"],
+                    history_best["loss"],
+                ):
+                    history_best = record
+            if int(summary["best_epoch"]) != int(history_best["epoch"]):
+                raise ValueError("best_epoch differs from selection history")
+            if (
+                "resume_signature" in summary
+                and summary["resume_signature"] != expected_signature
+            ):
+                raise ValueError("data/model/training signature differs")
+            if int(summary["selection_train_rows"]) != len(train_indices):
+                raise ValueError("selection row count differs")
+            if int(summary["full_retrain_rows"]) != len(full_train_indices):
+                raise ValueError("full retrain row count differs")
+            if manifest["id"].tolist() != frame["id"].astype(str).tolist():
+                raise ValueError("training ids differ")
+            if manifest["split"].tolist() != expected_split.tolist():
+                raise ValueError("selection split differs")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            candidates.append(
+                ((-1, -1), None, f"{catalog.source}: rejected ({exc})")
+            )
+            continue
+        try:
+            probabilities = _probabilities_from_validation_csv(
+                source_output / "validation_predictions.csv", val_frame, task
+            )
+            validation_recovery = "exact"
+        except (OSError, KeyError, TypeError, ValueError):
+            probabilities = np.full(
+                (len(val_frame), len(task.labels)),
+                1.0 / len(task.labels),
+                dtype=np.float64,
+            )
+            validation_recovery = "unavailable_uniform_placeholder"
+            summary = {
+                **summary,
+                "resume_validation_predictions": validation_recovery,
+            }
+        result = {
+            "summary": summary,
+            "train_indices": train_indices,
+            "downsampled_indices": downsampled_indices,
+            "full_train_indices": full_train_indices,
+            "train_frame": train_frame,
+            "selection_train_truncated": selection_train_truncated,
+            "selection_history": history,
+            "validation_probabilities": probabilities,
+            "validation_indices": val_indices,
+            "seed_output_dir": seed_output_dir,
+            "seed_checkpoint_dir": seed_checkpoint_dir,
+            "validation_recovery": validation_recovery,
+        }
+        quality = 2 if "resume_signature" in summary else 1
+        candidates.append(
+            ((quality, len(history)), (result, source_output), catalog.source)
+        )
+    valid = [item for item in candidates if item[0][0] >= 0]
+    if not valid:
+        return None
+    _, (result, source_output), source = max(valid, key=lambda item: item[0])
+    return result, source, source_output
+
+
+def _legacy_partial_selection(
+    *,
+    catalogs: list[ResumeCatalog],
+    seed: int,
+    frame: pd.DataFrame,
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    downsampled_indices: np.ndarray,
+) -> tuple[list[dict], Path, Path, str] | None:
+    """Use pre-resume-format history and its best adapter as a warm restart."""
+
+    expected_split = np.full(len(frame), "selection_excluded", dtype=object)
+    expected_split[downsampled_indices] = "selection_downsampled"
+    expected_split[train_indices] = "selection_train"
+    expected_split[val_indices] = "selection_validation"
+    candidates = []
+    for catalog in catalogs:
+        source_output = catalog.seed_output(seed)
+        source_checkpoint = catalog.seed_checkpoint(seed)
+        if source_output is None or source_checkpoint is None:
+            continue
+        adapter = source_checkpoint / "best_holdout_adapter"
+        if not adapter.is_dir() or (source_output / "seed_summary.json").is_file():
+            continue
+        try:
+            history = json.loads(
+                (source_output / "selection_training_history.json").read_text(
+                    encoding="utf-8"
+                )
+            )["epochs"]
+            manifest = pd.read_csv(
+                source_output / "split_manifest.csv", dtype={"id": str}
+            )
+            if (
+                not history
+                or manifest["id"].tolist() != frame["id"].astype(str).tolist()
+            ):
+                raise ValueError("training ids/history differ")
+            if manifest["split"].tolist() != expected_split.tolist():
+                raise ValueError("selection split differs")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        candidates.append(
+            (len(history), history, adapter, source_output, catalog.source)
+        )
+    if not candidates:
+        return None
+    _, history, adapter, source_output, source = max(
+        candidates, key=lambda item: item[0]
+    )
+    return list(history), adapter, source_output, source
+
+
+def _save_prediction_scores(
+    path: Path,
+    prediction_ids: list[str],
+    prediction_sha256: str,
+    predictions: dict,
+) -> None:
+    np.savez_compressed(
+        path,
+        ids=np.asarray(prediction_ids),
+        prediction_sha256=np.asarray(prediction_sha256),
+        probabilities=predictions["probabilities"],
+        mean_token_log_probs=predictions["mean_token_log_probs"],
+    )
+
+
+def _load_prediction_scores(
+    path: Path,
+    prediction_ids: list[str],
+    prediction_sha256: str,
+) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as values:
+        if values["ids"].astype(str).tolist() != prediction_ids:
+            raise ValueError("prediction ids differ")
+        if str(values["prediction_sha256"].item()) != prediction_sha256:
+            raise ValueError("prediction input hash differs")
+        probabilities = values["probabilities"]
+        scores = values["mean_token_log_probs"]
+    return {"probabilities": probabilities, "mean_token_log_probs": scores}
+
+
+def _completed_retrain_from_catalogs(
+    *,
+    catalogs: list[ResumeCatalog],
+    seed: int,
+    expected_epochs: int,
+    prediction_frame: pd.DataFrame,
+    prediction_sha256: str,
+    task: TaskConfig,
+    expected_signature: dict[str, object],
+) -> dict | None:
+    """Find the richest completed phase-2 artifact for one seed."""
+
+    prediction_ids = prediction_frame["id"].astype(str).tolist()
+    candidates = []
+    for catalog in catalogs:
+        source_output = catalog.seed_output(seed)
+        if source_output is None:
+            continue
+        try:
+            summary_value = json.loads(
+                (source_output / "seed_summary.json").read_text(encoding="utf-8")
+            )
+            summary = summary_value["full_data_retrain"]
+            if (
+                int(summary["seed"]) != seed
+                or int(summary["epochs"]) != expected_epochs
+            ):
+                raise ValueError("seed/epoch count differs")
+            if (
+                "resume_signature" in summary
+                and summary["resume_signature"] != expected_signature
+            ):
+                raise ValueError("data/model/training signature differs")
+            predictions_frame = pd.read_csv(
+                source_output / "predictions.csv", dtype={"id": str}
+            )
+            if predictions_frame["id"].tolist() != prediction_ids:
+                raise ValueError("prediction ids differ")
+            label_to_id = {label: index for index, label in enumerate(task.labels)}
+            label_ids = predictions_frame["label"].map(label_to_id)
+            if label_ids.isna().any():
+                raise ValueError("prediction labels differ")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+        score_path = source_output / "prediction_scores.npz"
+        adapter = None
+        source_checkpoint = catalog.seed_checkpoint(seed)
+        if source_checkpoint is not None:
+            candidate_adapter = source_checkpoint / "final_full_data_adapter"
+            if candidate_adapter.is_dir():
+                adapter = candidate_adapter
+        try:
+            scores = _load_prediction_scores(
+                score_path, prediction_ids, prediction_sha256
+            )
+            expected_shape = (len(prediction_ids), len(task.labels))
+            if (
+                scores["probabilities"].shape != expected_shape
+                or scores["mean_token_log_probs"].shape != expected_shape
+                or not np.all(np.isfinite(scores["probabilities"]))
+                or not np.all(np.isfinite(scores["mean_token_log_probs"]))
+            ):
+                raise ValueError("saved prediction score shape/values differ")
+            quality = 3
+            mode = "scores"
+        except (OSError, KeyError, TypeError, ValueError):
+            scores = None
+            if adapter is not None:
+                quality = 2
+                mode = "adapter"
+            else:
+                # Last-resort recovery: completed predictions still carry an
+                # equal seed vote. Scores are unavailable only for old outputs.
+                ids = label_ids.astype(int).to_numpy()
+                one_hot = np.eye(len(task.labels), dtype=np.float64)[ids]
+                scores = {
+                    "probabilities": one_hot,
+                    "mean_token_log_probs": one_hot,
+                }
+                quality = 1
+                mode = "labels"
+        candidates.append(
+            {
+                "quality": quality,
+                "mode": mode,
+                "scores": scores,
+                "label_ids": label_ids.astype(int).to_numpy(),
+                "summary": summary,
+                "source_output": source_output,
+                "adapter": adapter,
+                "source": catalog.source,
+            }
+        )
+    return max(candidates, key=lambda item: item["quality"]) if candidates else None
+
+
+def _final_adapter_from_catalogs(
+    catalogs: list[ResumeCatalog], seed: int, expected_epochs: int
+) -> tuple[Path, str] | None:
+    for catalog in catalogs:
+        checkpoint = catalog.seed_checkpoint(seed)
+        output = catalog.seed_output(seed)
+        if checkpoint is None or output is None:
+            continue
+        adapter = checkpoint / "final_full_data_adapter"
+        try:
+            history = json.loads(
+                (output / "full_data_training_history.json").read_text(
+                    encoding="utf-8"
+                )
+            )["epochs"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+        if adapter.is_dir() and len(history) == expected_epochs:
+            return adapter, catalog.source
+    return None
+
+
 def _wrap_for_ddp(model, runtime: RuntimeContext):
     if not runtime.distributed:
         return model
@@ -812,6 +1400,9 @@ def _run_seed_ensemble(
     resolved_revision: str | None,
     parameter_counts: dict[str, int] | None,
     token_diagnostics: list[dict[str, object]],
+    resume_catalogs: list[ResumeCatalog],
+    resume_signature: dict[str, object],
+    prediction_sha256: str,
 ) -> None:
     """Retrain every selected seed, predict, and ensemble their outputs."""
 
@@ -928,50 +1519,184 @@ def _run_seed_ensemble(
             f"({len(full_train_data)} rows / {best_epoch} epoch(s)) ===",
             runtime,
         )
+        completed_retrain = _completed_retrain_from_catalogs(
+            catalogs=resume_catalogs,
+            seed=seed,
+            expected_epochs=best_epoch,
+            prediction_frame=prediction_frame,
+            prediction_sha256=prediction_sha256,
+            task=task,
+            expected_signature=resume_signature,
+        )
+        if completed_retrain is not None and completed_retrain["mode"] != "adapter":
+            on_main(
+                partial(
+                    copy_seed_outputs,
+                    completed_retrain["source_output"],
+                    seed_output_dir,
+                ),
+                runtime,
+            )
+            scores = completed_retrain["scores"]
+            label_ids = scores["probabilities"].argmax(axis=1)
+            if completed_retrain["mode"] == "labels":
+                log(
+                    f"RESUME | seed={seed} | reused completed predictions from "
+                    f"{completed_retrain['source']}; old output has no candidate "
+                    "scores, so score-based tie breaks use recovered one-hot votes.",
+                    runtime,
+                )
+            else:
+                log(
+                    f"RESUME | seed={seed} | phase 2 and prediction already "
+                    f"complete in {completed_retrain['source']} "
+                    "(no training/inference).",
+                    runtime,
+                )
+            retrained_results.append(
+                {
+                    "seed": seed,
+                    "label_ids": label_ids,
+                    "probabilities": scores["probabilities"],
+                    "mean_token_log_probs": scores["mean_token_log_probs"],
+                    "summary": completed_retrain["summary"],
+                    "full_train_truncated": full_train_data.truncated_count,
+                    "recovery_mode": completed_retrain["mode"],
+                }
+            )
+            del full_train_data
+            continue
+
         set_global_seed(seed)
         full_loader, full_sampler = create_train_loader(
             full_train_data, collator, config, runtime, seed
         )
         final_model = _wrap_for_ddp(load_lora_model(config, runtime), runtime)
-        optimizer, scheduler, scaler = _training_state(
-            final_model, full_loader, best_epoch, config, runtime
-        )
-        full_history = []
-        for epoch in range(1, best_epoch + 1):
-            if full_sampler is not None:
-                full_sampler.set_epoch(epoch)
-            train_loss = train_llm_epoch(
-                final_model,
-                full_loader,
-                optimizer,
-                scheduler,
-                scaler,
-                config,
-                runtime,
-                epoch,
-                f"Full-data retrain seed {seed}",
+        reusable_final_adapter = (
+            (completed_retrain["adapter"], completed_retrain["source"])
+            if completed_retrain is not None
+            and completed_retrain["mode"] == "adapter"
+            else _final_adapter_from_catalogs(
+                resume_catalogs, seed, best_epoch
             )
-            full_history.append({"epoch": epoch, "train_loss": train_loss})
+        )
+        if reusable_final_adapter is not None:
+            adapter, source = reusable_final_adapter
+            restore_adapter(final_model, adapter)
             log(
-                f"Seed {seed} full-data epoch {epoch}/{best_epoch}: "
-                f"train_loss={train_loss:.5f}",
+                f"RESUME | seed={seed} | loaded completed phase-2 adapter from "
+                f"{source}; skipping full-data training and regenerating "
+                "prediction scores.",
                 runtime,
             )
-            on_main(
-                lambda seed_output_dir=seed_output_dir,
-                seed=seed,
-                full_history=list(full_history): _write_json(
-                    seed_output_dir / "full_data_training_history.json",
-                    {"seed": seed, "epochs": full_history},
-                ),
-                runtime,
+            full_history = []
+            optimizer = scheduler = scaler = None
+            recovery_mode = "adapter_inference"
+        else:
+            optimizer, scheduler, scaler = _training_state(
+                final_model, full_loader, best_epoch, config, runtime
             )
+            full_history: list[dict] = []
+            completed_epoch = 0
+            exact_checkpoint = _latest_phase_checkpoint(
+                resume_catalogs,
+                seed,
+                "full_retrain",
+                resume_signature,
+                best_epoch,
+                runtime.world_size,
+            )
+            if exact_checkpoint is not None:
+                checkpoint, source = exact_checkpoint
+                try:
+                    completed_epoch, full_history = _restore_epoch_resume(
+                        checkpoint=checkpoint,
+                        expected_signature=resume_signature,
+                        expected_total_epochs=best_epoch,
+                        model=final_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        loader=full_loader,
+                        runtime=runtime,
+                    )
+                    log(
+                        f"RESUME | seed={seed} | exact phase-2 state after epoch "
+                        f"{completed_epoch} from {source}.",
+                        runtime,
+                    )
+                except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                    log(
+                        f"Full-retrain checkpoint rejected for seed {seed}: {exc}. "
+                        "Starting phase 2 normally.",
+                        runtime,
+                    )
+                    del final_model, optimizer, scheduler, scaler
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    set_global_seed(seed)
+                    final_model = _wrap_for_ddp(
+                        load_lora_model(config, runtime), runtime
+                    )
+                    optimizer, scheduler, scaler = _training_state(
+                        final_model, full_loader, best_epoch, config, runtime
+                    )
+                    completed_epoch, full_history = 0, []
 
-        del optimizer, scheduler, scaler
-        on_main(
-            partial(save_adapter, final_model, tokenizer, final_adapter_dir), runtime
-        )
-        restore_adapter(final_model, final_adapter_dir)
+            for epoch in range(completed_epoch + 1, best_epoch + 1):
+                if full_sampler is not None:
+                    full_sampler.set_epoch(epoch)
+                train_loss = train_llm_epoch(
+                    final_model,
+                    full_loader,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    config,
+                    runtime,
+                    epoch,
+                    f"Full-data retrain seed {seed}",
+                )
+                full_history.append({"epoch": epoch, "train_loss": train_loss})
+                log(
+                    f"Seed {seed} full-data epoch {epoch}/{best_epoch}: "
+                    f"train_loss={train_loss:.5f}",
+                    runtime,
+                )
+                on_main(
+                    lambda seed_output_dir=seed_output_dir,
+                    seed=seed,
+                    full_history=list(full_history): _write_json(
+                        seed_output_dir / "full_data_training_history.json",
+                        {"seed": seed, "epochs": full_history},
+                    ),
+                    runtime,
+                )
+                _save_epoch_resume(
+                    phase="full_retrain",
+                    epoch=epoch,
+                    total_epochs=best_epoch,
+                    model=final_model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    loader=full_loader,
+                    history=list(full_history),
+                    seed_checkpoint_dir=seed_checkpoint_dir,
+                    signature=resume_signature,
+                    runtime=runtime,
+                )
+
+            del optimizer, scheduler, scaler
+            on_main(
+                partial(save_adapter, final_model, tokenizer, final_adapter_dir),
+                runtime,
+            )
+            _clear_phase_resume(seed_checkpoint_dir, "full_retrain", runtime)
+            recovery_mode = "trained_or_exact_resume"
+        if reusable_final_adapter is None:
+            restore_adapter(final_model, final_adapter_dir)
         predictions = score_candidates(
             final_model,
             prediction_data,
@@ -991,8 +1716,13 @@ def _run_seed_ensemble(
             "label_distribution": full_train_frame[task.label_column]
             .value_counts()
             .to_dict(),
-            "checkpoint": str(final_adapter_dir),
+            "checkpoint": str(
+                reusable_final_adapter[0]
+                if reusable_final_adapter is not None
+                else final_adapter_dir
+            ),
             "prediction_source": "seed_specific_final_full_data_adapter",
+            "resume_signature": resume_signature,
         }
 
         def export_seed_retrain_artifacts(
@@ -1001,6 +1731,12 @@ def _run_seed_ensemble(
             summary=summary,
             final_summary=final_summary,
         ) -> None:
+            _save_prediction_scores(
+                seed_output_dir / "prediction_scores.npz",
+                prediction_frame["id"].astype(str).tolist(),
+                prediction_sha256,
+                predictions,
+            )
             write_submission(
                 prediction_frame["id"].tolist(),
                 predicted_labels,
@@ -1022,6 +1758,7 @@ def _run_seed_ensemble(
                 "mean_token_log_probs": predictions["mean_token_log_probs"],
                 "summary": final_summary,
                 "full_train_truncated": full_train_data.truncated_count,
+                "recovery_mode": recovery_mode,
             }
         )
         del final_model, full_loader, full_train_data
@@ -1126,6 +1863,10 @@ def _run_seed_ensemble(
                 "configured label order",
             ],
             "fixed_label_order": list(task.labels),
+            "seed_recovery_modes": {
+                str(result["seed"]): result["recovery_mode"]
+                for result in retrained_results
+            },
             "rows_by_resolution_method": method_counts,
             "rows_with_plurality_tie": int(np.sum(tie_detected)),
             "prediction_file": str(csv_path),
@@ -1163,6 +1904,16 @@ def _run_seed_ensemble(
                 * config.gradient_accumulation_steps
                 * runtime.world_size,
                 "selection_seeds": list(selection_seeds),
+                "resume": {
+                    "artifact_catalogs": [
+                        item.source for item in resume_catalogs[1:]
+                    ],
+                    "training_signature": resume_signature,
+                    "prediction_sha256": prediction_sha256,
+                    "seed_recovery_modes": ensemble_summary[
+                        "seed_recovery_modes"
+                    ],
+                },
                 "reporting_best_seed": reporting_seed,
                 "reporting_best_seed_used_only_for_validation_summary": True,
                 "selection_split": {
@@ -1263,7 +2014,12 @@ def _run_seed_ensemble(
     on_main(export_ensemble_artifacts, runtime)
 
 
-def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
+def run_llm_task(
+    task: TaskConfig,
+    config: LLMTrainingConfig,
+    resume_sources: tuple[Path, ...] = (),
+    auto_resume: bool = True,
+) -> None:
     """Select epochs, retrain configured seeds, then predict development."""
 
     validate_config(config)
@@ -1346,6 +2102,47 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         on_main(lambda: output_dir.mkdir(parents=True, exist_ok=True), runtime)
         on_main(lambda: checkpoint_dir.mkdir(parents=True, exist_ok=True), runtime)
 
+        training_sha256, prediction_sha256 = _input_hashes(task)
+        resume_signature = _resume_signature(
+            task, config, training_sha256, runtime
+        )
+        discovered_sources = list(resume_sources)
+        kaggle_input = Path("/kaggle/input")
+        if auto_resume and kaggle_input.is_dir():
+            discovered_sources.append(kaggle_input)
+        # Preserve order while avoiding an expensive duplicate recursive scan.
+        discovered_sources = list(dict.fromkeys(discovered_sources))
+        catalog_manifest = checkpoint_dir / "resume_catalog.json"
+
+        def prepare_catalog() -> None:
+            scratch = Path(
+                os.getenv(
+                    "HASTIKA_RESUME_CACHE_DIR",
+                    f"/tmp/hastika_resume_cache/{task.checkpoint_subdir}",
+                )
+            )
+            if scratch.exists():
+                shutil.rmtree(scratch)
+            catalogs = prepare_resume_catalogs(
+                discovered_sources,
+                scratch,
+                task.output_subdir,
+                task.checkpoint_subdir,
+            )
+            write_catalog_manifest(catalog_manifest, catalogs)
+
+        on_main(prepare_catalog, runtime)
+        synchronize(runtime)
+        resume_catalogs = [
+            ResumeCatalog("current run", output_dir, checkpoint_dir),
+            *read_catalog_manifest(catalog_manifest),
+        ]
+        log(
+            f"Resume scan: {len(resume_catalogs) - 1} reusable result tree(s) "
+            f"from {len(discovered_sources)} source(s).",
+            runtime,
+        )
+
         seed_results = []
         resolved_revision = None
         parameter_counts = None
@@ -1423,6 +2220,44 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     runtime,
                 )
 
+            completed_selection = _completed_selection_from_catalogs(
+                catalogs=resume_catalogs,
+                seed=selection_seed,
+                frame=frame,
+                val_frame=val_frame,
+                task=task,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                downsampled_indices=downsampled_indices,
+                full_train_indices=full_train_indices,
+                train_frame=train_frame,
+                selection_train_truncated=selection_train_data.truncated_count,
+                seed_output_dir=seed_output_dir,
+                seed_checkpoint_dir=seed_checkpoint_dir,
+                expected_signature=resume_signature,
+            )
+            if completed_selection is not None:
+                resumed_result, source, source_output = completed_selection
+                on_main(
+                    partial(copy_seed_outputs, source_output, seed_output_dir), runtime
+                )
+                seed_results.append(resumed_result)
+                log(
+                    f"RESUME | seed={selection_seed} | phase 1 already complete; "
+                    f"reused from {source} (no selection training).",
+                    runtime,
+                )
+                if resumed_result["validation_recovery"] != "exact":
+                    log(
+                        f"RESUME | seed={selection_seed} | per-row validation "
+                        "predictions were absent; scalar holdout metrics and "
+                        "best_epoch remain exact, while the reporting-only CSV "
+                        "uses a uniform placeholder.",
+                        runtime,
+                    )
+                del selection_train_data
+                continue
+
             selection_loader, selection_sampler = create_train_loader(
                 selection_train_data, collator, config, runtime, selection_seed
             )
@@ -1443,9 +2278,104 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             optimizer, scheduler, scaler = _training_state(
                 selection_model, selection_loader, config.max_epochs, config, runtime
             )
+            selection_history: list[dict] = []
+            completed_epoch = 0
+            best_adapter_load_dir = selection_adapter_dir
+            exact_checkpoint = _latest_phase_checkpoint(
+                resume_catalogs,
+                selection_seed,
+                "selection",
+                resume_signature,
+                config.max_epochs,
+                runtime.world_size,
+            )
+            if exact_checkpoint is not None:
+                checkpoint, source = exact_checkpoint
+                try:
+                    completed_epoch, selection_history = _restore_epoch_resume(
+                        checkpoint=checkpoint,
+                        expected_signature=resume_signature,
+                        expected_total_epochs=config.max_epochs,
+                        model=selection_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        loader=selection_loader,
+                        runtime=runtime,
+                    )
+                    source_best = checkpoint.parents[2] / "best_holdout_adapter"
+                    if source_best.is_dir():
+                        best_adapter_load_dir = source_best
+                    log(
+                        f"RESUME | seed={selection_seed} | exact phase-1 state "
+                        f"after epoch {completed_epoch} from {source}.",
+                        runtime,
+                    )
+                except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                    log(
+                        f"Resume checkpoint rejected for seed {selection_seed}: {exc}. "
+                        "Starting phase 1 normally.",
+                        runtime,
+                    )
+                    del selection_model, optimizer, scheduler, scaler
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    set_global_seed(selection_seed)
+                    selection_model = _wrap_for_ddp(
+                        load_lora_model(config, runtime), runtime
+                    )
+                    optimizer, scheduler, scaler = _training_state(
+                        selection_model,
+                        selection_loader,
+                        config.max_epochs,
+                        config,
+                        runtime,
+                    )
+                    selection_history = []
+                    completed_epoch = 0
+            elif (legacy := _legacy_partial_selection(
+                catalogs=resume_catalogs,
+                seed=selection_seed,
+                frame=frame,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                downsampled_indices=downsampled_indices,
+            )) is not None:
+                legacy_history, legacy_adapter, legacy_output, source = legacy
+                restore_adapter(selection_model, legacy_adapter)
+                selection_history = legacy_history[: config.max_epochs]
+                completed_epoch = min(len(selection_history), config.max_epochs)
+                best_adapter_load_dir = legacy_adapter
+                on_main(
+                    partial(copy_seed_outputs, legacy_output, seed_output_dir),
+                    runtime,
+                )
+                log(
+                    f"RESUME | seed={selection_seed} | legacy phase-1 artifacts "
+                    f"through epoch {completed_epoch} from {source}. Adapter weights "
+                    "were reused; optimizer/scheduler state was unavailable.",
+                    runtime,
+                )
+
             best_metric, best_loss, best_epoch, stale = -math.inf, math.inf, 0, 0
-            selection_history = []
-            for epoch in range(1, config.max_epochs + 1):
+            for record in selection_history:
+                if is_better_checkpoint(
+                    record["macro_f1"], record["loss"], best_metric, best_loss
+                ):
+                    best_metric, best_loss, best_epoch, stale = (
+                        record["macro_f1"],
+                        record["loss"],
+                        int(record["epoch"]),
+                        0,
+                    )
+                else:
+                    stale += 1
+            last_epoch = (
+                completed_epoch
+                if stale >= config.early_stopping_patience
+                else config.max_epochs
+            )
+            for epoch in range(completed_epoch + 1, last_epoch + 1):
                 if selection_sampler is not None:
                     selection_sampler.set_epoch(epoch)
                 train_loss = train_llm_epoch(
@@ -1532,6 +2462,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         ),
                         runtime,
                     )
+                    best_adapter_load_dir = selection_adapter_dir
                 else:
                     stale += 1
                 on_main(
@@ -1542,6 +2473,21 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     ),
                     runtime,
                 )
+                _save_epoch_resume(
+                    phase="selection",
+                    epoch=epoch,
+                    total_epochs=config.max_epochs,
+                    model=selection_model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    loader=selection_loader,
+                    history=list(selection_history),
+                    seed_checkpoint_dir=seed_checkpoint_dir,
+                    signature=resume_signature,
+                    runtime=runtime,
+                )
                 if stale >= config.early_stopping_patience:
                     log(
                         f"Seed {selection_seed} early stopping at epoch {epoch}.",
@@ -1550,7 +2496,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     break
 
             del optimizer, scheduler, scaler
-            restore_adapter(selection_model, selection_adapter_dir)
+            restore_adapter(selection_model, best_adapter_load_dir)
             best_validation = score_candidates(
                 selection_model,
                 val_data,
@@ -1571,6 +2517,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 "full_retrain_rows": len(full_train_indices),
                 "downsampled_rows": len(downsampled_indices),
                 "downsampling_summary": downsampling_summary,
+                "resume_signature": resume_signature,
             }
             for key in ("per_class", "confusion_matrix"):
                 if key in best_validation:
@@ -1590,6 +2537,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 _write_json(seed_output_dir / "seed_summary.json", public_summary)
 
             on_main(export_seed_artifacts, runtime)
+            _clear_phase_resume(seed_checkpoint_dir, "selection", runtime)
             seed_results.append(
                 {
                     "summary": public_summary,
@@ -1635,6 +2583,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 resolved_revision=resolved_revision,
                 parameter_counts=parameter_counts,
                 token_diagnostics=token_diagnostics,
+                resume_catalogs=resume_catalogs,
+                resume_signature=resume_signature,
+                prediction_sha256=prediction_sha256,
             )
             return
 
@@ -1967,6 +2918,21 @@ def run_llm_cli(
         default=task.prediction_filename,
         help="CSV input filename, or full path (e.g. official test inputs).",
     )
+    parser.add_argument(
+        "--resume-from",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Result directory or ZIP to reuse. Repeat for multiple Kaggle outputs. "
+            "Kaggle /kaggle/input is scanned automatically unless disabled."
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-resume",
+        action="store_true",
+        help="Do not automatically scan /kaggle/input for earlier result artifacts.",
+    )
     args = parser.parse_args()
     config = replace(
         defaults,
@@ -1981,4 +2947,9 @@ def run_llm_cli(
     )
     validate_config(config)
     relaunch_with_torchrun_if_needed(config)
-    run_llm_task(replace(task, prediction_filename=args.prediction_file), config)
+    run_llm_task(
+        replace(task, prediction_filename=args.prediction_file),
+        config,
+        tuple(Path(path) for path in args.resume_from),
+        auto_resume=not args.no_auto_resume,
+    )
