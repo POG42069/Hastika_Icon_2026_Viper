@@ -74,10 +74,10 @@ class LLMTrainingConfig:
     warmup_ratio: float = 0.10
     train_batch_size_per_gpu: int = 4
     # Number of candidate completions per forward, NOT number of comments.
-    eval_batch_size_per_gpu: int = 6
+    eval_batch_size_per_gpu: int = 2
     gradient_accumulation_steps: int = 2
     max_grad_norm: float = 1.0
-    early_stopping_patience: int = 3
+    early_stopping_patience: int = 6
     lora_rank: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
