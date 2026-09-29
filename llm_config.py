@@ -110,7 +110,7 @@ TASK_A = TaskConfig(
     augmentation_fold_filenames=tuple(
         f"binary_augment{fold}.csv" for fold in range(1, 6)
     ),
-    use_augmentation=True,
+    use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),
