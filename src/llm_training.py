@@ -51,7 +51,12 @@ from src.distributed import (
     initialize_runtime,
     relaunch_with_torchrun_if_needed,
 )
-from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
+from src.llm_data import (
+    PROMPT_STYLES,
+    ChatEncoder,
+    CompletionCollator,
+    CompletionDataset,
+)
 from src.submission import write_submission
 from src.training import (
     build_optimizer,
@@ -92,6 +97,8 @@ def validate_config(config: LLMTrainingConfig) -> None:
         raise ValueError("progress_log_percent must be between 1 and 100")
     if config.compute_dtype not in {"auto", "float16", "bfloat16"}:
         raise ValueError("compute_dtype must be auto, float16 or bfloat16")
+    if config.prompt_style not in PROMPT_STYLES:
+        raise ValueError(f"prompt_style must be one of {PROMPT_STYLES}")
     if config.learning_rate <= 0 or config.max_grad_norm <= 0:
         raise ValueError("learning_rate and max_grad_norm must be positive")
     if config.initial_loss_scale <= 0:
@@ -161,8 +168,11 @@ def completion_token_diagnostics(encoder: ChatEncoder) -> list[dict[str, object]
     tokenizer = encoder.tokenizer
     convert_ids_to_tokens = getattr(tokenizer, "convert_ids_to_tokens", None)
     diagnostics = []
-    for label, token_ids in zip(
-        encoder.task.labels, encoder.completions, strict=True
+    for label, code, token_ids in zip(
+        encoder.task.labels,
+        encoder.task.label_codes,
+        encoder.completions,
+        strict=True,
     ):
         ids = list(token_ids)
         token_pieces = (
@@ -173,6 +183,7 @@ def completion_token_diagnostics(encoder: ChatEncoder) -> list[dict[str, object]
         diagnostics.append(
             {
                 "label": label,
+                "code": code,
                 "token_count": len(ids),
                 "token_ids": ids,
                 "token_pieces": token_pieces,
@@ -191,7 +202,7 @@ def log_completion_token_diagnostics(
 
     for item in diagnostics:
         log(
-            f"Completion tokens | label={item['label']!r} | "
+            f"Completion tokens | label={item['label']!r} | code={item['code']!r} | "
             f"count={item['token_count']} | ids={item['token_ids']} | "
             f"pieces={item['token_pieces']} | "
             f"decoded={item['decoded_completion']!r}",
@@ -673,6 +684,103 @@ def binary_majority_vote(
     return final_ids, hate_votes, nonhate_votes
 
 
+def ensemble_plurality_vote(
+    seed_label_ids: np.ndarray,
+    seed_mean_token_log_probs: np.ndarray,
+    labels: tuple[str, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vote equally across seeds and resolve multiclass ties deterministically.
+
+    Ties in the plurality vote are resolved by summed, tie-aware Borda points,
+    then by summed per-seed z-normalized mean token log probabilities. An exact
+    tie after all score-based rules falls back to the configured label order.
+    """
+
+    label_ids = np.asarray(seed_label_ids, dtype=np.int64)
+    scores = np.asarray(seed_mean_token_log_probs, dtype=np.float64)
+    if label_ids.ndim != 2 or label_ids.shape[0] < 1:
+        raise ValueError("seed_label_ids must have shape (seeds, prediction rows)")
+    if len(labels) < 2:
+        raise ValueError("Ensemble voting requires at least two labels")
+    expected_score_shape = (*label_ids.shape, len(labels))
+    if scores.shape != expected_score_shape:
+        raise ValueError(
+            "seed_mean_token_log_probs must have shape "
+            f"{expected_score_shape}, received {scores.shape}"
+        )
+    if np.any((label_ids < 0) | (label_ids >= len(labels))):
+        raise ValueError("seed_label_ids contains an invalid label index")
+    if not np.all(np.isfinite(scores)):
+        raise ValueError("seed_mean_token_log_probs must contain finite values")
+
+    seed_count, row_count = label_ids.shape
+    vote_counts = np.zeros((row_count, len(labels)), dtype=np.int64)
+    for label_index in range(len(labels)):
+        vote_counts[:, label_index] = np.sum(label_ids == label_index, axis=0)
+
+    # A candidate receives one Borda point for every candidate it outscores.
+    # Equal candidate scores therefore receive equal points and do not silently
+    # inherit a preference from array order.
+    borda_points = np.sum(
+        scores[:, :, :, np.newaxis] > scores[:, :, np.newaxis, :], axis=-1
+    )
+    borda_scores = np.sum(borda_points, axis=0, dtype=np.int64)
+
+    score_means = np.mean(scores, axis=2, keepdims=True)
+    score_stds = np.std(scores, axis=2, keepdims=True)
+    normalized_scores = np.divide(
+        scores - score_means,
+        score_stds,
+        out=np.zeros_like(scores),
+        where=score_stds > 0,
+    )
+    normalized_score_sums = np.sum(normalized_scores, axis=0)
+
+    final_ids = np.empty(row_count, dtype=np.int64)
+    tie_detected = np.zeros(row_count, dtype=bool)
+    tie_break_methods = np.empty(row_count, dtype=object)
+    for row_index in range(row_count):
+        candidates = np.flatnonzero(
+            vote_counts[row_index] == vote_counts[row_index].max()
+        )
+        if len(candidates) == 1:
+            final_ids[row_index] = candidates[0]
+            tie_break_methods[row_index] = "plurality"
+            continue
+
+        tie_detected[row_index] = True
+        candidate_borda = borda_scores[row_index, candidates]
+        candidates = candidates[candidate_borda == candidate_borda.max()]
+        if len(candidates) == 1:
+            final_ids[row_index] = candidates[0]
+            tie_break_methods[row_index] = "borda"
+            continue
+
+        candidate_scores = normalized_score_sums[row_index, candidates]
+        best_score = candidate_scores.max()
+        candidates = candidates[
+            np.isclose(candidate_scores, best_score, rtol=1e-12, atol=1e-12)
+        ]
+        if len(candidates) == 1:
+            final_ids[row_index] = candidates[0]
+            tie_break_methods[row_index] = "normalized_score"
+            continue
+
+        final_ids[row_index] = candidates[0]
+        tie_break_methods[row_index] = "label_order"
+
+    if np.any(vote_counts.sum(axis=1) != seed_count):
+        raise RuntimeError("Every prediction row must receive one vote per seed")
+    return (
+        final_ids,
+        vote_counts,
+        borda_scores,
+        normalized_score_sums,
+        tie_detected,
+        tie_break_methods,
+    )
+
+
 def _best_validation_result(seed_results: list[dict]) -> dict:
     """Return the best holdout result for reporting, not final prediction."""
 
@@ -712,12 +820,14 @@ def _run_seed_ensemble(
     parameter_counts: dict[str, int] | None,
     token_diagnostics: list[dict[str, object]],
 ) -> None:
-    """Retrain every selected seed, predict, and hard-vote Task A outputs."""
+    """Retrain every selected seed, predict, and ensemble their outputs."""
 
     if len(seed_results) != len(selection_seeds):
         raise RuntimeError("Every configured seed must finish before ensembling")
-    if len(selection_seeds) % 2 == 0:
-        raise ValueError("ensemble_all_seeds requires an odd number of seeds")
+    if len(selection_seeds) < 2:
+        raise ValueError("ensemble_all_seeds requires at least two seeds")
+    if len(task.labels) == 2 and len(selection_seeds) % 2 == 0:
+        raise ValueError("Binary seed ensembling requires an odd number of seeds")
 
     reporting_best = _best_validation_result(seed_results)
     reporting_summary = reporting_best["summary"]
@@ -916,6 +1026,7 @@ def _run_seed_ensemble(
                 "seed": seed,
                 "label_ids": label_ids,
                 "probabilities": predictions["probabilities"],
+                "mean_token_log_probs": predictions["mean_token_log_probs"],
                 "summary": final_summary,
                 "full_train_truncated": full_train_data.truncated_count,
             }
@@ -929,8 +1040,18 @@ def _run_seed_ensemble(
     stacked_label_ids = np.stack(
         [result["label_ids"] for result in retrained_results], axis=0
     )
-    final_ids, hate_votes, nonhate_votes = binary_majority_vote(
-        stacked_label_ids, task.labels
+    stacked_scores = np.stack(
+        [result["mean_token_log_probs"] for result in retrained_results], axis=0
+    )
+    (
+        final_ids,
+        vote_counts,
+        borda_scores,
+        normalized_score_sums,
+        tie_detected,
+        tie_break_methods,
+    ) = ensemble_plurality_vote(
+        stacked_label_ids, stacked_scores, task.labels
     )
     final_labels = [task.labels[index] for index in final_ids]
     mean_probabilities = np.mean(
@@ -943,17 +1064,37 @@ def _run_seed_ensemble(
     voting_data: dict[str, object] = {
         "id": prediction_frame["id"].astype(str).tolist()
     }
-    for row, seed_result in zip(
-        stacked_label_ids, retrained_results, strict=True
+    for seed_index, (row, seed_result) in enumerate(
+        zip(stacked_label_ids, retrained_results, strict=True)
     ):
-        voting_data[f"seed_{seed_result['seed']}"] = [
+        seed_prefix = f"seed_{seed_result['seed']}"
+        voting_data[seed_prefix] = [
             task.labels[index] for index in row
         ]
-    voting_data["hate_votes"] = hate_votes
-    voting_data["nonhate_votes"] = nonhate_votes
+        for label_index, label in enumerate(task.labels):
+            safe_label = label.lower().replace("-", "_").replace(" ", "_")
+            voting_data[
+                f"{seed_prefix}_mean_token_log_prob_{safe_label}"
+            ] = stacked_scores[seed_index, :, label_index]
+            voting_data[f"{seed_prefix}_prob_{safe_label}"] = seed_result[
+                "probabilities"
+            ][:, label_index]
     for label_index, label in enumerate(task.labels):
         safe_label = label.lower().replace("-", "_").replace(" ", "_")
+        voting_data[f"votes_{safe_label}"] = vote_counts[:, label_index]
+        voting_data[f"borda_{safe_label}"] = borda_scores[:, label_index]
+        voting_data[f"normalized_score_{safe_label}"] = normalized_score_sums[
+            :, label_index
+        ]
         voting_data[f"mean_prob_{safe_label}"] = mean_probabilities[:, label_index]
+    if set(task.labels) == {"Non-Hate", "Hate"} and len(task.labels) == 2:
+        voting_data["hate_votes"] = vote_counts[:, task.labels.index("Hate")]
+        voting_data["nonhate_votes"] = vote_counts[
+            :, task.labels.index("Non-Hate")
+        ]
+    voting_data["max_votes"] = vote_counts.max(axis=1)
+    voting_data["tie_detected"] = tie_detected
+    voting_data["tie_break_method"] = tie_break_methods
     voting_data["final_label"] = final_labels
     voting_frame = pd.DataFrame(voting_data)
 
@@ -971,12 +1112,29 @@ def _run_seed_ensemble(
             output_dir,
             task.submission_zip_name,
         )
+        method_counts = {
+            method: int(np.sum(tie_break_methods == method))
+            for method in (
+                "plurality",
+                "borda",
+                "normalized_score",
+                "label_order",
+            )
+        }
         ensemble_summary = {
-            "method": "hard majority vote",
+            "method": (
+                "equal-weight plurality vote with Borda and normalized-score "
+                "tie-breaks"
+            ),
             "seeds": list(selection_seeds),
-            "required_votes": len(selection_seeds) // 2 + 1,
-            "tie_possible": False,
-            "vote_rule": "Hate if hate_votes > nonhate_votes; otherwise Non-Hate",
+            "tie_break_order": [
+                "summed tie-aware Borda points",
+                "summed per-seed z-normalized mean token log probabilities",
+                "configured label order",
+            ],
+            "fixed_label_order": list(task.labels),
+            "rows_by_resolution_method": method_counts,
+            "rows_with_plurality_tie": int(np.sum(tie_detected)),
             "prediction_file": str(csv_path),
             "voting_audit_file": str(output_dir / "voting_predictions.csv"),
             "submission": str(zip_path),
@@ -996,7 +1154,9 @@ def _run_seed_ensemble(
             output_dir / "run_summary.json",
             {
                 "task": task.task_name,
-                "method": "LoRA answer-only causal LM with hard-vote seed ensemble",
+                "method": (
+                    "LoRA answer-only causal LM with equal-weight seed ensemble"
+                ),
                 "model": config.model_name,
                 "resolved_model_revision": resolved_revision,
                 "world_size": runtime.world_size,
@@ -1048,7 +1208,8 @@ def _run_seed_ensemble(
                 "development_rows": len(prediction_data),
                 "training_config": asdict(config),
                 "parameters": parameter_counts,
-                "system_prompt": encoder.system_text,
+                "prompt_style": encoder.prompt_style,
+                "prompt_template": encoder.system_text,
                 "label_order": list(task.labels),
                 "completion_token_ids": encoder.completions,
                 "completion_token_diagnostics": token_diagnostics,
@@ -1058,11 +1219,13 @@ def _run_seed_ensemble(
                 == 1,
                 "inference": (
                     "per-seed argmax mean token log P(answer including chat end | "
-                    "prompt), followed by hard majority vote"
+                    "prompt), followed by equal-weight plurality voting with "
+                    "Borda, normalized-score, and fixed-label-order tie-breaks"
                 ),
                 "probabilities": (
                     "softmax over mean token log likelihoods; mean probabilities "
-                    "are diagnostic only and do not determine the final vote"
+                    "are diagnostic only; tie score uses z-normalized raw mean "
+                    "token log likelihoods"
                 ),
                 "loss": "mean per-example answer-token NLL; not class cross-entropy",
                 "truncated_comments": {
@@ -1098,7 +1261,8 @@ def _run_seed_ensemble(
         log(
             f"\n=== COMPLETE | {task.task_name} ===\n"
             f"Retrained seeds: {list(selection_seeds)}\n"
-            f"Voting rule: at least {len(selection_seeds) // 2 + 1} votes.\n"
+            "Voting rule: equal-weight plurality; ties use Borda, normalized "
+            "candidate score, then fixed label order.\n"
             f"Voting audit: {output_dir / 'voting_predictions.csv'}\n"
             f"Predictions: {csv_path}\nSubmission: {zip_path}",
             runtime,
@@ -1117,12 +1281,10 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
     if any(seed < 0 for seed in selection_seeds):
         raise ValueError("selection_seeds must contain non-negative integers")
     if task.ensemble_all_seeds:
-        if len(selection_seeds) % 2 == 0:
-            raise ValueError("ensemble_all_seeds requires an odd number of seeds")
-        if set(task.labels) != {"Non-Hate", "Hate"} or len(task.labels) != 2:
-            raise ValueError(
-                "ensemble_all_seeds currently supports binary Non-Hate/Hate only"
-            )
+        if len(selection_seeds) < 2:
+            raise ValueError("ensemble_all_seeds requires at least two seeds")
+        if len(task.labels) == 2 and len(selection_seeds) % 2 == 0:
+            raise ValueError("Binary seed ensembling requires an odd number of seeds")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     runtime = initialize_runtime()
     try:
@@ -1176,7 +1338,12 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
-        encoder = ChatEncoder(tokenizer, task, config.max_length)
+        encoder = ChatEncoder(
+            tokenizer,
+            task,
+            config.max_length,
+            prompt_style=config.prompt_style,
+        )
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
         val_frame = frame.iloc[val_indices]
@@ -1728,7 +1895,8 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "development_rows": len(prediction_data),
                     "training_config": asdict(config),
                     "parameters": parameter_counts,
-                    "system_prompt": encoder.system_text,
+                    "prompt_style": encoder.prompt_style,
+                    "prompt_template": encoder.system_text,
                     "label_order": list(task.labels),
                     "completion_token_ids": encoder.completions,
                     "completion_token_diagnostics": token_diagnostics,
@@ -1797,8 +1965,16 @@ def run_llm_cli(
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=defaults.model_name)
     parser.add_argument("--revision", default=defaults.model_revision)
+    parser.add_argument(
+        "--prompt-style",
+        choices=PROMPT_STYLES,
+        default=defaults.prompt_style,
+    )
     parser.add_argument("--max-epochs", type=int, default=defaults.max_epochs)
     parser.add_argument("--max-length", type=int, default=defaults.max_length)
+    parser.add_argument(
+        "--learning-rate", type=float, default=defaults.learning_rate
+    )
     parser.add_argument(
         "--batch-size", type=int, default=defaults.train_batch_size_per_gpu
     )
@@ -1818,8 +1994,10 @@ def run_llm_cli(
         defaults,
         model_name=args.model,
         model_revision=args.revision,
+        prompt_style=args.prompt_style,
         max_epochs=args.max_epochs,
         max_length=args.max_length,
+        learning_rate=args.learning_rate,
         train_batch_size_per_gpu=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation,
         use_all_available_gpus=defaults.use_all_available_gpus

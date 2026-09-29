@@ -6,9 +6,11 @@ Pipeline fine-tune causal LLM cho hai task HASTIKA:
 - Task B: phân loại `Gender`, `Political`, `Religion`, `Geo-political`,
   `Violence`, `Others`.
 
-Pipeline dùng **LoRA chuẩn, không lượng tử hóa**. Backbone được nạp bằng
-FP16 trên T4 hoặc BF16 trên GPU hỗ trợ native BF16; trọng số backbone đóng
-băng và chỉ các ma trận LoRA được optimizer cập nhật.
+Nhánh thử nghiệm này dùng `sarvamai/sarvam-1`, một base causal language model
+được pretrain cho các ngôn ngữ Indic (bao gồm Kannada) và English. Pipeline dùng
+**LoRA chuẩn, không lượng tử hóa**. Backbone được nạp bằng FP16 trên T4 hoặc
+BF16 trên GPU hỗ trợ native BF16; trọng số backbone đóng băng và chỉ các ma
+trận LoRA được optimizer cập nhật.
 
 ## Quy trình huấn luyện
 
@@ -22,14 +24,16 @@ Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộ
    và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
    thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
    lấy ngẫu nhiên một tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
-3. Với Task A, cả 5 seed đều khởi tạo lại backbone và LoRA từ đầu, rồi retrain
-   trên `binary_original_1..5 + binary_augment1..5` theo `best_epoch` riêng.
-   Năm adapter dự đoán development độc lập; nhãn cuối là hard majority vote,
-   tức `Hate` khi có ít nhất 3 phiếu, ngược lại là `Non-Hate`.
-4. Task B vẫn chọn seed tốt nhất, khởi tạo lại từ đầu và retrain trên
-   `original_1..5 + augment1..5`, ngoại trừ các câu Gender bị seed chiến thắng
-   loại khỏi fold 1-4.
-5. Adapter full-retrain dùng để dự đoán development inputs và tạo
+3. Với cả hai task, từng seed khởi tạo lại backbone và LoRA từ đầu rồi retrain
+   trên dữ liệu đầy đủ theo `best_epoch` riêng. Task B tiếp tục loại đúng tập
+   Gender mà seed đó đã chọn khi chạy phase selection; vì vậy 5 seed có thể
+   retrain trên 5 tập Gender khác nhau nhưng cùng số lượng mẫu.
+4. Năm adapter dự đoán development độc lập và có trọng số ngang nhau. Task A
+   dùng majority vote. Task B dùng plurality vote; nếu nhiều nhãn cùng số phiếu
+   cao nhất thì lần lượt phá hòa bằng tổng điểm Borda, tổng `mean_token_log_probs`
+   đã z-normalize riêng trong từng seed/mẫu, rồi thứ tự label cố định trong
+   `llm_config.py` nếu mọi giá trị vẫn bằng nhau.
+5. Kết quả ensemble dùng để tạo
    `predictions.csv` cùng file ZIP nộp CodaBench. Full-retrain không đánh giá
    lại fold 5 vì fold này đã được đưa vào dữ liệu huấn luyện đầy đủ.
 
@@ -39,7 +43,7 @@ nhóm validation cũ.
 
 ## Light text normalization
 
-Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa cột `Comment` vào chat tokenizer:
+Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa cột `Comment` vào tokenizer:
 
 - Sửa lỗi encoding bằng `ftfy`, chuẩn hóa Unicode NFKC và giải mã HTML entity.
 - Thu gọn khoảng trắng; ô `Comment` thiếu được chuyển thành chuỗi rỗng.
@@ -47,8 +51,8 @@ Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa cột `Comment` và
 - Không lowercase; giữ hashtag, emoji và dấu câu.
 - Không xóa stopword, không lemmatize và không chuẩn hóa ký tự/từ lặp.
 
-Khi comment quá dài, `ChatEncoder` chỉ cắt phần cuối comment để toàn bộ system
-prompt và assistant label vẫn nằm trong `max_length`.
+Khi comment quá dài, `ChatEncoder` chỉ cắt phần cuối comment để toàn bộ prompt
+và label đích vẫn nằm trong `max_length`.
 
 ## LoRA
 
@@ -56,15 +60,17 @@ Cấu hình mặc định trong `llm_config.py`:
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone | `sarvamai/sarvam-1` |
+| Revision | `f7c5f371d2e0bbe082caede3b3b0e1e403fc5839` |
+| Prompt style | `sarvam_completion` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
 | Max epochs để chọn | 5 |
 | Early-stopping patience | 2 |
-| Max chat length | 256 |
-| Learning rate | `1e-4` |
+| Max sequence length | 256 |
+| Learning rate | `2e-4` |
 | Batch/GPU | 4 |
 | Gradient accumulation | 2 |
 | Eval batch/GPU | 2 candidate completions |
@@ -81,8 +87,15 @@ cập nhật.
 
 Đây không còn là QLoRA: code không dùng NF4, double quantization hay
 `BitsAndBytesConfig`. Vì vậy standard LoRA dùng VRAM nhiều hơn đáng kể.
-Qwen2.5-3B phù hợp hơn với T4 16 GB; Qwen2.5-7B FP16 thường không còn đủ
-khoảng trống để train LoRA trên một T4, và DDP không cộng VRAM của hai GPU.
+Sarvam-1 không phải instruction/chat model; pipeline dùng prompt downstream
+ngắn, không dùng system message dài và chỉ tối ưu completion là label. Tokenizer
+vẫn cung cấp scaffold `[INST] ... [/INST]` để xác định biên prompt/completion
+ổn định. DDP không cộng VRAM của hai GPU: mỗi GPU vẫn giữ một bản backbone.
+
+Checkpoint được pin theo revision cụ thể để một cập nhật trên Hugging Face Hub
+không âm thầm làm thay đổi lần chạy sau. Model được phát hành theo Sarvam AI
+Non-Commercial License; cần kiểm tra điều khoản cuộc thi và mục đích sử dụng
+trước khi dùng ngoài nghiên cứu/đánh giá.
 
 ## Dữ liệu
 
@@ -146,7 +159,8 @@ bằng DDP với hai worker; mỗi GPU giữ một bản backbone đầy đủ.
 Đổi backbone hoặc giới hạn tài nguyên:
 
 ```bash
-!python Train_A_LLM.py --model Qwen/Qwen2.5-3B-Instruct
+!python Train_A_LLM.py --model sarvamai/sarvam-1
+!python Train_A_LLM.py --learning-rate 5e-5
 !python Train_A_LLM.py --max-epochs 3 --batch-size 1 --max-length 256
 !python Train_B_LLM.py --single-gpu --gradient-accumulation 16
 !python Train_A_LLM.py --prediction-file /path/to/official_inputs.csv
@@ -162,23 +176,27 @@ Có thể đặt thư mục bằng biến môi trường trước khi chạy:
 
 ## Tokenization, loss và dự đoán
 
-Task A dùng trực tiếp nhãn chính thức trong assistant response:
+Vì Sarvam-1 là base model, cả hai task dùng prompt completion ngắn thay cho
+system prompt hội thoại dài. Ví dụ Task A:
 
 ```text
-System: Classify ... Allowed labels: Non-Hate; Hate.
-User: Comment:\n<normalized Comment>
-Assistant: Non-Hate hoặc Hate
+Task: Detect hate speech in this Kannada-English code-mixed comment.
+Choose exactly one label from: Non-Hate; Hate.
+Comment:
+<normalized Comment>
+Answer: Non-Hate hoặc Hate
 ```
 
 Task B cũng dùng trực tiếp các nhãn chính thức `Gender`, `Political`, `Religion`,
 `Geo-political`, `Violence` và `Others`; pipeline không dùng mã nội bộ `A`–`F`.
 
-Code gọi `apply_chat_template` của tokenizer. Prompt và padding được mask bằng
-`-100`; loss chỉ áp dụng cho các token của assistant label và phần kết thúc
-chat. Khi dự đoán, pipeline tính mean token log-likelihood cho từng câu trả lời
-hợp lệ và chọn nhãn có điểm lớn nhất; phép chuẩn hóa này tránh thiên vị câu trả
-lời ngắn khi Task A dùng trực tiếp tên nhãn. Pipeline không sinh văn bản tự do
-và không regex sửa kết quả.
+Code dùng template do tokenizer Sarvam cung cấp để tạo biên prompt/completion
+nhất quán. Prompt và padding được mask bằng `-100`; loss chỉ áp dụng cho các
+token của label và token kết thúc. Khi dự đoán, pipeline tính mean token
+log-likelihood cho từng câu trả lời hợp lệ và chọn nhãn có điểm lớn nhất. Phép
+chuẩn hóa theo số token tránh thiên vị câu trả lời ngắn khi `Non-Hate` và `Hate`
+có độ dài token khác nhau. Pipeline không sinh văn bản tự do và không regex sửa
+kết quả.
 
 Tiến trình train, validation và prediction được ghi thành dòng cố định mỗi 10%
 với số batch/candidate, elapsed time, ETA, tốc độ và mean loss khi train. Cách
@@ -193,24 +211,24 @@ nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện,
 Task A:
 
 ```text
-checkpoints/task_a_lora/seed_42/best_holdout_adapter/
-checkpoints/task_a_lora/seed_42/final_full_data_adapter/
-checkpoints/task_a_lora/seed_52/...
-checkpoints/task_a_lora/seed_62/...
-checkpoints/task_a_lora/seed_72/...
-checkpoints/task_a_lora/seed_82/...
-checkpoints/task_a_lora/metrics.json
-outputs/task_a_lora/seed_42/validation_predictions.csv
-outputs/task_a_lora/seed_42/predictions.csv
-outputs/task_a_lora/seed_52/...
-outputs/task_a_lora/selection_training_history.json
-outputs/task_a_lora/split_manifest.csv
-outputs/task_a_lora/validation_predictions.csv
-outputs/task_a_lora/seed_selection_results.csv
-outputs/task_a_lora/voting_predictions.csv
-outputs/task_a_lora/predictions.csv
-outputs/task_a_lora/task_a_submission.zip
-outputs/task_a_lora/run_summary.json
+checkpoints/task_a_sarvam1_lora/seed_42/best_holdout_adapter/
+checkpoints/task_a_sarvam1_lora/seed_42/final_full_data_adapter/
+checkpoints/task_a_sarvam1_lora/seed_52/...
+checkpoints/task_a_sarvam1_lora/seed_62/...
+checkpoints/task_a_sarvam1_lora/seed_72/...
+checkpoints/task_a_sarvam1_lora/seed_82/...
+checkpoints/task_a_sarvam1_lora/metrics.json
+outputs/task_a_sarvam1_lora/seed_42/validation_predictions.csv
+outputs/task_a_sarvam1_lora/seed_42/predictions.csv
+outputs/task_a_sarvam1_lora/seed_52/...
+outputs/task_a_sarvam1_lora/selection_training_history.json
+outputs/task_a_sarvam1_lora/split_manifest.csv
+outputs/task_a_sarvam1_lora/validation_predictions.csv
+outputs/task_a_sarvam1_lora/seed_selection_results.csv
+outputs/task_a_sarvam1_lora/voting_predictions.csv
+outputs/task_a_sarvam1_lora/predictions.csv
+outputs/task_a_sarvam1_lora/task_a_submission.zip
+outputs/task_a_sarvam1_lora/run_summary.json
 ```
 
 `validation_predictions.csv` ở thư mục gốc là kết quả của seed có holdout tốt
@@ -218,10 +236,13 @@ nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoá
 số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
 kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
-Task B còn tạo một thư mục riêng cho từng seed, ví dụ
-`outputs/task_b_lora/seed_42/`, cùng `seed_selection_results.csv` và
-`seed_selection_summary.json`. Các artifact ở trực tiếp
-`outputs/task_b_lora/` luôn tương ứng với seed chiến thắng.
+Task B có cấu trúc artifact tương tự Task A: mỗi seed có
+`best_holdout_adapter/`, `final_full_data_adapter/`, prediction và lịch sử
+retrain riêng. `outputs/task_b_sarvam1_lora/voting_predictions.csv` lưu nhãn của từng
+seed, số phiếu, điểm Borda, tổng candidate score đã chuẩn hóa, phương thức phá
+hòa và nhãn cuối. Các file `predictions.csv`, ZIP và `run_summary.json` ở thư
+mục gốc là kết quả ensemble; seed có holdout tốt nhất chỉ được dùng để xuất báo
+cáo validation đại diện, không còn là seed duy nhất được retrain.
 
 Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
 tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức

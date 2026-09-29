@@ -31,6 +31,7 @@ from src.llm_training import (
     completion_token_diagnostics,
     completion_log_probs,
     compute_dtype,
+    ensemble_plurality_vote,
     format_per_class_diagnostics,
     require_cuda,
     restore_adapter,
@@ -57,7 +58,15 @@ class TestChatTokenizer:
     def decode(self, ids, skip_special_tokens=False):
         return "".join(chr(value - 10) for value in ids)
 
-    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        enable_thinking=None,
+    ):
+        self.thinking_values = getattr(self, "thinking_values", [])
+        self.thinking_values.append(enable_thinking)
         role_ids = {"system": 3, "user": 4, "assistant": 5}
         ids = []
         for message in messages:
@@ -144,8 +153,13 @@ class LLMTests(unittest.TestCase):
             lora_dropout=0.0,
         )
 
-    def test_answer_mask_and_truncation_preserve_full_labels(self):
-        self.assertIn("Allowed labels: Non-Hate; Hate", self.encoder.system_text)
+    def test_answer_mask_and_truncation_preserve_configured_answers(self):
+        self.assertTrue(self.tokenizer.thinking_values)
+        self.assertTrue(all(value is False for value in self.tokenizer.thinking_values))
+        self.assertEqual(TASK_A.label_codes, TASK_A.labels)
+        self.assertIn(
+            "Allowed labels: Non-Hate; Hate", self.encoder.system_text
+        )
         self.assertNotIn("Code mapping", self.encoder.system_text)
         task_b_prompt = ChatEncoder(self.tokenizer, TASK_B, 512).system_text
         self.assertIn(
@@ -157,24 +171,48 @@ class LLMTests(unittest.TestCase):
             encoder = ChatEncoder(self.tokenizer, task, 512)
             prompt, truncated = encoder.encode_prompt("long comment " * 300)
             self.assertTrue(truncated)
-            for label_id, label in enumerate(task.labels):
+            for label_id, answer in enumerate(task.label_codes):
                 feature = encoder.feature(prompt, label_id)
                 self.assertLessEqual(len(feature["input_ids"]), 512)
                 self.assertEqual(feature["labels"][: len(prompt)], [-100] * len(prompt))
                 self.assertEqual(
-                    feature["labels"][len(prompt) :], self.tokenizer.encode(label) + [2]
+                    feature["labels"][len(prompt) :],
+                    self.tokenizer.encode(answer) + [2],
                 )
                 self.assertEqual(feature["input_ids"][: len(prompt)], prompt)
 
     def test_encoding_matches_full_training_chat(self):
         prompt, _ = self.encoder.encode_prompt("hello")
-        for label_id, label in enumerate(TASK_A.labels):
+        for label_id, answer in enumerate(TASK_A.label_codes):
             expected = self.tokenizer.apply_chat_template(
                 self.encoder.messages("hello")
-                + [{"role": "assistant", "content": label}]
+                + [{"role": "assistant", "content": answer}]
             )
             self.assertEqual(
                 self.encoder.feature(prompt, label_id)["input_ids"], expected
+            )
+
+    def test_sarvam_completion_prompt_is_compact_and_answer_only(self):
+        encoder = ChatEncoder(
+            self.tokenizer,
+            TASK_B,
+            512,
+            prompt_style="sarvam_completion",
+        )
+        messages = encoder.messages("sample comment")
+        self.assertEqual([message["role"] for message in messages], ["user"])
+        self.assertIn("Kannada-English", messages[0]["content"])
+        self.assertIn("Choose exactly one label", messages[0]["content"])
+        self.assertIn("Comment:\nsample comment\nAnswer:", messages[0]["content"])
+        self.assertNotIn("untrusted text", messages[0]["content"])
+        prompt, truncated = encoder.encode_prompt("sample comment")
+        self.assertFalse(truncated)
+        for label_id, answer in enumerate(TASK_B.label_codes):
+            expected = self.tokenizer.apply_chat_template(
+                messages + [{"role": "assistant", "content": answer}]
+            )
+            self.assertEqual(
+                encoder.feature(prompt, label_id)["input_ids"], expected
             )
 
     def test_shifted_answer_loss_matches_full_qwen_loss(self):
@@ -386,6 +424,11 @@ class LLMTests(unittest.TestCase):
     def test_task_a_direct_labels_use_length_normalized_candidate_scores(self):
         encoder = ChatEncoder(self.tokenizer, TASK_A, 512)
         self.assertNotEqual(len(encoder.completions[0]), len(encoder.completions[1]))
+        diagnostics = completion_token_diagnostics(encoder)
+        self.assertEqual([item["label"] for item in diagnostics], ["Non-Hate", "Hate"])
+        self.assertEqual(
+            [item["code"] for item in diagnostics], ["Non-Hate", "Hate"]
+        )
         data = CompletionDataset(["a direct-label example"], encoder)
         result = score_candidates(
             tiny_model().eval(),
@@ -424,6 +467,83 @@ class LLMTests(unittest.TestCase):
     def test_binary_majority_vote_rejects_even_seed_count(self):
         with self.assertRaisesRegex(ValueError, "odd number of seeds"):
             binary_majority_vote(np.asarray([[0, 1], [1, 0]]), TASK_A.labels)
+
+    def test_ensemble_plurality_vote_uses_unique_plurality(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray(
+            [
+                [0, 2],
+                [0, 1],
+                [1, 2],
+                [0, 2],
+                [2, 0],
+            ]
+        )
+        scores = np.eye(len(labels), dtype=np.float64)[label_ids]
+        final_ids, votes, _, _, ties, methods = ensemble_plurality_vote(
+            label_ids, scores, labels
+        )
+        np.testing.assert_array_equal(final_ids, [0, 2])
+        np.testing.assert_array_equal(votes, [[3, 1, 1], [1, 1, 3]])
+        np.testing.assert_array_equal(ties, [False, False])
+        self.assertEqual(methods.tolist(), ["plurality", "plurality"])
+
+    def test_ensemble_plurality_vote_breaks_tie_with_borda(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray([[0], [0], [1], [1], [2]])
+        scores = np.asarray(
+            [
+                [[3.0, 2.0, 1.0]],
+                [[3.0, 2.0, 1.0]],
+                [[1.0, 3.0, 2.0]],
+                [[1.0, 3.0, 2.0]],
+                [[2.0, 1.0, 3.0]],
+            ]
+        )
+        final_ids, votes, borda, _, ties, methods = ensemble_plurality_vote(
+            label_ids, scores, labels
+        )
+        np.testing.assert_array_equal(votes[0], [2, 2, 1])
+        np.testing.assert_array_equal(borda[0], [5, 6, 4])
+        np.testing.assert_array_equal(final_ids, [1])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["borda"])
+
+    def test_ensemble_plurality_vote_breaks_borda_tie_with_normalized_score(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray([[0], [0], [1], [1], [2]])
+        scores = np.asarray(
+            [
+                [[1.0, 0.9, 0.0]],
+                [[0.1, -10.0, 0.0]],
+                [[0.0, 10.0, 0.1]],
+                [[0.0, 10.0, 0.1]],
+                [[0.1, 0.0, 10.0]],
+            ]
+        )
+        final_ids, votes, borda, normalized, ties, methods = (
+            ensemble_plurality_vote(label_ids, scores, labels)
+        )
+        np.testing.assert_array_equal(votes[0], [2, 2, 1])
+        np.testing.assert_array_equal(borda[0, :2], [5, 5])
+        self.assertGreater(normalized[0, 1], normalized[0, 0])
+        np.testing.assert_array_equal(final_ids, [1])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["normalized_score"])
+
+    def test_ensemble_plurality_vote_uses_label_order_for_exact_tie(self):
+        labels = ("A", "B")
+        label_ids = np.asarray([[0], [1]])
+        scores = np.asarray([[[1.0, 0.0]], [[0.0, 1.0]]])
+        final_ids, votes, borda, normalized, ties, methods = (
+            ensemble_plurality_vote(label_ids, scores, labels)
+        )
+        np.testing.assert_array_equal(votes[0], [1, 1])
+        np.testing.assert_array_equal(borda[0], [1, 1])
+        np.testing.assert_allclose(normalized[0], [0.0, 0.0])
+        np.testing.assert_array_equal(final_ids, [0])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["label_order"])
 
     def test_cpu_production_run_fails_clearly(self):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
@@ -635,9 +755,18 @@ class LLMTests(unittest.TestCase):
                     self.assertEqual(
                         voting["final_label"].tolist(), result["label"].tolist()
                     )
+                    vote_columns = [
+                        "votes_"
+                        + label.lower().replace("-", "_").replace(" ", "_")
+                        for label in task.labels
+                    ]
                     self.assertEqual(
-                        (voting["hate_votes"] + voting["nonhate_votes"]).tolist(),
+                        voting[vote_columns].sum(axis=1).tolist(),
                         [len(test_seeds)] * len(voting),
+                    )
+                    self.assertEqual(
+                        summary["ensemble"]["fixed_label_order"],
+                        list(task.labels),
                     )
                 else:
                     self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
@@ -686,10 +815,16 @@ class LLMTests(unittest.TestCase):
                     calls.count("Development prediction from full-data adapter"),
                     len(test_seeds) if task.ensemble_all_seeds else 1,
                 )
-                encoder = ChatEncoder(self.tokenizer, task, config.max_length)
+                encoder = ChatEncoder(
+                    self.tokenizer,
+                    task,
+                    config.max_length,
+                    prompt_style=config.prompt_style,
+                )
                 data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
                 if task.ensemble_all_seeds:
                     seed_label_ids = []
+                    seed_mean_token_log_probs = []
                     for index, seed in enumerate(test_seeds):
                         final_model = loaded_models[len(test_seeds) + index]
                         restore_adapter(
@@ -711,8 +846,13 @@ class LLMTests(unittest.TestCase):
                         seed_label_ids.append(
                             scores["probabilities"].argmax(axis=1)
                         )
-                    expected_ids, _, _ = binary_majority_vote(
-                        np.stack(seed_label_ids), task.labels
+                        seed_mean_token_log_probs.append(
+                            scores["mean_token_log_probs"]
+                        )
+                    expected_ids, *_ = ensemble_plurality_vote(
+                        np.stack(seed_label_ids),
+                        np.stack(seed_mean_token_log_probs),
+                        task.labels,
                     )
                     expected = [task.labels[index] for index in expected_ids]
                 else:

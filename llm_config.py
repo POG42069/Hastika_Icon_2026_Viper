@@ -24,6 +24,8 @@ class TaskConfig:
     prediction_filename: str
     label_column: str
     labels: tuple[str, ...]
+    # Answers emitted by the model, in the same order as the official labels.
+    label_codes: tuple[str, ...]
     checkpoint_subdir: str
     output_subdir: str
     submission_zip_name: str
@@ -58,15 +60,19 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"
+            "HASTIKA_LLM_MODEL", "sarvamai/sarvam-1"
         )
     )
-    model_revision: str = "main"
+    # Pin the model snapshot so a later Hub update cannot silently change a run.
+    model_revision: str = "f7c5f371d2e0bbe082caede3b3b0e1e403fc5839"
+    # Sarvam-1 is a base completion model, so use a compact downstream-task
+    # prompt rather than the verbose system/user instruction used by Qwen.
+    prompt_style: str = "sarvam_completion"
     validation_size: float = 0.20
     seed: int = 42
-    max_length: int = 256  # Full chat, including instructions, answer and EOS.
+    max_length: int = 256  # Full prompt, including the answer and EOS.
     max_epochs: int = 5
-    learning_rate: float = 1e-4
+    learning_rate: float = 2e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.10
     train_batch_size_per_gpu: int = 4
@@ -74,7 +80,7 @@ class LLMTrainingConfig:
     eval_batch_size_per_gpu: int = 2
     gradient_accumulation_steps: int = 2
     max_grad_norm: float = 1.0
-    early_stopping_patience: int = 2
+    early_stopping_patience: int = 4
     lora_rank: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
@@ -94,8 +100,9 @@ TASK_A = TaskConfig(
     prediction_filename="binary_validation_inputs.csv",
     label_column="Label",
     labels=("Non-Hate", "Hate"),
-    checkpoint_subdir="task_a_lora",
-    output_subdir="task_a_lora",
+    label_codes=("Non-Hate", "Hate"),
+    checkpoint_subdir="task_a_sarvam1_lora",
+    output_subdir="task_a_sarvam1_lora",
     submission_zip_name="task_a_submission.zip",
     original_fold_filenames=tuple(
         f"binary_original_{fold}.csv" for fold in range(1, 6)
@@ -103,7 +110,7 @@ TASK_A = TaskConfig(
     augmentation_fold_filenames=tuple(
         f"binary_augment{fold}.csv" for fold in range(1, 6)
     ),
-    use_augmentation=True,
+    use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),
@@ -124,8 +131,17 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    checkpoint_subdir="task_b_lora",
-    output_subdir="task_b_lora",
+    # Task B continues to train and score the official category names directly.
+    label_codes=(
+        "Gender",
+        "Political",
+        "Religion",
+        "Geo-political",
+        "Violence",
+        "Others",
+    ),
+    checkpoint_subdir="task_b_sarvam1_lora",
+    output_subdir="task_b_sarvam1_lora",
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
@@ -134,6 +150,7 @@ TASK_B = TaskConfig(
     selection_validation_data_origins=("original",),
     selection_train_label_caps=(("Gender", 870),),
     selection_seeds=(42, 52, 62, 72, 82),
+    ensemble_all_seeds=True,
     report_per_class_metrics=False,
     enable_augmentation_audit=True,
     augmentation_audit_action="report",
