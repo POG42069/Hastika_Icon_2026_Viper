@@ -1,4 +1,4 @@
-"""Train Task B on original raw + English comments for five epochs per seed."""
+"""Select per-seed epochs on raw + English Task B inputs, retrain, and ensemble."""
 
 from llm_config import LLM_TRAINING_B, TASK_B_LLM
 from src.llm_training import run_llm_cli

@@ -28,23 +28,31 @@ optimizer chỉ cập nhật các ma trận LoRA.
 4. Năm model dự đoán development độc lập. Nhãn cuối được chọn bằng hard
    majority vote: ít nhất 3 phiếu `Hate` thì trả `Hate`.
 
-### Task B: thí nghiệm fixed epoch + năm full-data model
+### Task B: best epoch riêng cho từng seed + năm full-data model
 
 Task B không còn downsample Gender và không loại bất kỳ câu train nào.
 
-1. Tạm bỏ toàn bộ giai đoạn five-fold OOF và không chọn global best epoch.
-2. Đặt số epoch full-data cố định bằng `5` cho thí nghiệm phương sai.
-3. Khởi tạo mới năm model với seed `42, 52, 62, 72, 82`. Mỗi model train trên
-   toàn bộ `original_1..5` trong đúng năm epoch. Các file `augment1..5` không
-   được đọc, không audit và không tham gia tính class weight.
-4. Mỗi model trả xác suất cho sáu nhãn. Pipeline lấy trung bình xác suất của
+1. Với mỗi seed `42, 52, 62, 72, 82`, train trên `original_1..4` và validation
+   trên `original_5`. Tập validation cố định giữa các seed, không dùng augment.
+2. Selection chạy tối đa 5 epoch. Mỗi seed chọn epoch có Macro-F1 cao nhất;
+   validation loss thấp hơn phá hòa, còn cả hai bằng nhau thì giữ epoch trước.
+   Early stopping có patience 2. Macro-F1 là trung bình F1 của đủ sáu nhãn.
+3. Khôi phục `best_holdout_adapter` để đánh giá lại và lưu kết quả của từng seed.
+4. Khởi tạo lại backbone và LoRA cho cả năm seed. Mỗi model retrain trên toàn bộ
+   `original_1..5` trong đúng số best epoch của chính seed đó. Ví dụ best epoch
+   là `3, 3, 4, 2, 3` thì các full-data model cũng train lần lượt `3, 3, 4, 2, 3`
+   epoch. Không chọn một seed thắng để loại các model còn lại.
+5. Mỗi model trả xác suất cho sáu nhãn. Pipeline lấy trung bình xác suất của
    năm model với trọng số bằng nhau rồi lấy nhãn có xác suất trung bình cao
    nhất. Đây là soft ensemble, không phải hard voting.
 
-Class-weighted loss vẫn được áp dụng cho cả năm model. Mỗi model được khởi tạo
-mới để mọi hàng dữ liệu được học đúng năm epoch như nhau.
-Prompt raw + English được áp dụng nhất quán ở train, validation mỗi epoch
-và development prediction. Nhãn gold chỉ dùng cho loss hoặc tính metric.
+Class-weighted loss áp dụng trong cả selection và full-data retrain. Task B
+không chạy five-fold OOF và không dùng global best epoch hoặc số epoch cố định.
+Full retrain không tiếp tục train từ adapter holdout: mỗi seed được khởi tạo mới.
+Các file `augment1..5` không được đọc, không audit và không tham gia tính weights.
+Prompt raw + English được áp dụng nhất quán ở selection train, holdout,
+full retrain, official validation mỗi epoch và development prediction.
+Nhãn gold chỉ dùng cho loss hoặc tính metric, không đưa vào user prompt.
 
 ## Class-weighted loss của Task B
 
@@ -68,8 +76,9 @@ Trong đó `N` là tổng số mẫu train, `K=6`, và `n_c` là số mẫu củ
 ngăn class hiếm chi phối gradient. Bước chuẩn hóa giữ mean sample weight bằng
 1, nên độ lớn loss và learning rate gần với pipeline cũ.
 
-Trong thí nghiệm fixed epoch hiện tại, weights được tính từ năm file original
-trước khi train năm full-data model.
+Trong selection, weights được tính chỉ từ `original_1..4`, không dùng phân bố
+nhãn của validation fold 5. Trong full retrain, weights được tính lại từ
+`original_1..5` rồi áp dụng cho cả năm full-data model.
 
 Với dữ liệu Task B hiện tại:
 
@@ -112,8 +121,9 @@ Nếu phải cắt, giữ đầu của cả hai phần, các tiêu đề và to�
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
-| Max epochs | 5 cho Task A; Task B cố định 5 epoch |
-| Early-stopping patience | 2, chỉ áp dụng quy trình Task A |
+| Max selection epochs | 5 cho cả Task A và Task B |
+| Full-data epochs | Best epoch riêng của mỗi seed, cho cả hai task |
+| Early-stopping patience | 2, chỉ áp dụng giai đoạn selection |
 | Max chat length | 256 |
 | Learning rate | `1e-4` |
 | Weight decay | 0.01 |
@@ -238,9 +248,8 @@ Có thể đổi tham số qua CLI:
 !python Train_B_LLM.py --prediction-file /path/to/official_inputs.csv
 ```
 
-Số epoch của thí nghiệm Task B hiện được khóa bằng
-`TASK_B.fixed_full_retrain_epochs=5`; tùy chọn `--max-epochs` không thay đổi
-giá trị cố định này.
+`--max-epochs` điều chỉnh số epoch selection tối đa của Task B. Số epoch full
+retrain được lấy từ best epoch riêng của từng seed, không khóa bằng 5.
 
 ### Log validation sau mỗi epoch của Task B
 
@@ -249,22 +258,32 @@ hoặc `data/`. File cần các cột `id`, `Comment`, `Hate Category` và có 3
 Pipeline đọc file này độc lập với input dùng để tạo submission, nên vẫn có
 thể dùng `--prediction-file` để dự đoán test không nhãn.
 
-Sau mỗi epoch của từng seed, Task B đánh giá trên gold validation và in:
+Trong selection, Task B chấm `original_5` sau mỗi epoch và in Macro-F1, loss,
+accuracy, confusion matrix dạng text cùng precision, recall, F1, support của
+từng nhãn. Các metric này được dùng để chọn best epoch của chính seed đó.
+
+Trong full retrain, sau mỗi epoch của từng seed, Task B đánh giá trên gold
+validation 395 câu và in:
 
 - Seed, epoch, validation loss, Macro-F1 và accuracy.
 - Confusion matrix dạng text: hàng là nhãn thật, cột là nhãn dự đoán.
 - Precision, recall, F1, support và số câu nhầm vào/ra từng class.
 
-Các metric chỉ để theo dõi. Pipeline vẫn train đủ 5 epoch, không early stop
-hoặc chọn checkpoint bằng gold validation. Validation không được ghép vào
-train; ID trùng với train sẽ gây lỗi. Trạng thái RNG được giữ lại khi chấm
+Các metric của gold validation 395 câu chỉ để theo dõi. Full retrain chạy đủ
+best epoch đã chọn từ holdout, không early stop hoặc chọn checkpoint bằng gold
+validation. Gold validation không được ghép vào train; ID trùng với train sẽ
+gây lỗi. Trạng thái RNG được giữ lại khi chấm
 để bước đánh giá không làm thay đổi random của epoch train tiếp theo.
 
 Khi cả năm model hoàn tất, code cũng in metric của soft ensemble trên cùng
-gold validation. Metric này dùng để so sánh hai nhánh có/không augment.
+gold validation. Metric này dùng để so sánh các lượt chạy và cấu hình thử nghiệm.
 Task A giữ nguyên pipeline và cách log hiện tại.
 
-Metric mỗi epoch được lưu trong `seed_<seed>/full_data_training_history.json`.
+Metric selection được lưu trong `seed_<seed>/selection_training_history.json`;
+dự đoán holdout tốt nhất nằm trong `seed_<seed>/validation_predictions.csv`.
+`seed_selection_results.csv` và `seed_selection_summary.json` ghi best epoch
+riêng của tất cả seed. Metric full retrain mỗi epoch được lưu trong
+`seed_<seed>/full_data_training_history.json`.
 Thư mục `seed_<seed>/official_validation/` chứa predictions, metric JSON và
 confusion matrix CSV theo epoch. Kết quả ensemble cuối nằm trong
 `official_validation_metrics.json` và `official_validation_predictions.csv`.
@@ -277,7 +296,8 @@ Có thể đặt thư mục bằng biến môi trường:
 %env HASTIKA_CHECKPOINT_DIR=/kaggle/working/checkpoints
 ```
 
-Task B hiện bỏ qua OOF và chỉ train năm full-data model, mỗi model đúng 5 epoch.
+Task B train năm model selection trước, sau đó train năm full-data model theo
+best epoch riêng; năm lượt selection đều giữ nguyên original fold 5 làm holdout.
 
 ## Artifacts
 
@@ -285,13 +305,18 @@ Task B tạo các artifact chính:
 
 ```text
 outputs/task_b_lora/seed_42/full_data_training_history.json
+outputs/task_b_lora/seed_42/selection_training_history.json
+outputs/task_b_lora/seed_42/validation_predictions.csv
 outputs/task_b_lora/seed_42/predictions.csv
 outputs/task_b_lora/seed_52/...
+outputs/task_b_lora/seed_selection_results.csv
+outputs/task_b_lora/seed_selection_summary.json
 outputs/task_b_lora/ensemble_predictions.csv
 outputs/task_b_lora/predictions.csv
 outputs/task_b_lora/task_b_submission.zip
 outputs/task_b_lora/run_summary.json
 checkpoints/task_b_lora/seed_42/final_full_data_adapter/
+checkpoints/task_b_lora/seed_42/best_holdout_adapter/
 checkpoints/task_b_lora/seed_52/...
 checkpoints/task_b_lora/metrics.json
 ```
