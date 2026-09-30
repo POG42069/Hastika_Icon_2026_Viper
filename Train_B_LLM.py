@@ -1,4 +1,4 @@
-"""Retrain five Task B LoRA models for five fixed epochs and ensemble."""
+"""Train Task B on original raw + English comments for five epochs per seed."""
 
 from llm_config import LLM_TRAINING_B, TASK_B_LLM
 from src.llm_training import run_llm_cli

@@ -29,6 +29,7 @@ class TaskBEpochValidationTests(unittest.TestCase):
             {
                 "id": [f"gold-{i}" for i in range(len(TASK_B.labels))],
                 "Comment": [f"comment {i}" for i in range(len(TASK_B.labels))],
+                "Comment_en": [f"English {i}" for i in range(len(TASK_B.labels))],
                 TASK_B.label_column: list(TASK_B.labels),
             }
         )

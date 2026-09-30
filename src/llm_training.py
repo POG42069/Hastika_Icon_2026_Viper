@@ -869,11 +869,7 @@ def _run_seed_ensemble(
         best_epoch = int(summary["best_epoch"])
         full_train_indices = result["full_train_indices"]
         full_train_frame = frame.iloc[full_train_indices]
-        full_train_data = CompletionDataset(
-            full_train_frame["text"].tolist(),
-            encoder,
-            full_train_frame["label_id"].tolist(),
-        )
+        full_train_data = CompletionDataset.from_frame(full_train_frame, encoder)
         seed_output_dir = result["seed_output_dir"]
         seed_checkpoint_dir = result["seed_checkpoint_dir"]
         final_adapter_dir = seed_checkpoint_dir / "final_full_data_adapter"
@@ -1333,21 +1329,22 @@ def public_validation_metrics(metrics: dict) -> dict:
 class TaskBValidationMonitor:
     """Report external validation every epoch without affecting epoch selection."""
 
-    def __init__(self, task, config, runtime, training_frame, encoder, collator):
+    def __init__(
+        self, task, config, runtime, training_frame, encoder, collator,
+        prediction_frame=None,
+    ):
         self.task = task
         self.config = config
         self.runtime = runtime
         self.collator = collator
-        self.frame = load_epoch_validation_frame(task)
+        self.frame = load_epoch_validation_frame(task, prediction_frame)
         overlap = set(training_frame["id"]) & set(self.frame["id"])
         if overlap:
             raise ValueError(
                 "Official validation IDs must not occur in training data: "
                 f"{sorted(overlap)[:10]}"
             )
-        self.data = CompletionDataset(
-            self.frame["text"].tolist(), encoder, self.frame["label_id"].tolist()
-        )
+        self.data = CompletionDataset.from_frame(self.frame, encoder)
         path = resolve_data_file(task.epoch_validation_filename)
         self.summary = {
             "filename": task.epoch_validation_filename,
@@ -1451,12 +1448,10 @@ def _run_fixed_epoch_full_retrain_ensemble(
         raise ValueError("Fixed Task B training requires class-weighted loss.")
 
     validation_monitor = TaskBValidationMonitor(
-        task, config, runtime, frame, encoder, collator
+        task, config, runtime, frame, encoder, collator, prediction_frame
     )
 
-    full_train_data = CompletionDataset(
-        frame["text"].tolist(), encoder, frame["label_id"].tolist()
-    )
+    full_train_data = CompletionDataset.from_frame(frame, encoder)
     full_class_weights, full_class_weight_summary = _class_weight_state(
         task, frame["label_id"].to_numpy()
     )
@@ -1705,6 +1700,12 @@ def _run_fixed_epoch_full_retrain_ensemble(
                 "training_config": asdict(config),
                 "parameters": parameter_counts,
                 "system_prompt": encoder.system_text,
+                "prompt_input": {
+                    "raw_column": "Comment",
+                    "translation_column": task.translation_column,
+                    "use_augmentation": task.use_augmentation,
+                    "truncation": "share content budget between raw and English; preserve chat and labels",
+                },
                 "label_order": list(task.labels),
                 "completion_token_ids": encoder.completions,
                 "completion_token_diagnostics": token_diagnostics,
@@ -1795,16 +1796,8 @@ def _run_oof_full_retrain_ensemble(
         )
         train_frame = frame.iloc[train_indices]
         validation_frame = frame.iloc[validation_indices]
-        train_data = CompletionDataset(
-            train_frame["text"].tolist(),
-            encoder,
-            train_frame["label_id"].tolist(),
-        )
-        validation_data = CompletionDataset(
-            validation_frame["text"].tolist(),
-            encoder,
-            validation_frame["label_id"].tolist(),
-        )
+        train_data = CompletionDataset.from_frame(train_frame, encoder)
+        validation_data = CompletionDataset.from_frame(validation_frame, encoder)
         class_weights, class_weight_summary = _class_weight_state(
             task, train_frame["label_id"].to_numpy()
         )
@@ -2063,9 +2056,7 @@ def _run_oof_full_retrain_ensemble(
         runtime,
     )
 
-    full_train_data = CompletionDataset(
-        frame["text"].tolist(), encoder, frame["label_id"].tolist()
-    )
+    full_train_data = CompletionDataset.from_frame(frame, encoder)
     full_class_weights, full_class_weight_summary = _class_weight_state(
         task, frame["label_id"].to_numpy()
     )
@@ -2377,6 +2368,13 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         for name, data in (("train", frame), ("development", prediction_frame)):
             if data.empty:
                 raise ValueError(f"{name} input must contain at least one row.")
+        if task.translation_column:
+            log(
+                f"Task B inputs | original-only={not task.use_augmentation} "
+                f"| train={len(frame)} | development={len(prediction_frame)} "
+                f"| prompt=raw Comment + English {task.translation_column}",
+                runtime,
+            )
         if task.fixed_full_retrain_epochs is not None:
             base_train_indices = val_indices = None
             split_strategy = "fixed_epoch_full_data"
@@ -2424,7 +2422,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         encoder = ChatEncoder(tokenizer, task, config.max_length)
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
-        prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
+        prediction_data = CompletionDataset.from_frame(prediction_frame, encoder, labeled=False)
         collator = CompletionCollator(tokenizer.pad_token_id)
 
         output_dir = OUTPUT_ROOT / task.output_subdir
@@ -2471,9 +2469,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             return
 
         val_frame = frame.iloc[val_indices]
-        val_data = CompletionDataset(
-            val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
-        )
+        val_data = CompletionDataset.from_frame(val_frame, encoder)
 
         seed_results = []
         resolved_revision = None
@@ -2495,11 +2491,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 assume_unique=True,
             )
             train_frame = frame.iloc[train_indices]
-            selection_train_data = CompletionDataset(
-                train_frame["text"].tolist(),
-                encoder,
-                train_frame["label_id"].tolist(),
-            )
+            selection_train_data = CompletionDataset.from_frame(train_frame, encoder)
             multiple_seeds = len(selection_seeds) > 1
             seed_output_dir = (
                 output_dir / f"seed_{selection_seed}"
@@ -2787,11 +2779,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         full_train_indices = winner["full_train_indices"]
         train_frame = winner["train_frame"]
         full_train_frame = frame.iloc[full_train_indices]
-        full_train_data = CompletionDataset(
-            full_train_frame["text"].tolist(),
-            encoder,
-            full_train_frame["label_id"].tolist(),
-        )
+        full_train_data = CompletionDataset.from_frame(full_train_frame, encoder)
 
         def export_winner_artifacts():
             write_split_manifest(

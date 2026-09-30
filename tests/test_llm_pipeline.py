@@ -163,7 +163,10 @@ class LLMTests(unittest.TestCase):
             self.assertEqual(task.label_codes, task.labels)
             self.assertIn("Allowed labels: " + "; ".join(task.labels), encoder.system_text)
             self.assertNotIn("Code mapping", encoder.system_text)
-            prompt, truncated = encoder.encode_prompt("long comment " * 300)
+            prompt, truncated = encoder.encode_prompt(
+                "long comment " * 300,
+                "long translation " * 300 if task.translation_column else None,
+            )
             self.assertTrue(truncated)
             for label_id, code in enumerate(task.label_codes):
                 feature = encoder.feature(prompt, label_id)
@@ -333,7 +336,10 @@ class LLMTests(unittest.TestCase):
         model = tiny_model().eval()
         diagnostic_task = replace(TASK_B, report_per_class_metrics=True)
         encoder = ChatEncoder(self.tokenizer, diagnostic_task, 512)
-        data = CompletionDataset(["a", "some other text", "xyz"], encoder, [0, 1, 5])
+        data = CompletionDataset(
+            ["a", "some other text", "xyz"], encoder, [0, 1, 5],
+            translations=["one", "other English", "three"],
+        )
         before = {name: p.detach().clone() for name, p in model.named_parameters()}
         scores = score_candidates(
             model, data, self.collator, self.config, cpu_runtime(), "test"
@@ -403,7 +409,10 @@ class LLMTests(unittest.TestCase):
 
     def test_completion_token_counts_are_reported_and_constant_per_label(self):
         encoder = ChatEncoder(self.tokenizer, TASK_B, 512)
-        data = CompletionDataset(["short", "a different comment"], encoder)
+        data = CompletionDataset(
+            ["short", "a different comment"], encoder,
+            translations=["short English", "different English"],
+        )
         result = score_candidates(
             tiny_model().eval(),
             data,
@@ -816,6 +825,9 @@ class LLMTests(unittest.TestCase):
                         "Comment": [
                             f"original comment {fold}-{i}" for i in range(rows_per_fold)
                         ],
+                        "Comment_en": [
+                            f"translated original {fold}-{i}" for i in range(rows_per_fold)
+                        ],
                         task.label_column: original_labels,
                     }
                 )
@@ -834,20 +846,22 @@ class LLMTests(unittest.TestCase):
                     }
                 )
                 original.to_csv(root / original_name, index=False)
-                augment.to_csv(root / augment_name, index=False)
+                # Deliberately unreadable: original-only training must not touch it.
+                (root / augment_name).write_text("invalid augmentation CSV", encoding="utf-8")
 
             prediction_frame = pd.DataFrame(
                 {
                     "id": ["0100", "0101", "0102"],
                     "Comment": ["one", "two", "three"],
+                    "Comment_en": ["English one", "English two", "English three"],
                 }
             )
             prediction_frame.to_csv(root / task.prediction_filename, index=False)
             gold_frame = pd.DataFrame(
                 {
-                    "id": [f"gold-{i}" for i in range(len(task.labels))],
-                    "Comment": [f"gold comment {i}" for i in range(len(task.labels))],
-                    task.label_column: list(task.labels),
+                    "id": prediction_frame["id"],
+                    "Comment": prediction_frame["Comment"],
+                    task.label_column: list(task.labels[:len(prediction_frame)]),
                 }
             )
             gold_frame.to_csv(root / task.epoch_validation_filename, index=False)
@@ -871,6 +885,7 @@ class LLMTests(unittest.TestCase):
                 train_calls.append(
                     {
                         "rows": len(args[1].dataset),
+                        "prompt": self.tokenizer.decode(args[1].dataset.prompts[0]),
                         "class_weights": kwargs.get("class_weights"),
                     }
                 )
@@ -979,9 +994,17 @@ class LLMTests(unittest.TestCase):
             self.assertEqual(len(loaded_models), len(retrain_seeds))
             self.assertEqual(
                 [call["rows"] for call in train_calls],
-                [rows_per_fold * 5 + len(task.labels) * 5]
+                [rows_per_fold * 5]
                 * (len(retrain_seeds) * task.fixed_full_retrain_epochs),
             )
+            self.assertTrue(all(
+                "original comment 1-0" in call["prompt"]
+                and "English translation:\ntranslated original 1-0" in call["prompt"]
+                for call in train_calls
+            ))
+            self.assertEqual(summary["prompt_input"]["translation_column"], "Comment_en")
+            self.assertFalse(summary["prompt_input"]["use_augmentation"])
+            self.assertFalse(any(name.startswith("augment") for name in summary["input_sha256"]))
             self.assertTrue(
                 all(call["class_weights"] is not None for call in train_calls)
             )

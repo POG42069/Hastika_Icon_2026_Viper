@@ -31,6 +31,7 @@ class TaskConfig:
     original_fold_filenames: tuple[str, ...] = ()
     augmentation_fold_filenames: tuple[str, ...] = ()
     use_augmentation: bool = True
+    translation_column: str | None = None
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
@@ -147,7 +148,8 @@ TASK_B = TaskConfig(
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
-    use_augmentation=True,
+    use_augmentation=False,
+    translation_column="Comment_en",
     selection_validation_fold=None,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),

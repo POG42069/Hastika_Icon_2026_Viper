@@ -60,7 +60,7 @@ class ChatEncoder:
         self.task = task
         self.max_length = max_length
         self.system_text = system_prompt(task)
-        empty_messages = self.messages("")
+        empty_messages = self.messages("", "" if task.translation_column else None)
         empty_prompt = self._template(empty_messages, generation=True)
         if len(task.labels) != len(task.label_codes):
             raise ValueError("labels and label_codes must have the same length")
@@ -85,10 +85,21 @@ class ChatEncoder:
                 "max_length is too small for the instructions and complete labels."
             )
 
-    def messages(self, text: str) -> list[dict[str, str]]:
+    def messages(
+        self, text: str, translation: str | None = None,
+    ) -> list[dict[str, str]]:
+        if self.task.translation_column:
+            if translation is None:
+                raise ValueError("Task B requires an English translation alongside the raw comment.")
+            content = (
+                "Comment (raw code-mixed):\n" + text
+                + "\n\nEnglish translation:\n" + translation
+            )
+        else:
+            content = "Comment:\n" + text
         return [
             {"role": "system", "content": self.system_text},
-            {"role": "user", "content": "Comment:\n" + text},
+            {"role": "user", "content": content},
         ]
 
     def _template(self, messages: list[dict[str, str]], generation: bool) -> list[int]:
@@ -98,7 +109,11 @@ class ChatEncoder:
             )
         )
 
-    def encode_prompt(self, text: str) -> tuple[list[int], bool]:
+    def encode_prompt(
+        self, text: str, translation: str | None = None,
+    ) -> tuple[list[int], bool]:
+        if self.task.translation_column:
+            return self._encode_bilingual_prompt(text, translation)
         prompt = self._template(self.messages(text), generation=True)
         if len(prompt) + self.response_reserve <= self.max_length:
             return prompt, False
@@ -111,6 +126,42 @@ class ChatEncoder:
             text = self.tokenizer.decode(comment_ids, skip_special_tokens=False)
             prompt = self._template(self.messages(text), generation=True)
         return prompt, True
+
+    def _encode_bilingual_prompt(
+        self, text: str, translation: str | None,
+    ) -> tuple[list[int], bool]:
+        prompt = self._template(self.messages(text, translation), generation=True)
+        if len(prompt) + self.response_reserve <= self.max_length:
+            return prompt, False
+        raw_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        english_ids = self.tokenizer.encode(translation, add_special_tokens=False)
+        scaffold = self._template(self.messages("", ""), generation=True)
+        budget = self.max_length - self.response_reserve - len(scaffold)
+        minimum = [int(bool(raw_ids)), int(bool(english_ids))]
+        if budget < sum(minimum):
+            raise ValueError("max_length is too small to retain raw and English text.")
+        # Share the available content budget; short fields give unused tokens
+        # to the other field. Never sacrifice English entirely to a long raw text.
+        raw_limit = min(len(raw_ids), max(minimum[0], budget // 2))
+        english_limit = min(len(english_ids), budget - raw_limit)
+        raw_limit = min(len(raw_ids), budget - english_limit)
+        parts = [raw_ids[:raw_limit], english_ids[:english_limit]]
+        while True:
+            raw, english = (
+                self.tokenizer.decode(ids, skip_special_tokens=False) for ids in parts
+            )
+            prompt = self._template(self.messages(raw, english), generation=True)
+            overflow = len(prompt) + self.response_reserve - self.max_length
+            if overflow <= 0:
+                return prompt, True
+            # Re-render because decoding can change token boundaries. Remove
+            # from the longer field while retaining at least one token per field.
+            removable = [len(ids) - keep for ids, keep in zip(parts, minimum)]
+            if max(removable) <= 0:
+                raise ValueError("max_length cannot fit the bilingual prompt and complete label.")
+            index = max(range(2), key=lambda i: removable[i])
+            remove = min(removable[index], max(1, overflow))
+            parts[index] = parts[index][:-remove]
 
     def feature(self, prompt: Sequence[int], label_id: int) -> dict[str, list[int]]:
         response = self.completions[label_id]
@@ -128,14 +179,32 @@ class CompletionDataset(Dataset):
         texts: Sequence[str],
         encoder: ChatEncoder,
         labels: Sequence[int] | None = None,
+        *,
+        translations: Sequence[str] | None = None,
     ) -> None:
         self.encoder = encoder
         self.labels = None if labels is None else list(labels)
         if self.labels is not None and len(texts) != len(self.labels):
             raise ValueError("texts and labels must have the same length")
-        encoded = [encoder.encode_prompt(text) for text in texts]
+        if encoder.task.translation_column and translations is None:
+            raise ValueError("English translations are required for this task.")
+        if translations is not None and len(texts) != len(translations):
+            raise ValueError("texts and translations must have the same length")
+        encoded = [
+            encoder.encode_prompt(text, None if translations is None else translations[index])
+            for index, text in enumerate(texts)
+        ]
         self.prompts = [item[0] for item in encoded]
         self.truncated_count = sum(item[1] for item in encoded)
+
+    @classmethod
+    def from_frame(cls, frame, encoder: ChatEncoder, *, labeled: bool = True):
+        """Build train and inference prompts from the same normalized fields."""
+        return cls(
+            frame["text"].tolist(), encoder,
+            frame["label_id"].tolist() if labeled else None,
+            translations=frame["text_en"].tolist() if encoder.task.translation_column else None,
+        )
 
     def __len__(self) -> int:
         return len(self.prompts)

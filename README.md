@@ -1,5 +1,9 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
+Trên `Khangtest`, Task B train **original-only** và đưa cả comment raw
+code-mixed lẫn bản dịch tiếng Anh `Comment_en` vào cùng prompt plain text.
+Backbone vẫn là `Qwen/Qwen2.5-3B-Instruct`. Task A giữ nguyên pipeline hiện có.
+
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
 
 - Task A: phát hiện `Non-Hate` / `Hate`.
@@ -31,13 +35,16 @@ Task B không còn downsample Gender và không loại bất kỳ câu train nà
 1. Tạm bỏ toàn bộ giai đoạn five-fold OOF và không chọn global best epoch.
 2. Đặt số epoch full-data cố định bằng `5` cho thí nghiệm phương sai.
 3. Khởi tạo mới năm model với seed `42, 52, 62, 72, 82`. Mỗi model train trên
-   toàn bộ `original_1..5 + augment1..5` trong đúng năm epoch.
+   toàn bộ `original_1..5` trong đúng năm epoch. Các file `augment1..5` không
+   được đọc, không audit và không tham gia tính class weight.
 4. Mỗi model trả xác suất cho sáu nhãn. Pipeline lấy trung bình xác suất của
    năm model với trọng số bằng nhau rồi lấy nhãn có xác suất trung bình cao
    nhất. Đây là soft ensemble, không phải hard voting.
 
 Class-weighted loss vẫn được áp dụng cho cả năm model. Mỗi model được khởi tạo
 mới để mọi hàng dữ liệu được học đúng năm epoch như nhau.
+Prompt raw + English được áp dụng nhất quán ở train, validation mỗi epoch
+và development prediction. Nhãn gold chỉ dùng cho loss hoặc tính metric.
 
 ## Class-weighted loss của Task B
 
@@ -61,22 +68,23 @@ Trong đó `N` là tổng số mẫu train, `K=6`, và `n_c` là số mẫu củ
 ngăn class hiếm chi phối gradient. Bước chuẩn hóa giữ mean sample weight bằng
 1, nên độ lớn loss và learning rate gần với pipeline cũ.
 
-Trong thí nghiệm fixed epoch hiện tại, weights được tính từ toàn bộ 10 file
+Trong thí nghiệm fixed epoch hiện tại, weights được tính từ năm file original
 trước khi train năm full-data model.
 
 Với dữ liệu Task B hiện tại:
 
 | Label | Số mẫu | Full-data weight |
 |---|---:|---:|
-| Gender | 1362 | 0.7542 |
-| Political | 558 | 1.1195 |
-| Religion | 559 | 1.1185 |
-| Geo-political | 553 | 1.1246 |
-| Violence | 559 | 1.1185 |
-| Others | 558 | 1.1195 |
+| Gender | 1362 | 0.7623 |
+| Political | 558 | 0.9866 |
+| Religion | 382 | 1.1924 |
+| Geo-political | 184 | 1.5245 |
+| Violence | 221 | 1.5245 |
+| Others | 448 | 1.1011 |
 
-Tổng cộng có 4149 mẫu. Gender vẫn xuất hiện đủ 1362 câu, nhưng mỗi câu tác
-động lên gradient nhẹ hơn. Các class còn lại được tăng khoảng 12%.
+Tổng cộng có 3155 mẫu original. Gender vẫn xuất hiện đủ 1362 câu; không
+downsample. Công thức weighting giữ nguyên, chỉ tính lại trên original-only.
+Khoảng clip áp dụng trước chuẩn hóa nên weight cuối có thể lớn hơn 1.50.
 
 ## Light text normalization
 
@@ -90,7 +98,10 @@ tokenizer:
 - Không xóa stopword, không lemmatize và không chuẩn hóa ký tự/từ lặp.
 
 Khi comment quá dài, `ChatEncoder` chỉ cắt phần comment để system prompt và
-assistant label vẫn nằm trong `max_length`.
+assistant label vẫn nằm trong `max_length`. Với Task B, phần token còn lại
+được chia cho raw và English; phần ngắn nhường token thừa cho phần dài.
+Nếu phải cắt, giữ đầu của cả hai phần, các tiêu đề và toàn bộ assistant label.
+`max_length` vẫn là 256; việc thêm bản dịch không tự tăng giới hạn này.
 
 ## Cấu hình LoRA mặc định
 
@@ -143,17 +154,28 @@ Task B:
 
 ```text
 original_1.csv ... original_5.csv
-augment1.csv ... augment5.csv
 multiclass_validation_inputs.csv
 hastika_multiclass_validation.csv
 ```
 
-Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Development
-CSV cần `id`, `Comment`. Các file augment cần thêm `source_id`,
+Task A: train CSV cần `id`, `Comment`, `Label`; development cần `id`, `Comment`.
+Các file augment Task A cần thêm `source_id`,
 `source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn cùng fold,
 nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
 
-`augmentation_audit.csv` đánh dấu câu quá ngắn, trùng lặp, quá khác câu
+Task B: dùng năm original và development từ `enhanced_hastika_augment_translate.zip`.
+Original cần `id`, `Comment`, `Comment_en`, `Hate Category`; development cần
+`id`, `Comment`, `Comment_en`. Thiếu cột hoặc bản dịch trống sẽ báo lỗi,
+không tự dịch và không bỏ qua English. Các file augment có thể vẫn nằm trong
+dataset nhưng Task B không đọc chúng.
+
+`hastika_multiclass_validation.csv` vẫn là file gold để báo cáo metric, không
+tham gia train. File này không bắt buộc có `Comment_en`: loader ghép bản dịch
+từ development theo ID và kiểm tra comment raw khớp sau chuẩn hóa nhẹ. ID
+thiếu, raw không khớp hoặc bản dịch có sẵn khác development sẽ báo lỗi.
+Thứ tự file gold được giữ nguyên khi ghép.
+
+`augmentation_audit.csv` của Task A đánh dấu câu quá ngắn, trùng lặp, quá khác câu
 nguồn hoặc gần giống original khác. Cấu hình
 `augmentation_audit_action="report"` chỉ báo cáo; các câu bị đánh dấu vẫn
 được train.
@@ -174,6 +196,21 @@ Assistant: Non-Hate hoặc Hate
 Task B cũng dùng trực tiếp sáu tên nhãn chính thức làm assistant response:
 `Gender`, `Political`, `Religion`, `Geo-political`, `Violence`, `Others`.
 Prompt liệt kê các nhãn hợp lệ; file submission giữ nguyên tên nhãn chính thức.
+
+User prompt Task B (plain text, không mã hóa A–F):
+
+```text
+Comment (raw code-mixed):
+<normalized Comment>
+
+English translation:
+<normalized Comment_en>
+```
+
+Nội dung system prompt và cách chấm likelihood của nhãn giữ nguyên. Không
+đưa nhãn gold hoặc ghi chú trong `translation_audit.csv` vào user prompt.
+`run_summary.json` ghi thêm `prompt_input` để xác nhận cột raw, cột dịch,
+augmentation đã tắt và cách truncate.
 
 Code gọi `apply_chat_template`. Prompt và padding được mask bằng `-100`;
 loss chỉ áp dụng cho token của assistant label và token kết thúc chat. Khi dự
