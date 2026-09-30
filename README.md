@@ -16,10 +16,9 @@ trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Cả hai task dùng predefined folds để giữ câu nguồn và augment cùng một fold.
-   Task A dùng `binary_original_1..4 + binary_augment1..4` để train và chỉ
-   `binary_original_5` để validation. Task B dùng
-   `original_1..4 + augment1..4` để train và `original_5` để validation.
+1. Cả hai task chỉ dùng dữ liệu original. Task A train trên
+   `binary_original_1_4.csv` và validate trên `binary_original_5.csv`.
+   Task B train trên `original_1_4.csv` và validate trên `original_5.csv`.
 2. Task A và Task B đều chạy 5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
    và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
    thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
@@ -105,45 +104,24 @@ hoặc một Kaggle Dataset dưới `/kaggle/input`.
 Task A:
 
 ```text
-binary_original_1.csv ... binary_original_5.csv
-binary_augment1.csv ... binary_augment5.csv
+binary_original_1_4.csv
+binary_original_5.csv
 binary_validation_inputs.csv
 ```
 
 Task B:
 
 ```text
-original_1.csv ... original_5.csv
-augment1.csv ... augment5.csv
+original_1_4.csv
+original_5.csv
 multiclass_validation_inputs.csv
 ```
 
 Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Development CSV
-cần `id`, `Comment`. Các file `augment*.csv` cần thêm `source_id`,
-`source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn nằm cùng fold,
-nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
-
-Tạo lại dữ liệu Task A cân bằng từ bộ dữ liệu đã làm sạch:
-
-```bash
-python scripts/build_task_a_balanced_data.py \
-  --input-dir ../hastika_regenerated_augments \
-  --output-dir ../task_a_balanced
-```
-
-Script không sửa dữ liệu nguồn. Nó audit Hate augment, khôi phục các câu nguồn
-Task B còn thiếu trong binary data, gán fold có seed cố định, sinh Non-Hate
-variants bảo thủ, tạo hàng chờ human review và xuất các fold Task A. Đặt
-`HASTIKA_DATA_DIR` trỏ tới thư mục output trước khi train.
-
-Chạy sanity check nhẹ trước khi dùng GPU:
-
-```bash
-python scripts/evaluate_task_a_data_sanity.py --data-dir ../task_a_balanced
-```
-
-Đây chỉ là kiểm tra hồi quy dữ liệu bằng character n-gram Naive Bayes. Quyết
-định cuối cùng vẫn dựa trên LoRA experiment với original-only fold 5.
+cần `id`, `Comment`. Loader ưu tiên cặp file gộp và fold 5 khi cả hai có mặt.
+Nếu chỉ có bộ file original theo 5 fold cũ, loader vẫn đọc được và không nạp
+augmentation cho cả hai task. File train gộp không cần cột `fold`: loader tự
+gán nhóm train và nhóm validation trong bộ nhớ.
 
 ## Chạy trên Kaggle
 

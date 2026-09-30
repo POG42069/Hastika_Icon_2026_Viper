@@ -29,6 +29,8 @@ class TaskConfig:
     checkpoint_subdir: str
     output_subdir: str
     submission_zip_name: str
+    compact_train_filename: str | None = None
+    compact_validation_filename: str | None = None
     original_fold_filenames: tuple[str, ...] = ()
     augmentation_fold_filenames: tuple[str, ...] = ()
     use_augmentation: bool = True
@@ -104,6 +106,8 @@ TASK_A = TaskConfig(
     checkpoint_subdir="task_a_sarvam1_lora",
     output_subdir="task_a_sarvam1_lora",
     submission_zip_name="task_a_submission.zip",
+    compact_train_filename="binary_original_1_4.csv",
+    compact_validation_filename="binary_original_5.csv",
     original_fold_filenames=tuple(
         f"binary_original_{fold}.csv" for fold in range(1, 6)
     ),
@@ -143,9 +147,11 @@ TASK_B = TaskConfig(
     checkpoint_subdir="task_b_sarvam1_lora",
     output_subdir="task_b_sarvam1_lora",
     submission_zip_name="task_b_submission.zip",
+    compact_train_filename="original_1_4.csv",
+    compact_validation_filename="original_5.csv",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
-    use_augmentation=True,
+    use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_train_label_caps=(("Gender", 870),),

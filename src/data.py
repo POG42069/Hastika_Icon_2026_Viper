@@ -334,12 +334,58 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
     return pd.concat([originals, all_augments], ignore_index=True, sort=False)
 
 
+def _compact_original_paths(task: TaskConfig) -> tuple[Path, Path] | None:
+    """Find the two-file original-only layout when both files are available."""
+
+    if not task.compact_train_filename or not task.compact_validation_filename:
+        return None
+    try:
+        train_path = resolve_data_file(task.compact_train_filename)
+        validation_path = resolve_data_file(task.compact_validation_filename)
+    except FileNotFoundError:
+        return None
+    if not train_path.is_file() or not validation_path.is_file():
+        return None
+    if train_path.parent != validation_path.parent:
+        raise ValueError("Compact train and validation files must share one directory.")
+    return train_path, validation_path
+
+
+def labeled_input_filenames(task: TaskConfig) -> tuple[str, ...]:
+    """List labeled inputs actually used, including the compact layout."""
+
+    if _compact_original_paths(task) is not None:
+        assert task.compact_train_filename and task.compact_validation_filename
+        return task.compact_train_filename, task.compact_validation_filename
+    return task.labeled_filenames()
+
+
+def _load_compact_originals(task: TaskConfig, paths: tuple[Path, Path]) -> pd.DataFrame:
+    if task.selection_validation_fold is None:
+        raise ValueError("Compact originals require a predefined validation fold.")
+    frames = []
+    for path, fold in zip(paths, (0, task.selection_validation_fold), strict=True):
+        frame = _read_csv(path)
+        _validate_columns(frame, path, {"id", "Comment", task.label_column})
+        frame = frame.copy()
+        # The merged file has no per-source fold column. Zero means the combined
+        # training group; the untouched holdout keeps its configured fold number.
+        frame["fold"] = fold
+        frame["data_origin"] = "original"
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
 def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load, validate, and normalize train/development CSVs consistently."""
 
     prediction_path = resolve_data_file(task.prediction_filename)
     prediction_df = _read_csv(prediction_path)
-    if task.original_fold_filenames:
+    compact_paths = _compact_original_paths(task)
+    if compact_paths is not None:
+        train_df = _load_compact_originals(task, compact_paths)
+        train_description = "merged original training file and original holdout"
+    elif task.original_fold_filenames:
         train_df = _load_predefined_folds(task)
         train_description = (
             "predefined original and augmentation folds"
