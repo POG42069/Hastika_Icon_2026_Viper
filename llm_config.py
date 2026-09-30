@@ -43,6 +43,7 @@ class TaskConfig:
     class_weight_min: float = 0.75
     class_weight_max: float = 1.50
     report_per_class_metrics: bool = False
+    epoch_validation_filename: str | None = None
     enable_augmentation_audit: bool = True
     augmentation_audit_action: str = "report"
     augmentation_near_duplicate_threshold: float = 0.92
@@ -158,7 +159,8 @@ TASK_B = TaskConfig(
     class_weight_power=0.50,
     class_weight_min=0.75,
     class_weight_max=1.50,
-    report_per_class_metrics=False,
+    report_per_class_metrics=True,
+    epoch_validation_filename="hastika_multiclass_validation.csv",
     enable_augmentation_audit=True,
     augmentation_audit_action="report",
 )

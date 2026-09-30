@@ -145,6 +145,7 @@ Task B:
 original_1.csv ... original_5.csv
 augment1.csv ... augment5.csv
 multiclass_validation_inputs.csv
+hastika_multiclass_validation.csv
 ```
 
 Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Development
@@ -203,6 +204,33 @@ Có thể đổi tham số qua CLI:
 Số epoch của thí nghiệm Task B hiện được khóa bằng
 `TASK_B.fixed_full_retrain_epochs=5`; tùy chọn `--max-epochs` không thay đổi
 giá trị cố định này.
+
+### Log validation sau mỗi epoch của Task B
+
+Thêm file gold `hastika_multiclass_validation.csv` của BTC vào Kaggle Dataset
+hoặc `data/`. File cần các cột `id`, `Comment`, `Hate Category` và có 395 câu.
+Pipeline đọc file này độc lập với input dùng để tạo submission, nên vẫn có
+thể dùng `--prediction-file` để dự đoán test không nhãn.
+
+Sau mỗi epoch của từng seed, Task B đánh giá trên gold validation và in:
+
+- Seed, epoch, validation loss, Macro-F1 và accuracy.
+- Confusion matrix dạng text: hàng là nhãn thật, cột là nhãn dự đoán.
+- Precision, recall, F1, support và số câu nhầm vào/ra từng class.
+
+Các metric chỉ để theo dõi. Pipeline vẫn train đủ 5 epoch, không early stop
+hoặc chọn checkpoint bằng gold validation. Validation không được ghép vào
+train; ID trùng với train sẽ gây lỗi. Trạng thái RNG được giữ lại khi chấm
+để bước đánh giá không làm thay đổi random của epoch train tiếp theo.
+
+Khi cả năm model hoàn tất, code cũng in metric của soft ensemble trên cùng
+gold validation. Metric này dùng để so sánh hai nhánh có/không augment.
+Task A giữ nguyên pipeline và cách log hiện tại.
+
+Metric mỗi epoch được lưu trong `seed_<seed>/full_data_training_history.json`.
+Thư mục `seed_<seed>/official_validation/` chứa predictions, metric JSON và
+confusion matrix CSV theo epoch. Kết quả ensemble cuối nằm trong
+`official_validation_metrics.json` và `official_validation_predictions.csv`.
 
 Có thể đặt thư mục bằng biến môi trường:
 

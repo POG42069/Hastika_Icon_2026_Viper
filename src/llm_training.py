@@ -43,7 +43,7 @@ from llm_config import (
     LLMTrainingConfig,
     TaskConfig,
 )
-from src.data import load_task_frames, resolve_data_file
+from src.data import load_epoch_validation_frame, load_task_frames, resolve_data_file
 from src.distributed import (
     RuntimeContext,
     cleanup_runtime,
@@ -1284,6 +1284,142 @@ def _write_prediction_diagnostics(
     )
 
 
+def format_confusion_matrix(metrics: dict) -> list[str]:
+    """Render actual-label rows and predicted-label columns in Kaggle text logs."""
+
+    confusion = metrics["confusion_matrix"]
+    labels = confusion["label_order"]
+    matrix = np.asarray(confusion["values"], dtype=np.int64)
+    if matrix.shape != (len(labels), len(labels)):
+        raise ValueError("Confusion matrix shape does not match its label order.")
+    width = max(len("actual / predicted"), *(len(label) for label in labels)) + 2
+    lines = [
+        "Confusion matrix | rows=actual labels | columns=predicted labels",
+        "actual / predicted".ljust(width)
+        + "".join(label.rjust(width) for label in labels),
+    ]
+    lines.extend(
+        label.ljust(width) + "".join(str(int(value)).rjust(width) for value in row)
+        for label, row in zip(labels, matrix, strict=True)
+    )
+    return lines
+
+
+def log_classification_metrics(metrics: dict, heading: str, runtime: RuntimeContext) -> None:
+    """Print aggregate metrics, class metrics and both directions of confusion."""
+
+    log(
+        f"{heading}: val_loss={metrics['loss']:.5f}, "
+        f"macro_f1={metrics['macro_f1']:.5f}, accuracy={metrics['accuracy']:.5f}",
+        runtime,
+    )
+    for line in format_confusion_matrix(metrics) + format_per_class_diagnostics(metrics):
+        log(line, runtime)
+
+
+def public_validation_metrics(metrics: dict) -> dict:
+    """Exclude per-example score arrays from JSON training history."""
+
+    return {
+        key: metrics[key]
+        for key in (
+            "loss", "macro_f1", "accuracy", "per_class_f1", "per_class",
+            "confusion_matrix",
+        )
+        if key in metrics
+    }
+
+
+class TaskBValidationMonitor:
+    """Report external validation every epoch without affecting epoch selection."""
+
+    def __init__(self, task, config, runtime, training_frame, encoder, collator):
+        self.task = task
+        self.config = config
+        self.runtime = runtime
+        self.collator = collator
+        self.frame = load_epoch_validation_frame(task)
+        overlap = set(training_frame["id"]) & set(self.frame["id"])
+        if overlap:
+            raise ValueError(
+                "Official validation IDs must not occur in training data: "
+                f"{sorted(overlap)[:10]}"
+            )
+        self.data = CompletionDataset(
+            self.frame["text"].tolist(), encoder, self.frame["label_id"].tolist()
+        )
+        path = resolve_data_file(task.epoch_validation_filename)
+        self.summary = {
+            "filename": task.epoch_validation_filename,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "rows": len(self.frame),
+            "label_distribution": self.frame[task.label_column].value_counts().to_dict(),
+            "truncated_comments": self.data.truncated_count,
+            "purpose": "reporting only; never used for training or epoch selection",
+        }
+        log(
+            f"Task B per-epoch validation | file={task.epoch_validation_filename} "
+            f"| rows={len(self.data)} | reporting only",
+            runtime,
+        )
+
+    def evaluate(self, model, seed: int, epoch: int, output_dir: Path) -> dict:
+        heading = f"Official validation | seed={seed} | epoch={epoch}"
+        devices = (
+            [self.runtime.device.index] if self.runtime.device.type == "cuda" else []
+        )
+        was_training = model.training
+        # Diagnostic forwards must not advance the RNG used by subsequent training.
+        try:
+            with torch.random.fork_rng(devices=devices):
+                metrics = score_candidates(
+                    model, self.data, self.collator, self.config, self.runtime, heading
+                )
+        finally:
+            model.train(was_training)
+        log_classification_metrics(metrics, heading, self.runtime)
+
+        def export() -> None:
+            directory = output_dir / "official_validation"
+            directory.mkdir(parents=True, exist_ok=True)
+            write_validation_confusion_matrix(metrics["confusion_matrix"], epoch, directory)
+            _write_prediction_diagnostics(
+                self.frame, self.task, metrics["probabilities"],
+                directory / f"predictions_epoch_{epoch:02d}.csv",
+            )
+            _write_json(
+                directory / f"metrics_epoch_{epoch:02d}.json",
+                {"seed": seed, "epoch": epoch, **public_validation_metrics(metrics)},
+            )
+
+        on_main(export, self.runtime)
+        return metrics
+
+    def evaluate_ensemble(self, results: list[dict], output_dir: Path) -> dict:
+        probabilities = np.mean(
+            np.stack([row["validation_probabilities"] for row in results]), axis=0
+        )
+        # Ensemble loss here is mean gold-answer NLL of the component models.
+        metrics = _classification_metrics(
+            self.task, self.frame["label_id"].to_numpy(), probabilities,
+            float(np.mean([row["validation_loss"] for row in results])),
+        )
+        log_classification_metrics(metrics, "Official validation | FINAL SOFT ENSEMBLE", self.runtime)
+
+        def export() -> None:
+            _write_json(
+                output_dir / "official_validation_metrics.json",
+                {"dataset": self.summary, **public_validation_metrics(metrics)},
+            )
+            _write_prediction_diagnostics(
+                self.frame, self.task, probabilities,
+                output_dir / "official_validation_predictions.csv",
+            )
+
+        on_main(export, self.runtime)
+        return public_validation_metrics(metrics)
+
+
 def _run_fixed_epoch_full_retrain_ensemble(
     *,
     task: TaskConfig,
@@ -1313,6 +1449,10 @@ def _run_fixed_epoch_full_retrain_ensemble(
         raise ValueError("Fixed class-weighted training cannot downsample labels.")
     if task.class_weight_power is None:
         raise ValueError("Fixed Task B training requires class-weighted loss.")
+
+    validation_monitor = TaskBValidationMonitor(
+        task, config, runtime, frame, encoder, collator
+    )
 
     full_train_data = CompletionDataset(
         frame["text"].tolist(), encoder, frame["label_id"].tolist()
@@ -1390,8 +1530,14 @@ def _run_fixed_epoch_full_retrain_ensemble(
                 f"Fixed full-data train seed {seed}",
                 class_weights=full_class_weights,
             )
+            validation_metrics = validation_monitor.evaluate(
+                model, seed, epoch, seed_output_dir
+            )
             full_history.append(
-                {"epoch": epoch, "train_weighted_loss": train_loss}
+                {
+                    "epoch": epoch, "train_weighted_loss": train_loss,
+                    "official_validation": public_validation_metrics(validation_metrics),
+                }
             )
             log(
                 f"Seed {seed} full-data epoch {epoch}/{fixed_epochs}: "
@@ -1406,6 +1552,7 @@ def _run_fixed_epoch_full_retrain_ensemble(
                     {
                         "seed": seed,
                         "epoch_selection": "fixed_without_oof",
+                        "validation_dataset": validation_monitor.summary,
                         "class_weighting": full_class_weight_summary,
                         "epochs": full_history,
                     },
@@ -1455,12 +1602,15 @@ def _run_fixed_epoch_full_retrain_ensemble(
                 "probabilities": probabilities,
                 "label_ids": label_ids,
                 "summary": summary,
+                "validation_probabilities": validation_metrics["probabilities"],
+                "validation_loss": validation_metrics["loss"],
             }
         )
         del model, full_loader
         gc.collect()
         torch.cuda.empty_cache()
 
+    ensemble_validation = validation_monitor.evaluate_ensemble(retrained_results, output_dir)
     stacked_probabilities = np.stack(
         [result["probabilities"] for result in retrained_results], axis=0
     )
@@ -1541,6 +1691,10 @@ def _run_fixed_epoch_full_retrain_ensemble(
                 * config.gradient_accumulation_steps
                 * runtime.world_size,
                 "epoch_selection": epoch_selection,
+                "official_validation": {
+                    "dataset": validation_monitor.summary,
+                    "ensemble_metrics": ensemble_validation,
+                },
                 "class_weighting": {
                     "downsampling": None,
                     "full_data": full_class_weight_summary,

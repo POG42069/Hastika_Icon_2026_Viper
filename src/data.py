@@ -360,3 +360,19 @@ def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
         task,
         train_description,
     )
+
+
+def load_epoch_validation_frame(task: TaskConfig) -> pd.DataFrame:
+    """Read external gold labels for reporting, independently of prediction input."""
+
+    if task.epoch_validation_filename is None:
+        raise ValueError("Per-epoch monitoring requires a labeled validation filename.")
+    path = resolve_data_file(task.epoch_validation_filename)
+    frame = _read_csv(path)
+    _validate_columns(frame, path, {"id", "Comment", task.label_column})
+    if frame.empty:
+        raise ValueError(f"Labeled validation must not be empty: {path}")
+    validated, _ = _validate_and_encode_frames(
+        frame, frame[["id", "Comment"]], task, str(path)
+    )
+    return validated
