@@ -1,10 +1,11 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
-Nhánh `Khangtest2` là thí nghiệm original-only: đồng bộ pipeline từ
-`Khangtest` tại commit `e4282e3`, chỉ tắt augmentation cho cả Task A và B
-bằng `use_augmentation=False`. Backbone, prompt, seed, hyperparameter và
-cách ensemble giữ nguyên để so sánh trên cùng development input. Các file
-augment có thể vẫn nằm trong dataset nhưng không được đọc hoặc dùng để train.
+Nhánh `Khangtest2` dùng dữ liệu original-only cho cả Task A và B
+(`use_augmentation=False`). Task B đổi backbone từ `Qwen/Qwen2.5-3B-Instruct`
+sang `sarvamai/sarvam-1`; nội dung prompt, seed, hyperparameter, loss và cách
+ensemble giữ nguyên. Task A tiếp tục dùng `Qwen/Qwen2.5-3B-Instruct`.
+Các file augment có thể vẫn nằm trong dataset nhưng không được đọc hoặc
+dùng để train.
 
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
 
@@ -103,7 +104,8 @@ assistant label vẫn nằm trong `max_length`.
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone Task A | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone Task B | `sarvamai/sarvam-1` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
@@ -130,8 +132,8 @@ Với `r=32`, `alpha=64`, hệ số scale là 2. Backbone `W0` không được
 optimizer cập nhật.
 
 Đây không phải QLoRA: code không dùng NF4, double quantization hay
-`BitsAndBytesConfig`. Qwen2.5-3B phù hợp với T4 16 GB hơn bản 7B khi dùng
-LoRA FP16. DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
+`BitsAndBytesConfig`. Cả hai backbone dùng LoRA FP16 trên T4. DDP dùng cả
+hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
 
 ## Dữ liệu
 
@@ -182,6 +184,18 @@ softmax sáu candidate scores để lấy xác suất, rồi chọn nhãn theo q
 ensemble của từng task. Pipeline không sinh văn bản tự do và không regex sửa
 kết quả.
 
+Task B dùng chat template có sẵn trong tokenizer Sarvam: system instruction
+nằm trong `<<SYS>> ... <</SYS>>`, user nằm trong `[INST] ... [/INST]`, và
+assistant answer kết thúc bằng `</s>`. Nội dung system prompt và `Comment:`
+vẫn là plain text như trước; các token bao quanh hội thoại theo checkpoint
+mới. Tokenizer không có PAD nên code dùng EOS làm PAD và mask các vị trí
+padding như hiện tại.
+
+Theo [model card chính thức](https://huggingface.co/sarvamai/sarvam-1),
+Sarvam-1 là base model hỗ trợ Kannada và tiếng Anh, chưa được instruction-tune.
+Code vẫn fine-tune LoRA trên câu trả lời là nhãn và chấm sáu candidate trực
+tiếp, không cần model sinh hoặc hiểu hội thoại tốt trước khi fine-tune.
+
 ## Chạy trên Kaggle
 
 ```bash
@@ -195,11 +209,15 @@ Khi Kaggle có T4 x2, entry point tự relaunch bằng DDP với hai worker.
 Có thể đổi tham số qua CLI:
 
 ```bash
-!python Train_B_LLM.py --model Qwen/Qwen2.5-3B-Instruct
+!python Train_B_LLM.py --model sarvamai/sarvam-1
 !python Train_B_LLM.py --batch-size 4 --gradient-accumulation 2
 !python Train_B_LLM.py --single-gpu
 !python Train_B_LLM.py --prediction-file /path/to/official_inputs.csv
 ```
+
+`Train_B_LLM.py` mặc định dùng Sarvam-1. `--model` hoặc biến môi trường
+`HASTIKA_LLM_MODEL` có thể ghi đè checkpoint; bỏ override Qwen cũ nếu muốn
+chạy backbone mặc định mới. `HASTIKA_LLM_MODEL` vẫn áp dụng cho cả hai task.
 
 Số epoch của thí nghiệm Task B hiện được khóa bằng
 `TASK_B.fixed_full_retrain_epochs=5`; tùy chọn `--max-epochs` không thay đổi

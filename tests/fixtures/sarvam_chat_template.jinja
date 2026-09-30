@@ -1,0 +1,22 @@
+{% if messages[0]['role'] == 'system' %}{% set loop_messages = messages[1:] %}{% set system_message = messages[0]['content'] %}{% else %}{% set loop_messages = messages %}{% set system_message = false %}{% endif %}
+{% for message in loop_messages %}
+{% if message['role'] not in ['user', 'assistant', 'tool_calls'] %}
+{{ raise_exception('Invalid role: ' + message['role'] + '. Must be user, assistant, or tool_calls.') }}
+{% endif %}
+{% if loop.index0 == 0 and system_message != false %}
+{% set content = '<<SYS>>
+' + system_message + '
+<</SYS>>
+
+' + message['content'] %}
+{% else %}
+{% set content = message['content'] %}
+{% endif %}
+{% if message['role'] == 'user' %}
+{{ bos_token + '[INST] ' + content.strip() + ' [/INST]' }}
+{% elif message['role'] == 'assistant' %}
+{{ ' ' + content.strip() + ' ' + eos_token }}
+{% elif message['role'] == 'tool_calls' %}
+{{ ' [TOOL_CALLS] ' + content.strip() + ' [/TOOL_CALLS] ' }}
+{% endif %}
+{% endfor %}

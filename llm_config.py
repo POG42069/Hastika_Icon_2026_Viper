@@ -173,6 +173,9 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-LLM_TRAINING_B = replace(LLM_TRAINING)
+LLM_TRAINING_B = replace(
+    LLM_TRAINING,
+    model_name=os.getenv("HASTIKA_LLM_MODEL", "sarvamai/sarvam-1"),
+)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B
