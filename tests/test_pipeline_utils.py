@@ -11,13 +11,48 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from llm_config import TASK_A
-from src.data import load_task_frames
+from llm_config import TASK_A, TASK_B
+from src.data import labeled_input_filenames, load_task_frames
 from src.submission import write_submission
 
 
 class TextNormalizationTests(unittest.TestCase):
     """Verify technical cleanup does not discard authored content."""
+
+    def test_compact_original_files_load_without_a_fold_column(self) -> None:
+        for task in (TASK_A, TASK_B):
+            with self.subTest(task=task.task_name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                train = pd.DataFrame(
+                    {
+                        "id": ["001", "002"],
+                        "Comment": ["first", "second"],
+                        task.label_column: [task.labels[0], task.labels[1]],
+                    }
+                )
+                holdout = pd.DataFrame(
+                    {
+                        "id": ["003"],
+                        "Comment": ["holdout"],
+                        task.label_column: [task.labels[0]],
+                    }
+                )
+                train.to_csv(root / task.compact_train_filename, index=False)
+                holdout.to_csv(root / task.compact_validation_filename, index=False)
+                pd.DataFrame({"id": ["004"], "Comment": ["development"]}).to_csv(
+                    root / task.prediction_filename, index=False
+                )
+                with patch("src.data.resolve_data_file", side_effect=root.joinpath):
+                    labeled, development = load_task_frames(task)
+                    filenames = labeled_input_filenames(task)
+                self.assertEqual(labeled["id"].tolist(), ["001", "002", "003"])
+                self.assertEqual(labeled["fold"].tolist(), [0, 0, 5])
+                self.assertEqual(labeled["data_origin"].tolist(), ["original"] * 3)
+                self.assertEqual(development["id"].tolist(), ["004"])
+                self.assertEqual(
+                    filenames,
+                    (task.compact_train_filename, task.compact_validation_filename),
+                )
 
     def test_urls_mentions_html_and_stylistic_signals_are_preserved(self) -> None:
         raw = (

@@ -43,7 +43,7 @@ from llm_config import (
     LLMTrainingConfig,
     TaskConfig,
 )
-from src.data import load_task_frames, resolve_data_file
+from src.data import labeled_input_filenames, load_task_frames, resolve_data_file
 from src.distributed import (
     RuntimeContext,
     cleanup_runtime,
@@ -1244,7 +1244,10 @@ def _run_seed_ensemble(
                 },
                 "input_sha256": {
                     name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
-                    for name in (*task.labeled_filenames(), task.prediction_filename)
+                    for name in (
+                        *labeled_input_filenames(task),
+                        task.prediction_filename,
+                    )
                 },
                 "packages": {
                     name: version(name)
@@ -1923,7 +1926,10 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         name: hashlib.sha256(
                             resolve_data_file(name).read_bytes()
                         ).hexdigest()
-                        for name in (*task.labeled_filenames(), task.prediction_filename)
+                        for name in (
+                            *labeled_input_filenames(task),
+                            task.prediction_filename,
+                        )
                     },
                     "packages": {
                         name: version(name)

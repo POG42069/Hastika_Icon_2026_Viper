@@ -16,19 +16,20 @@ trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Cả hai task dùng predefined folds để giữ câu nguồn và augment cùng một fold.
-   Task A dùng `binary_original_1..4 + binary_augment1..4` để train và chỉ
-   `binary_original_5` để validation. Task B dùng
-   `original_1..4 + augment1..4` để train và `original_5` để validation.
-2. Task A và Task B đều chạy 5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
-   và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
+1. Với bộ dữ liệu gộp, Task A train trên `binary_original_1_4.csv` và validate
+   trên `binary_original_5.csv`; Task B train trên `original_1_4.csv` và
+   validate trên `original_5.csv`. Bộ này chỉ chứa dữ liệu original.
+   Nếu dùng bộ 5 fold cũ, loader tiếp tục đọc các file augment theo cấu hình.
+2. Task A chạy 3 seed `42, 52, 62`; Task B chạy 5 seed `42, 52, 62, 72, 82`.
+   Mỗi seed train LoRA và tự chọn `best_epoch` trên cùng một validation cố định.
+   Macro-F1 cao hơn
    thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
    lấy ngẫu nhiên một tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
 3. Với cả hai task, từng seed khởi tạo lại backbone và LoRA từ đầu rồi retrain
    trên dữ liệu đầy đủ theo `best_epoch` riêng. Task B tiếp tục loại đúng tập
    Gender mà seed đó đã chọn khi chạy phase selection; vì vậy 5 seed có thể
    retrain trên 5 tập Gender khác nhau nhưng cùng số lượng mẫu.
-4. Năm adapter dự đoán development độc lập và có trọng số ngang nhau. Task A
+4. Các adapter dự đoán development độc lập và có trọng số ngang nhau. Task A
    dùng majority vote. Task B dùng plurality vote; nếu nhiều nhãn cùng số phiếu
    cao nhất thì lần lượt phá hòa bằng tổng điểm Borda, tổng `mean_token_log_probs`
    đã z-normalize riêng trong từng seed/mẫu, rồi thứ tự label cố định trong
@@ -105,45 +106,25 @@ hoặc một Kaggle Dataset dưới `/kaggle/input`.
 Task A:
 
 ```text
-binary_original_1.csv ... binary_original_5.csv
-binary_augment1.csv ... binary_augment5.csv
+binary_original_1_4.csv
+binary_original_5.csv
 binary_validation_inputs.csv
 ```
 
 Task B:
 
 ```text
-original_1.csv ... original_5.csv
-augment1.csv ... augment5.csv
+original_1_4.csv
+original_5.csv
 multiclass_validation_inputs.csv
 ```
 
 Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Development CSV
-cần `id`, `Comment`. Các file `augment*.csv` cần thêm `source_id`,
-`source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn nằm cùng fold,
-nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
-
-Tạo lại dữ liệu Task A cân bằng từ bộ dữ liệu đã làm sạch:
-
-```bash
-python scripts/build_task_a_balanced_data.py \
-  --input-dir ../hastika_regenerated_augments \
-  --output-dir ../task_a_balanced
-```
-
-Script không sửa dữ liệu nguồn. Nó audit Hate augment, khôi phục các câu nguồn
-Task B còn thiếu trong binary data, gán fold có seed cố định, sinh Non-Hate
-variants bảo thủ, tạo hàng chờ human review và xuất các fold Task A. Đặt
-`HASTIKA_DATA_DIR` trỏ tới thư mục output trước khi train.
-
-Chạy sanity check nhẹ trước khi dùng GPU:
-
-```bash
-python scripts/evaluate_task_a_data_sanity.py --data-dir ../task_a_balanced
-```
-
-Đây chỉ là kiểm tra hồi quy dữ liệu bằng character n-gram Naive Bayes. Quyết
-định cuối cùng vẫn dựa trên LoRA experiment với original-only fold 5.
+cần `id`, `Comment`. Loader ưu tiên cặp file gộp và fold 5 khi cả hai có mặt;
+`use_augmentation` không tác động đến bộ gộp original-only. Nếu chỉ có bộ 5 fold
+cũ, loader đọc augmentation khi `use_augmentation=True` và kiểm tra
+`source_id`, `source_group`, `fold` của từng mẫu. File train gộp không cần cột
+`fold`: loader tự gán nhóm train và validation trong bộ nhớ.
 
 ## Chạy trên Kaggle
 
@@ -215,8 +196,6 @@ checkpoints/task_a_sarvam1_lora/seed_42/best_holdout_adapter/
 checkpoints/task_a_sarvam1_lora/seed_42/final_full_data_adapter/
 checkpoints/task_a_sarvam1_lora/seed_52/...
 checkpoints/task_a_sarvam1_lora/seed_62/...
-checkpoints/task_a_sarvam1_lora/seed_72/...
-checkpoints/task_a_sarvam1_lora/seed_82/...
 checkpoints/task_a_sarvam1_lora/metrics.json
 outputs/task_a_sarvam1_lora/seed_42/validation_predictions.csv
 outputs/task_a_sarvam1_lora/seed_42/predictions.csv
@@ -232,7 +211,7 @@ outputs/task_a_sarvam1_lora/run_summary.json
 ```
 
 `validation_predictions.csv` ở thư mục gốc là kết quả của seed có holdout tốt
-nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 5 seed,
+nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 3 seed,
 số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
 kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
@@ -244,7 +223,7 @@ hòa và nhãn cuối. Các file `predictions.csv`, ZIP và `run_summary.json` �
 mục gốc là kết quả ensemble; seed có holdout tốt nhất chỉ được dùng để xuất báo
 cáo validation đại diện, không còn là seed duy nhất được retrain.
 
-Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
+Macro-F1 holdout của các seed chỉ dùng để chọn epoch riêng cho từng seed. File
 tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức
 vẫn là đánh giá cuối cùng.
 
