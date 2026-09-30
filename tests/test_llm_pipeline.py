@@ -798,6 +798,7 @@ class LLMTests(unittest.TestCase):
             task = replace(
                 TASK_B,
                 selection_seeds=retrain_seeds,
+                fixed_full_retrain_epochs=5,
                 enable_augmentation_audit=False,
             )
             rows_per_fold = len(task.labels) * 2
