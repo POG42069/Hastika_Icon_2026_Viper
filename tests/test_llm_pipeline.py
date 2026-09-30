@@ -843,6 +843,14 @@ class LLMTests(unittest.TestCase):
                 }
             )
             prediction_frame.to_csv(root / task.prediction_filename, index=False)
+            gold_frame = pd.DataFrame(
+                {
+                    "id": [f"gold-{i}" for i in range(len(task.labels))],
+                    "Comment": [f"gold comment {i}" for i in range(len(task.labels))],
+                    task.label_column: list(task.labels),
+                }
+            )
+            gold_frame.to_csv(root / task.epoch_validation_filename, index=False)
             config = replace(
                 self.config,
                 max_epochs=2,
@@ -892,6 +900,7 @@ class LLMTests(unittest.TestCase):
                 patch(
                     "src.llm_training.train_llm_epoch", side_effect=tracked_train
                 ),
+                patch("src.llm_training.log") as logged,
             ):
                 run_llm_task(task, config)
 
@@ -910,6 +919,44 @@ class LLMTests(unittest.TestCase):
 
             self.assertFalse((output / "oof_predictions.csv").exists())
             self.assertFalse((output / "oof_selection_summary.json").exists())
+
+            log_lines = [call.args[0] for call in logged.call_args_list]
+            for seed in retrain_seeds:
+                for epoch in range(1, task.fixed_full_retrain_epochs + 1):
+                    heading = f"Official validation | seed={seed} | epoch={epoch}:"
+                    self.assertEqual(
+                        sum(line.startswith(heading) for line in log_lines), 1
+                    )
+            self.assertEqual(
+                sum(line.startswith("Confusion matrix |") for line in log_lines),
+                len(retrain_seeds) * task.fixed_full_retrain_epochs + 1,
+            )
+            for label in task.labels:
+                self.assertTrue(any(
+                    line.startswith(f"  {label}: precision=")
+                    and "recall=" in line and "f1=" in line and "support=" in line
+                    for line in log_lines
+                ))
+            for seed in retrain_seeds:
+                history = json.loads(
+                    (output / f"seed_{seed}" / "full_data_training_history.json").read_text()
+                )
+                self.assertEqual(len(history["epochs"]), 5)
+                for record in history["epochs"]:
+                    metrics = record["official_validation"]
+                    self.assertEqual(set(metrics["per_class"]), set(task.labels))
+                    self.assertEqual(sum(
+                        value["support"] for value in metrics["per_class"].values()
+                    ), len(gold_frame))
+                    predictions_path = (
+                        output / f"seed_{seed}" / "official_validation"
+                        / f"predictions_epoch_{record['epoch']:02d}.csv"
+                    )
+                    saved = pd.read_csv(predictions_path, dtype={"id": str})
+                    self.assertEqual(saved["id"].tolist(), gold_frame["id"].tolist())
+            self.assertEqual(summary["official_validation"]["dataset"]["rows"], len(gold_frame))
+            self.assertTrue((output / "official_validation_metrics.json").is_file())
+            self.assertTrue((output / "official_validation_predictions.csv").is_file())
 
             result = pd.read_csv(output / "predictions.csv", dtype={"id": str})
             ensemble = pd.read_csv(
