@@ -38,6 +38,7 @@ class TaskConfig:
     ensemble_all_seeds: bool = False
     oof_validation_folds: tuple[int, ...] = ()
     full_retrain_soft_ensemble: bool = False
+    fixed_full_retrain_epochs: int | None = None
     class_weight_power: float | None = None
     class_weight_min: float = 0.75
     class_weight_max: float = 1.50
@@ -64,7 +65,7 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507"
+            "HASTIKA_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"
         )
     )
     model_revision: str = "main"
@@ -111,7 +112,7 @@ TASK_A = TaskConfig(
     augmentation_fold_filenames=tuple(
         f"binary_augment{fold}.csv" for fold in range(1, 6)
     ),
-    use_augmentation=True,
+    use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),
@@ -145,12 +146,15 @@ TASK_B = TaskConfig(
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
-    use_augmentation=True,
+    use_augmentation=False,
     selection_validation_fold=None,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),
     oof_validation_folds=(1, 2, 3, 4, 5),
     full_retrain_soft_ensemble=True,
+    # Temporary variance experiment: skip OOF and train every full-data seed
+    # for exactly five epochs.
+    fixed_full_retrain_epochs=5,
     class_weight_power=0.50,
     class_weight_min=0.75,
     class_weight_max=1.50,

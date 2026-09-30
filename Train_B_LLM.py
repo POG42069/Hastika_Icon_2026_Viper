@@ -1,4 +1,4 @@
-"""Select an epoch by five-fold OOF, retrain five LoRA models, and ensemble."""
+"""Retrain five Task B LoRA models for five fixed epochs and ensemble."""
 
 from llm_config import LLM_TRAINING_B, TASK_B_LLM
 from src.llm_training import run_llm_cli

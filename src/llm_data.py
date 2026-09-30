@@ -73,7 +73,7 @@ class ChatEncoder:
             if full[: len(empty_prompt)] != empty_prompt:
                 raise ValueError(
                     "Chat template response prefix is incompatible with answer-only training. "
-                    "Use a non-thinking instruct checkpoint."
+                    "Use a non-thinking instruct checkpoint such as Qwen2.5-Instruct."
                 )
             completion = full[len(empty_prompt) :]
             if not completion:
@@ -88,7 +88,7 @@ class ChatEncoder:
     def messages(self, text: str) -> list[dict[str, str]]:
         return [
             {"role": "system", "content": self.system_text},
-            {"role": "user", "content": "### Comment\n" + text},
+            {"role": "user", "content": "Comment:\n" + text},
         ]
 
     def _template(self, messages: list[dict[str, str]], generation: bool) -> list[int]:
