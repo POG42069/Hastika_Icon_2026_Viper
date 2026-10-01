@@ -1,8 +1,15 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
-Trên `Khangtest`, Task B train **original-only** và đưa cả comment raw
+Trên `Khangtest3`, Task B train **original-only** và đưa cả comment raw
 code-mixed lẫn bản dịch tiếng Anh `Comment_en` vào cùng prompt plain text.
-Backbone vẫn là `Qwen/Qwen2.5-3B-Instruct`. Task A giữ nguyên pipeline hiện có.
+Nhánh này lấy từ `Khangtest` tại commit `4b8d507`; chỉ đổi backbone
+Task B sang `Qwen/Qwen3-4B-Instruct-2507` (4,0 tỷ tham số). Task A giữ
+nguyên `Qwen/Qwen2.5-3B-Instruct` và pipeline hiện có.
+
+Checkpoint Task B chỉ hỗ trợ **non-thinking**, không cần truyền
+`enable_thinking=False`. Xem [model card chính thức của Qwen](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507).
+Prompt, dữ liệu, loss, năm seed, số epoch và hyperparameter giữ nguyên;
+chat template và tokenization được lấy từ tokenizer của checkpoint mới.
 
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
 
@@ -107,7 +114,8 @@ Nếu phải cắt, giữ đầu của cả hai phần, các tiêu đề và to�
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone Task A | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone Task B | `Qwen/Qwen3-4B-Instruct-2507` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
@@ -134,8 +142,11 @@ Với `r=32`, `alpha=64`, hệ số scale là 2. Backbone `W0` không được
 optimizer cập nhật.
 
 Đây không phải QLoRA: code không dùng NF4, double quantization hay
-`BitsAndBytesConfig`. Qwen2.5-3B phù hợp với T4 16 GB hơn bản 7B khi dùng
-LoRA FP16. DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
+`BitsAndBytesConfig`. Task B nạp Qwen3-4B bằng LoRA FP16 trên T4.
+DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
+Backbone 4B dùng nhiều VRAM hơn bản 3B; batch/GPU vẫn là 4 và
+accumulation vẫn là 2 để giữ cùng cấu hình thí nghiệm.
+`transformers==4.57.6` trong `requirements.txt` đã hỗ trợ Qwen3.
 
 ## Dữ liệu
 
@@ -232,7 +243,7 @@ Khi Kaggle có T4 x2, entry point tự relaunch bằng DDP với hai worker.
 Có thể đổi tham số qua CLI:
 
 ```bash
-!python Train_B_LLM.py --model Qwen/Qwen2.5-3B-Instruct
+!python Train_B_LLM.py --model Qwen/Qwen3-4B-Instruct-2507
 !python Train_B_LLM.py --batch-size 4 --gradient-accumulation 2
 !python Train_B_LLM.py --single-gpu
 !python Train_B_LLM.py --prediction-file /path/to/official_inputs.csv
@@ -241,6 +252,10 @@ Có thể đổi tham số qua CLI:
 Số epoch của thí nghiệm Task B hiện được khóa bằng
 `TASK_B.fixed_full_retrain_epochs=5`; tùy chọn `--max-epochs` không thay đổi
 giá trị cố định này.
+
+Nếu đã đặt biến `HASTIKA_LLM_MODEL`, giá trị đó vẫn ghi đè backbone
+mặc định; `--model` ghi đè giá trị cho lượt chạy hiện tại. Để chạy
+Task B với Qwen3 mặc định, không đặt biến này thành checkpoint cũ.
 
 ### Log validation sau mỗi epoch của Task B
 
