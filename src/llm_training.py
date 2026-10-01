@@ -45,7 +45,7 @@ from llm_config import (
     LLMTrainingConfig,
     TaskConfig,
 )
-from src.data import load_task_frames, resolve_data_file
+from src.data import labeled_input_filenames, load_task_frames, resolve_data_file
 from src.distributed import (
     RuntimeContext,
     cleanup_runtime,
@@ -637,7 +637,7 @@ def _input_hashes(task: TaskConfig) -> tuple[str, str]:
     """Hash training and prediction inputs separately for safe artifact reuse."""
 
     training = hashlib.sha256()
-    for name in task.labeled_filenames():
+    for name in labeled_input_filenames(task):
         training.update(name.encode())
         training.update(resolve_data_file(name).read_bytes())
     prediction = hashlib.sha256(
@@ -661,7 +661,7 @@ def _resume_signature(
         "model": config.model_name,
         "model_revision": config.model_revision,
         "labels": list(task.labels),
-        "labeled_filenames": list(task.labeled_filenames()),
+        "labeled_filenames": list(labeled_input_filenames(task)),
         "split_seed": config.seed,
         "selection_validation_fold": task.selection_validation_fold,
         "selection_validation_data_origins": list(
@@ -1987,7 +1987,7 @@ def _run_seed_ensemble(
                 },
                 "input_sha256": {
                     name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
-                    for name in (*task.labeled_filenames(), task.prediction_filename)
+                    for name in (*labeled_input_filenames(task), task.prediction_filename)
                 },
                 "packages": {
                     name: version(name)
@@ -2860,7 +2860,7 @@ def run_llm_task(
                         name: hashlib.sha256(
                             resolve_data_file(name).read_bytes()
                         ).hexdigest()
-                        for name in (*task.labeled_filenames(), task.prediction_filename)
+                        for name in (*labeled_input_filenames(task), task.prediction_filename)
                     },
                     "packages": {
                         name: version(name)

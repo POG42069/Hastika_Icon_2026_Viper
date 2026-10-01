@@ -14,10 +14,12 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Cả hai task dùng predefined folds để giữ câu nguồn và augment cùng một fold.
-   Task A dùng `binary_original_1..4 + binary_augment1..4` để train và chỉ
-   `binary_original_5` để validation. Task B dùng
-   `original_1..4 + augment1..4` để train và `original_5` để validation.
+1. Cả hai task dùng dữ liệu original tiếng Anh, không dùng augmentation.
+   Task A train trên `binary_original_1_4.csv` và validation trên
+   `binary_original_5.csv`. Task B tương ứng dùng `original_1_4.csv` và
+   `original_5.csv`. Loader gán fold 1 cho nhóm 1–4 đã gộp và fold 5 cho
+   validation để giữ nguyên logic chia tập. Nếu không có cả hai file gộp,
+   loader vẫn có thể đọc các file original 1–5 kiểu cũ (không đọc augment).
 2. Task A và Task B đều chạy 5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
    và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
    thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
@@ -98,28 +100,31 @@ Nếu đặt `HASTIKA_LLM_MODEL` trong môi trường, giá trị đó sẽ ghi 
 Mặc định pipeline tìm các file sau trong `HASTIKA_DATA_DIR`, thư mục `data/`,
 hoặc một Kaggle Dataset dưới `/kaggle/input`.
 
-Task A:
+Task A (mặc định):
 
 ```text
-binary_original_1.csv ... binary_original_5.csv
-binary_augment1.csv ... binary_augment5.csv
+binary_original_1_4.csv
+binary_original_5.csv
 binary_validation_inputs.csv
 ```
 
-Task B:
+Task B (mặc định):
 
 ```text
-original_1.csv ... original_5.csv
-augment1.csv ... augment5.csv
+original_1_4.csv
+original_5.csv
 multiclass_validation_inputs.csv
 ```
 
 Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Development CSV
-cần `id`, `Comment`. Các file `augment*.csv` cần thêm `source_id`,
-`source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn nằm cùng fold,
-nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
+cần `id`, `Comment`. Giải nén `hastika_english_only.zip` rồi trỏ
+`HASTIKA_DATA_DIR` tới thư mục chứa các CSV, hoặc gắn dataset đã giải nén
+trên Kaggle. Nếu chỉ tìm thấy một trong hai file original của task, loader
+báo lỗi thay vì âm thầm trộn bộ dữ liệu mới với file cũ. File
+`translation_map.csv` không được dùng để huấn luyện.
 
-Tạo lại dữ liệu Task A cân bằng từ bộ dữ liệu đã làm sạch:
+Script thử nghiệm augmentation Task A dưới đây chỉ dành cho bộ dữ liệu cũ;
+pipeline tiếng Anh mặc định không dùng output của script này:
 
 ```bash
 python scripts/build_task_a_balanced_data.py \
