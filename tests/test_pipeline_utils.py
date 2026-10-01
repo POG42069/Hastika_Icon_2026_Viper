@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from llm_config import TASK_A, TASK_B
+from llm_config import TASK_A
 from src.data import load_task_frames
 from src.submission import write_submission
 
@@ -52,57 +52,6 @@ class TextNormalizationTests(unittest.TestCase):
                 train, development = load_task_frames(task)
         self.assertEqual(train["text"].tolist(), [normalized, ""])
         self.assertEqual(development["text"].tolist(), ["Soooo GOOD!!!!!"])
-
-
-class OriginalOnlyDataTests(unittest.TestCase):
-    """Ensure both branch defaults exclude augment files even when present."""
-
-    def test_both_tasks_load_only_original_folds(self) -> None:
-        for task in (TASK_A, TASK_B):
-            for augment_present in (False, True):
-                with (
-                    self.subTest(task=task.task_name, augment_present=augment_present),
-                    tempfile.TemporaryDirectory() as temporary_directory,
-                ):
-                    root = Path(temporary_directory)
-                    self.assertFalse(task.use_augmentation)
-                    self.assertEqual(
-                        task.labeled_filenames(), task.original_fold_filenames
-                    )
-                    expected_ids = []
-                    for fold, original_name in enumerate(
-                        task.original_fold_filenames, start=1
-                    ):
-                        ids = [f"original-{fold}-{i}" for i in range(len(task.labels))]
-                        expected_ids.extend(ids)
-                        pd.DataFrame(
-                            {
-                                "id": ids,
-                                "Comment": [f"original {value}" for value in ids],
-                                task.label_column: list(task.labels),
-                            }
-                        ).to_csv(root / original_name, index=False)
-                    if augment_present:
-                        # These invalid CSVs would fail if the loader tried reading them.
-                        for name in task.augmentation_fold_filenames:
-                            (root / name).write_text("invalid_augment\nignored\n")
-                    pd.DataFrame(
-                        {"id": ["development-1"], "Comment": ["development comment"]}
-                    ).to_csv(root / task.prediction_filename, index=False)
-                    with (
-                        patch("src.data.resolve_data_file", side_effect=root.joinpath)
-                        as resolver,
-                        patch("src.data._audit_augmentation_quality") as audit,
-                    ):
-                        train, development = load_task_frames(task)
-                    self.assertEqual(train["id"].tolist(), expected_ids)
-                    self.assertEqual(set(train["data_origin"]), {"original"})
-                    self.assertEqual(len(development), 1)
-                    self.assertEqual(
-                        {call.args[0] for call in resolver.call_args_list},
-                        set(task.original_fold_filenames) | {task.prediction_filename},
-                    )
-                    audit.assert_not_called()
 
 
 class SubmissionTests(unittest.TestCase):

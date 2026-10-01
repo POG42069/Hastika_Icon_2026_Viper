@@ -869,11 +869,7 @@ def _run_seed_ensemble(
         best_epoch = int(summary["best_epoch"])
         full_train_indices = result["full_train_indices"]
         full_train_frame = frame.iloc[full_train_indices]
-        full_train_data = CompletionDataset(
-            full_train_frame["text"].tolist(),
-            encoder,
-            full_train_frame["label_id"].tolist(),
-        )
+        full_train_data = CompletionDataset.from_frame(full_train_frame, encoder)
         seed_output_dir = result["seed_output_dir"]
         seed_checkpoint_dir = result["seed_checkpoint_dir"]
         final_adapter_dir = seed_checkpoint_dir / "final_full_data_adapter"
@@ -1333,21 +1329,22 @@ def public_validation_metrics(metrics: dict) -> dict:
 class TaskBValidationMonitor:
     """Report external validation every epoch without affecting epoch selection."""
 
-    def __init__(self, task, config, runtime, training_frame, encoder, collator):
+    def __init__(
+        self, task, config, runtime, training_frame, encoder, collator,
+        prediction_frame=None,
+    ):
         self.task = task
         self.config = config
         self.runtime = runtime
         self.collator = collator
-        self.frame = load_epoch_validation_frame(task)
+        self.frame = load_epoch_validation_frame(task, prediction_frame)
         overlap = set(training_frame["id"]) & set(self.frame["id"])
         if overlap:
             raise ValueError(
                 "Official validation IDs must not occur in training data: "
                 f"{sorted(overlap)[:10]}"
             )
-        self.data = CompletionDataset(
-            self.frame["text"].tolist(), encoder, self.frame["label_id"].tolist()
-        )
+        self.data = CompletionDataset.from_frame(self.frame, encoder)
         path = resolve_data_file(task.epoch_validation_filename)
         self.summary = {
             "filename": task.epoch_validation_filename,
@@ -1420,7 +1417,7 @@ class TaskBValidationMonitor:
         return public_validation_metrics(metrics)
 
 
-def _run_full_retrain_soft_ensemble(
+def _run_fixed_epoch_full_retrain_ensemble(
     *,
     task: TaskConfig,
     config: LLMTrainingConfig,
@@ -1435,73 +1432,32 @@ def _run_full_retrain_soft_ensemble(
     checkpoint_dir: Path,
     retrain_seeds: tuple[int, ...],
     token_diagnostics: list[dict[str, object]],
-    epochs_by_seed: dict[int, int],
-    epoch_selection: dict,
-    selection_results: list[dict] | None = None,
-    validation_monitor: TaskBValidationMonitor | None = None,
+    fixed_epochs: int,
 ) -> None:
-    """Retrain every seed from scratch for its planned epochs and soft ensemble."""
+    """Skip epoch selection and soft-ensemble fixed-epoch full-data models."""
 
-    if set(epochs_by_seed) != set(retrain_seeds):
-        raise ValueError("Full-data epoch plan must cover every configured seed.")
-    if any(epochs < 1 for epochs in epochs_by_seed.values()):
-        raise ValueError("Full-data epoch counts must be positive.")
+    if fixed_epochs < 1:
+        raise ValueError("fixed_full_retrain_epochs must be positive.")
     if not task.full_retrain_soft_ensemble:
-        raise ValueError("Full-data training requires soft ensembling.")
+        raise ValueError("Fixed full-data training requires soft ensembling.")
     if len(retrain_seeds) < 2:
         raise ValueError("A full-data soft ensemble requires at least two seeds.")
     if task.selection_train_label_caps:
-        raise ValueError("Class-weighted soft-ensemble training cannot downsample labels.")
+        raise ValueError("Fixed class-weighted training cannot downsample labels.")
     if task.class_weight_power is None:
-        raise ValueError("Task B soft-ensemble training requires class-weighted loss.")
+        raise ValueError("Fixed Task B training requires class-weighted loss.")
 
-    selection_by_seed = (
-        {int(result["summary"]["seed"]): result["summary"] for result in selection_results}
-        if selection_results is not None else {}
+    validation_monitor = TaskBValidationMonitor(
+        task, config, runtime, frame, encoder, collator, prediction_frame
     )
-    if selection_results is not None:
-        if set(selection_by_seed) != set(retrain_seeds):
-            raise ValueError("Every seed must finish holdout selection before retraining.")
-        if any(
-            epochs_by_seed[seed] != summary["best_epoch"]
-            for seed, summary in selection_by_seed.items()
-        ):
-            raise ValueError("Full-data epoch plan must use each seed's own best epoch.")
 
-        def export_selection_overview() -> None:
-            write_seed_selection_results(
-                [
-                    {
-                        key: summary[key]
-                        for key in (
-                            "seed", "best_epoch", "macro_f1", "loss", "accuracy",
-                            "selection_train_rows", "full_retrain_rows",
-                            "downsampled_rows", "checkpoint",
-                        )
-                    } | {"selected": True}
-                    for summary in selection_by_seed.values()
-                ],
-                output_dir,
-            )
-            _write_json(output_dir / "seed_selection_summary.json", epoch_selection)
-
-        on_main(export_selection_overview, runtime)
-
-    if validation_monitor is None:
-        validation_monitor = TaskBValidationMonitor(
-            task, config, runtime, frame, encoder, collator
-        )
-
-    full_train_data = CompletionDataset(
-        frame["text"].tolist(), encoder, frame["label_id"].tolist()
-    )
+    full_train_data = CompletionDataset.from_frame(frame, encoder)
     full_class_weights, full_class_weight_summary = _class_weight_state(
         task, frame["label_id"].to_numpy()
     )
     log(
-        "\n=== FULL-DATA SOFT SEED ENSEMBLE | epochs by seed: "
-        + " | ".join(f"{seed}={epochs_by_seed[seed]}" for seed in retrain_seeds)
-        + " ===",
+        f"\n=== FIXED-EPOCH FULL-DATA EXPERIMENT | OOF SKIPPED "
+        f"| epochs={fixed_epochs} | models={len(retrain_seeds)} ===",
         runtime,
     )
     log(
@@ -1517,7 +1473,6 @@ def _run_full_retrain_soft_ensemble(
     resolved_revision = None
     parameter_counts = None
     for seed_number, seed in enumerate(retrain_seeds, start=1):
-        retrain_epochs = epochs_by_seed[seed]
         seed_output_dir = output_dir / f"seed_{seed}"
         seed_checkpoint_dir = checkpoint_dir / f"seed_{seed}"
         final_adapter_dir = seed_checkpoint_dir / "final_full_data_adapter"
@@ -1530,7 +1485,7 @@ def _run_full_retrain_soft_ensemble(
         log(
             f"\n=== FULL-DATA MODEL {seed_number}/{len(retrain_seeds)} "
             f"| seed={seed} | rows={len(full_train_data)} "
-            f"| epochs={retrain_epochs} ===",
+            f"| epochs={fixed_epochs} ===",
             runtime,
         )
         set_global_seed(seed)
@@ -1552,10 +1507,10 @@ def _run_full_retrain_soft_ensemble(
             del base
         model = _wrap_for_ddp(loaded_model, runtime)
         optimizer, scheduler, scaler = _training_state(
-            model, full_loader, retrain_epochs, config, runtime
+            model, full_loader, fixed_epochs, config, runtime
         )
         full_history = []
-        for epoch in range(1, retrain_epochs + 1):
+        for epoch in range(1, fixed_epochs + 1):
             if full_sampler is not None:
                 full_sampler.set_epoch(epoch)
             train_loss = train_llm_epoch(
@@ -1567,7 +1522,7 @@ def _run_full_retrain_soft_ensemble(
                 config,
                 runtime,
                 epoch,
-                f"Full-data retrain seed {seed}",
+                f"Fixed full-data train seed {seed}",
                 class_weights=full_class_weights,
             )
             validation_metrics = validation_monitor.evaluate(
@@ -1580,7 +1535,7 @@ def _run_full_retrain_soft_ensemble(
                 }
             )
             log(
-                f"Seed {seed} full-data epoch {epoch}/{retrain_epochs}: "
+                f"Seed {seed} full-data epoch {epoch}/{fixed_epochs}: "
                 f"train_weighted_loss={train_loss:.5f}",
                 runtime,
             )
@@ -1591,7 +1546,7 @@ def _run_full_retrain_soft_ensemble(
                     seed_output_dir / "full_data_training_history.json",
                     {
                         "seed": seed,
-                        "epoch_selection": epoch_selection["strategy"],
+                        "epoch_selection": "fixed_without_oof",
                         "validation_dataset": validation_monitor.summary,
                         "class_weighting": full_class_weight_summary,
                         "epochs": full_history,
@@ -1615,14 +1570,11 @@ def _run_full_retrain_soft_ensemble(
         label_ids = probabilities.argmax(axis=1)
         summary = {
             "seed": seed,
-            "epochs": retrain_epochs,
+            "epochs": fixed_epochs,
             "training_rows": len(full_train_data),
             "checkpoint": str(final_adapter_dir),
             "prediction_source": "seed_specific_full_data_adapter",
         }
-        if seed in selection_by_seed:
-            summary["best_epoch"] = retrain_epochs
-            summary["holdout_selection"] = selection_by_seed[seed]
 
         def export_seed_predictions(
             seed_output_dir=seed_output_dir,
@@ -1649,7 +1601,7 @@ def _run_full_retrain_soft_ensemble(
                 "validation_loss": validation_metrics["loss"],
             }
         )
-        del model, loaded_model, full_loader
+        del model, full_loader
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1703,6 +1655,11 @@ def _run_full_retrain_soft_ensemble(
             "audit_file": str(output_dir / "ensemble_predictions.csv"),
             "submission": str(zip_path),
         }
+        epoch_selection = {
+            "strategy": "fixed_without_oof",
+            "oof_skipped": True,
+            "fixed_epoch": fixed_epochs,
+        }
         retrain_summaries = [result["summary"] for result in retrained_results]
         _write_json(
             checkpoint_dir / "metrics.json",
@@ -1717,8 +1674,8 @@ def _run_full_retrain_soft_ensemble(
             {
                 "task": task.task_name,
                 "method": (
-                    "LoRA answer-only causal LM with "
-                    f"{epoch_selection['strategy']} epoch selection and full-data soft seed ensemble"
+                    "LoRA answer-only causal LM with fixed "
+                    f"{fixed_epochs}-epoch full-data soft seed ensemble"
                 ),
                 "model": config.model_name,
                 "resolved_model_revision": resolved_revision,
@@ -1735,10 +1692,6 @@ def _run_full_retrain_soft_ensemble(
                 },
                 "class_weighting": {
                     "downsampling": None,
-                    "selection_by_seed": {
-                        str(seed): summary["class_weighting"]
-                        for seed, summary in selection_by_seed.items()
-                    },
                     "full_data": full_class_weight_summary,
                 },
                 "full_data_retrains": retrain_summaries,
@@ -1747,6 +1700,17 @@ def _run_full_retrain_soft_ensemble(
                 "training_config": asdict(config),
                 "parameters": parameter_counts,
                 "system_prompt": encoder.system_text,
+                "prompt_input": {
+                    "raw_column": None if task.english_only_prompt else "Comment",
+                    "translation_column": task.translation_column,
+                    "english_only_prompt": task.english_only_prompt,
+                    "use_augmentation": task.use_augmentation,
+                    "truncation": (
+                        "truncate English comment; preserve chat and labels"
+                        if task.english_only_prompt else
+                        "share content budget between raw and English; preserve chat and labels"
+                    ),
+                },
                 "label_order": list(task.labels),
                 "completion_token_ids": encoder.completions,
                 "completion_token_diagnostics": token_diagnostics,
@@ -1776,8 +1740,7 @@ def _run_full_retrain_soft_ensemble(
         )
         log(
             f"\n=== COMPLETE | {task.task_name} ===\n"
-            f"Epoch selection: {epoch_selection['strategy']}\n"
-            f"Full-data epochs by seed: {epochs_by_seed}\n"
+            f"OOF selection skipped; fixed full-data epochs: {fixed_epochs}\n"
             f"Full-data seeds: {list(retrain_seeds)}\n"
             f"Ensemble: equal-weight soft probability mean\n"
             f"Predictions: {csv_path}\nSubmission: {zip_path}",
@@ -1838,16 +1801,8 @@ def _run_oof_full_retrain_ensemble(
         )
         train_frame = frame.iloc[train_indices]
         validation_frame = frame.iloc[validation_indices]
-        train_data = CompletionDataset(
-            train_frame["text"].tolist(),
-            encoder,
-            train_frame["label_id"].tolist(),
-        )
-        validation_data = CompletionDataset(
-            validation_frame["text"].tolist(),
-            encoder,
-            validation_frame["label_id"].tolist(),
-        )
+        train_data = CompletionDataset.from_frame(train_frame, encoder)
+        validation_data = CompletionDataset.from_frame(validation_frame, encoder)
         class_weights, class_weight_summary = _class_weight_state(
             task, train_frame["label_id"].to_numpy()
         )
@@ -2106,9 +2061,7 @@ def _run_oof_full_retrain_ensemble(
         runtime,
     )
 
-    full_train_data = CompletionDataset(
-        frame["text"].tolist(), encoder, frame["label_id"].tolist()
-    )
+    full_train_data = CompletionDataset.from_frame(frame, encoder)
     full_class_weights, full_class_weight_summary = _class_weight_state(
         task, frame["label_id"].to_numpy()
     )
@@ -2400,19 +2353,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             raise ValueError("OOF selection requires predefined fold files.")
         if not task.full_retrain_soft_ensemble:
             raise ValueError("OOF selection requires a full-data soft ensemble.")
-    if task.full_retrain_soft_ensemble and task.fixed_full_retrain_epochs is None:
-        if task.ensemble_all_seeds:
-            raise ValueError("Soft ensembling and binary hard voting are exclusive.")
-        if not task.oof_validation_folds and (
-            not task.original_fold_filenames or task.selection_validation_fold is None
-        ):
-            raise ValueError("Per-seed soft ensembling requires a predefined holdout fold.")
-        if task.selection_train_label_caps:
-            raise ValueError("Class-weighted soft ensembling cannot downsample labels.")
-        if task.class_weight_power is None:
-            raise ValueError("Task B soft ensembling requires class-weighted loss.")
-        if len(selection_seeds) < 2:
-            raise ValueError("A soft ensemble requires at least two seeds.")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     runtime = initialize_runtime()
     try:
@@ -2433,6 +2373,18 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         for name, data in (("train", frame), ("development", prediction_frame)):
             if data.empty:
                 raise ValueError(f"{name} input must contain at least one row.")
+        if task.translation_column:
+            prompt_description = (
+                f"English {task.translation_column} only"
+                if task.english_only_prompt else
+                f"raw Comment + English {task.translation_column}"
+            )
+            log(
+                f"Task B inputs | original-only={not task.use_augmentation} "
+                f"| train={len(frame)} | development={len(prediction_frame)} "
+                f"| prompt={prompt_description}",
+                runtime,
+            )
         if task.fixed_full_retrain_epochs is not None:
             base_train_indices = val_indices = None
             split_strategy = "fixed_epoch_full_data"
@@ -2480,7 +2432,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         encoder = ChatEncoder(tokenizer, task, config.max_length)
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
-        prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
+        prediction_data = CompletionDataset.from_frame(prediction_frame, encoder, labeled=False)
         collator = CompletionCollator(tokenizer.pad_token_id)
 
         output_dir = OUTPUT_ROOT / task.output_subdir
@@ -2490,7 +2442,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         on_main(lambda: checkpoint_dir.mkdir(parents=True, exist_ok=True), runtime)
 
         if task.fixed_full_retrain_epochs is not None:
-            _run_full_retrain_soft_ensemble(
+            _run_fixed_epoch_full_retrain_ensemble(
                 task=task,
                 config=config,
                 runtime=runtime,
@@ -2504,14 +2456,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 checkpoint_dir=checkpoint_dir,
                 retrain_seeds=selection_seeds,
                 token_diagnostics=token_diagnostics,
-                epochs_by_seed={
-                    seed: task.fixed_full_retrain_epochs for seed in selection_seeds
-                },
-                epoch_selection={
-                    "strategy": "fixed_without_oof",
-                    "oof_skipped": True,
-                    "fixed_epoch": task.fixed_full_retrain_epochs,
-                },
+                fixed_epochs=task.fixed_full_retrain_epochs,
             )
             return
 
@@ -2534,15 +2479,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             return
 
         val_frame = frame.iloc[val_indices]
-        val_data = CompletionDataset(
-            val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
-        )
-        # Validate the reporting-only gold file before spending GPU time on
-        # selection. It is never passed to the holdout checkpoint criterion.
-        validation_monitor = (
-            TaskBValidationMonitor(task, config, runtime, frame, encoder, collator)
-            if task.full_retrain_soft_ensemble else None
-        )
+        val_data = CompletionDataset.from_frame(val_frame, encoder)
 
         seed_results = []
         resolved_revision = None
@@ -2564,15 +2501,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 assume_unique=True,
             )
             train_frame = frame.iloc[train_indices]
-            selection_train_data = CompletionDataset(
-                train_frame["text"].tolist(),
-                encoder,
-                train_frame["label_id"].tolist(),
-            )
-            selection_class_weights, selection_class_weight_summary = (
-                _class_weight_state(task, train_frame["label_id"].to_numpy())
-                if task.full_retrain_soft_ensemble else (None, None)
-            )
+            selection_train_data = CompletionDataset.from_frame(train_frame, encoder)
             multiple_seeds = len(selection_seeds) > 1
             seed_output_dir = (
                 output_dir / f"seed_{selection_seed}"
@@ -2616,15 +2545,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"final retrain candidate={len(full_train_indices)}/{len(frame)} rows.",
                 runtime,
             )
-            if selection_class_weight_summary is not None:
-                log(
-                    "Selection class weights: "
-                    + " | ".join(
-                        f"{label}={selection_class_weight_summary['weights'][label]:.4f}"
-                        for label in task.labels
-                    ),
-                    runtime,
-                )
             for summary in downsampling_summary:
                 log(
                     f"Selection label cap: {summary['label']} available="
@@ -2669,8 +2589,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     runtime,
                     epoch,
                     "Selection train",
-                    **({"class_weights": selection_class_weights}
-                       if selection_class_weights is not None else {}),
                 )
                 metrics = score_candidates(
                     selection_model,
@@ -2727,9 +2645,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 )
                 for diagnostic_line in format_per_class_diagnostics(metrics):
                     log(diagnostic_line, runtime)
-                if task.full_retrain_soft_ensemble:
-                    for matrix_line in format_confusion_matrix(metrics):
-                        log(matrix_line, runtime)
                 if is_better_checkpoint(
                     metrics["macro_f1"], metrics["loss"], best_metric, best_loss
                 ):
@@ -2789,8 +2704,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 "downsampled_rows": len(downsampled_indices),
                 "downsampling_summary": downsampling_summary,
             }
-            if selection_class_weight_summary is not None:
-                public_summary["class_weighting"] = selection_class_weight_summary
             for key in ("per_class", "confusion_matrix"):
                 if key in best_validation:
                     public_summary[key] = best_validation[key]
@@ -2857,59 +2770,6 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             )
             return
 
-        if task.full_retrain_soft_ensemble:
-            epochs_by_seed = {
-                int(result["summary"]["seed"]): int(result["summary"]["best_epoch"])
-                for result in seed_results
-            }
-            log(
-                "Seed holdout results: "
-                + " | ".join(
-                    f"seed={result['summary']['seed']} "
-                    f"best_epoch={result['summary']['best_epoch']} "
-                    f"Macro-F1={result['summary']['macro_f1']:.5f}"
-                    for result in seed_results
-                ),
-                runtime,
-            )
-            _run_full_retrain_soft_ensemble(
-                task=task,
-                config=config,
-                runtime=runtime,
-                frame=frame,
-                prediction_frame=prediction_frame,
-                prediction_data=prediction_data,
-                collator=collator,
-                encoder=encoder,
-                tokenizer=tokenizer,
-                output_dir=output_dir,
-                checkpoint_dir=checkpoint_dir,
-                retrain_seeds=selection_seeds,
-                token_diagnostics=token_diagnostics,
-                epochs_by_seed=epochs_by_seed,
-                epoch_selection={
-                    "strategy": "per_seed_holdout",
-                    "oof_skipped": True,
-                    "validation_fold": task.selection_validation_fold,
-                    "validation_data_origins": list(task.selection_validation_data_origins),
-                    "validation_is_fixed_across_seeds": True,
-                    "selection_rule": (
-                        "highest holdout macro_f1 per seed; lower validation loss "
-                        "breaks ties; exact ties retain the earlier epoch"
-                    ),
-                    "max_epochs": config.max_epochs,
-                    "early_stopping_patience": config.early_stopping_patience,
-                    "best_epoch_by_seed": {
-                        str(seed): epoch for seed, epoch in epochs_by_seed.items()
-                    },
-                    "all_seeds_retrained": True,
-                    "results": [result["summary"] for result in seed_results],
-                },
-                selection_results=seed_results,
-                validation_monitor=validation_monitor,
-            )
-            return
-
         winner = seed_results[0]
         for candidate in seed_results[1:]:
             candidate_summary = candidate["summary"]
@@ -2929,11 +2789,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         full_train_indices = winner["full_train_indices"]
         train_frame = winner["train_frame"]
         full_train_frame = frame.iloc[full_train_indices]
-        full_train_data = CompletionDataset(
-            full_train_frame["text"].tolist(),
-            encoder,
-            full_train_frame["label_id"].tolist(),
-        )
+        full_train_data = CompletionDataset.from_frame(full_train_frame, encoder)
 
         def export_winner_artifacts():
             write_split_manifest(

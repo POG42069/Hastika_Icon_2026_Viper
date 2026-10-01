@@ -97,6 +97,20 @@ def _validate_and_encode_frames(
     prediction_df = prediction_df.copy()
     train_df["text"] = train_df["Comment"].map(normalize_text)
     prediction_df["text"] = prediction_df["Comment"].map(normalize_text)
+    if task.translation_column:
+        for frame, description in (
+            (train_df, train_description),
+            (prediction_df, task.prediction_filename),
+        ):
+            _validate_columns(frame, Path(description), {task.translation_column})
+            frame["text_en"] = frame[task.translation_column].map(normalize_text)
+            missing = frame["text_en"].eq("")
+            if missing.any():
+                raise ValueError(
+                    f"{description} contains missing English translations for IDs: "
+                    f"{frame.loc[missing, 'id'].head(10).tolist()}. "
+                    "Use the translated dataset with a nonempty Comment_en column."
+                )
     label_to_id = {label: index for index, label in enumerate(task.labels)}
     train_df["label_id"] = train_df[task.label_column].map(label_to_id).astype(int)
     return train_df, prediction_df
@@ -251,7 +265,8 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
         _validate_columns(
             original,
             original_path,
-            {"id", "Comment", task.label_column},
+            {"id", "Comment", task.label_column}
+            | ({task.translation_column} if task.translation_column else set()),
         )
         original = original.copy()
         original["fold"] = fold
@@ -362,7 +377,9 @@ def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
 
 
-def load_epoch_validation_frame(task: TaskConfig) -> pd.DataFrame:
+def load_epoch_validation_frame(
+    task: TaskConfig, prediction_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Read external gold labels for reporting, independently of prediction input."""
 
     if task.epoch_validation_filename is None:
@@ -372,7 +389,39 @@ def load_epoch_validation_frame(task: TaskConfig) -> pd.DataFrame:
     _validate_columns(frame, path, {"id", "Comment", task.label_column})
     if frame.empty:
         raise ValueError(f"Labeled validation must not be empty: {path}")
+    column = task.translation_column
+    if column and (prediction_frame is not None or column not in frame.columns):
+        # Gold files need not duplicate translations: reuse the prediction input
+        # by ID, checking raw text as well so English never gets paired wrongly.
+        if prediction_frame is None:
+            prediction_frame = _read_csv(resolve_data_file(task.prediction_filename))
+        _validate_columns(
+            prediction_frame, Path(task.prediction_filename), {"id", "Comment", column}
+        )
+        if prediction_frame["id"].isna().any() or prediction_frame["id"].duplicated().any():
+            raise ValueError("Translation reference requires unique, nonmissing IDs.")
+        reference = prediction_frame.set_index("id")
+        missing_ids = ~frame["id"].isin(reference.index)
+        if missing_ids.any():
+            raise ValueError(
+                "Official validation IDs are missing from translated development: "
+                f"{frame.loc[missing_ids, 'id'].head(10).tolist()}"
+            )
+        raw = frame["id"].map(reference["Comment"]).map(normalize_text)
+        mismatch = frame["Comment"].map(normalize_text).ne(raw)
+        if mismatch.any():
+            raise ValueError(
+                "Official validation raw comments differ from development for IDs: "
+                f"{frame.loc[mismatch, 'id'].head(10).tolist()}"
+            )
+        english = frame["id"].map(reference[column])
+        if column in frame.columns and frame[column].map(normalize_text).ne(
+            english.map(normalize_text)
+        ).any():
+            raise ValueError("Official validation translations differ from development.")
+        frame[column] = english
+    prediction_columns = ["id", "Comment"] + ([column] if column else [])
     validated, _ = _validate_and_encode_frames(
-        frame, frame[["id", "Comment"]], task, str(path)
+        frame, frame[prediction_columns], task, str(path)
     )
     return validated
