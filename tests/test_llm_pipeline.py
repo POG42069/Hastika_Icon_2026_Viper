@@ -807,7 +807,6 @@ class LLMTests(unittest.TestCase):
             task = replace(
                 TASK_B,
                 selection_seeds=retrain_seeds,
-                fixed_full_retrain_epochs=5,
                 enable_augmentation_audit=False,
             )
             rows_per_fold = len(task.labels) * 2
@@ -830,6 +829,20 @@ class LLMTests(unittest.TestCase):
                             f"translated original {fold}-{i}" for i in range(rows_per_fold)
                         ],
                         task.label_column: original_labels,
+                    }
+                )
+                augment = pd.DataFrame(
+                    {
+                        "id": [f"augment-{fold}-{i}" for i in range(len(task.labels))],
+                        "Comment": [
+                            f"paraphrase {fold}-{i}" for i in range(len(task.labels))
+                        ],
+                        task.label_column: list(task.labels),
+                        "source_id": original["id"].iloc[: len(task.labels)],
+                        "source_group": [
+                            f"group-{fold}-{i}" for i in range(len(task.labels))
+                        ],
+                        "fold": fold,
                     }
                 )
                 original.to_csv(root / original_name, index=False)

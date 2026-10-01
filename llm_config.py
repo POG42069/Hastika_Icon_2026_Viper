@@ -150,11 +150,14 @@ TASK_B = TaskConfig(
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
     use_augmentation=False,
     translation_column="Comment_en",
-    selection_validation_fold=5,
+    selection_validation_fold=None,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),
+    oof_validation_folds=(1, 2, 3, 4, 5),
     full_retrain_soft_ensemble=True,
-    # Each seed selects its own best epoch on original fold 5 before retraining.
+    # Temporary variance experiment: skip OOF and train every full-data seed
+    # for exactly five epochs.
+    fixed_full_retrain_epochs=5,
     class_weight_power=0.50,
     class_weight_min=0.75,
     class_weight_max=1.50,
