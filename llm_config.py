@@ -120,7 +120,7 @@ TASK_A = TaskConfig(
     use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
-    selection_seeds=(42, 52, 62),
+    selection_seeds=(42, 52, 62, 72, 82),
     ensemble_all_seeds=True,
     report_per_class_metrics=True,
 )
