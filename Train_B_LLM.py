@@ -1,4 +1,4 @@
-"""Train Task B on English originals in Comment, five full-data epochs per seed."""
+"""Train Qwen3-4B-Instruct-2507 on English Task B originals, five epochs per seed."""
 
 from llm_config import LLM_TRAINING_B, TASK_B_LLM
 from src.llm_training import run_llm_cli

@@ -3,7 +3,13 @@
 Trên `Khangtest`, Task B train **original-only** với dataset đã dịch sang
 tiếng Anh và lưu trực tiếp trong cột `Comment`. Prompt plain text chỉ
 đưa nội dung cột này vào một lần; không yêu cầu `Comment_en`.
-Backbone vẫn là `Qwen/Qwen2.5-3B-Instruct`. Task A giữ nguyên pipeline hiện có.
+Backbone Task B là `Qwen/Qwen3-4B-Instruct-2507` (khoảng 4 tỷ tham số).
+Task A giữ nguyên `Qwen/Qwen2.5-3B-Instruct` và pipeline hiện có.
+
+Checkpoint Task B chỉ hỗ trợ **non-thinking**, không cần truyền
+`enable_thinking=False`. Xem [model card chính thức của Qwen](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507).
+Nội dung prompt, dữ liệu, loss, số seed, số epoch và hyperparameter
+giữ nguyên; chat template và tokenization dùng tokenizer của checkpoint mới.
 
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
 
@@ -108,7 +114,8 @@ Nếu phải cắt, giữ đầu comment và toàn bộ assistant label.
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone Task A | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone Task B | `Qwen/Qwen3-4B-Instruct-2507` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
@@ -135,8 +142,10 @@ Với `r=32`, `alpha=64`, hệ số scale là 2. Backbone `W0` không được
 optimizer cập nhật.
 
 Đây không phải QLoRA: code không dùng NF4, double quantization hay
-`BitsAndBytesConfig`. Qwen2.5-3B phù hợp với T4 16 GB hơn bản 7B khi dùng
-LoRA FP16. DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
+`BitsAndBytesConfig`. Task B nạp Qwen3-4B bằng LoRA FP16 trên T4.
+DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
+Batch/GPU vẫn là 4 và accumulation vẫn là 2.
+`transformers==4.57.6` trong `requirements.txt` đã hỗ trợ Qwen3.
 
 ## Dữ liệu
 
@@ -236,7 +245,7 @@ cả model DDP và tham chiếu backbone trước khi nạp seed tiếp theo.
 Có thể đổi tham số qua CLI:
 
 ```bash
-!python Train_B_LLM.py --model Qwen/Qwen2.5-3B-Instruct
+!python Train_B_LLM.py --model Qwen/Qwen3-4B-Instruct-2507
 !python Train_B_LLM.py --batch-size 4 --gradient-accumulation 2
 !python Train_B_LLM.py --single-gpu
 !python Train_B_LLM.py --prediction-file /path/to/official_inputs.csv
@@ -245,6 +254,10 @@ Có thể đổi tham số qua CLI:
 Số epoch của thí nghiệm Task B hiện được khóa bằng
 `TASK_B.fixed_full_retrain_epochs=5`; tùy chọn `--max-epochs` không thay đổi
 giá trị cố định này.
+
+Biến `HASTIKA_LLM_MODEL` vẫn ghi đè backbone mặc định; `--model` ghi đè
+checkpoint cho lượt chạy hiện tại. Nếu notebook đang đặt biến này
+thành Qwen2.5, hãy bỏ giá trị cũ hoặc truyền `--model` Qwen3 như trên.
 
 ### Log validation sau mỗi epoch của Task B
 

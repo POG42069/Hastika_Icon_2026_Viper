@@ -181,6 +181,10 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-LLM_TRAINING_B = replace(LLM_TRAINING)
+# Task A keeps its existing backbone; only Task B switches to Qwen3.
+LLM_TRAINING_B = replace(
+    LLM_TRAINING,
+    model_name=os.getenv("HASTIKA_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507"),
+)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B
