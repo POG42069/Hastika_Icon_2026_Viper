@@ -334,42 +334,72 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
     return pd.concat([originals, all_augments], ignore_index=True, sort=False)
 
 
-def _compact_original_paths(task: TaskConfig) -> tuple[Path, Path] | None:
-    """Find the two-file original-only layout when both files are available."""
-
-    if not task.compact_train_filename or not task.compact_validation_filename:
-        return None
+def _optional_data_file(name: str) -> Path | None:
     try:
-        train_path = resolve_data_file(task.compact_train_filename)
-        validation_path = resolve_data_file(task.compact_validation_filename)
-    except FileNotFoundError:
+        path = resolve_data_file(name)
+    except FileNotFoundError as exc:
+        if not str(exc).startswith(f"Could not find {name}."):
+            raise
         return None
-    if not train_path.is_file() or not validation_path.is_file():
+    return path if path.is_file() else None
+
+
+def _compact_original_paths(task: TaskConfig) -> tuple[Path, Path] | None:
+    """Select the compact originals only when both files are available."""
+
+    if task.use_augmentation:
         return None
-    if train_path.parent != validation_path.parent:
-        raise ValueError("Compact train and validation files must share one directory.")
+    names = (task.compact_train_filename, task.compact_validation_filename)
+    if not any(names):
+        return None
+    if not all(names):
+        raise ValueError("Both compact original filenames must be configured.")
+    paths = [_optional_data_file(name) for name in names]
+    if all(path is None for path in paths):
+        return None
+    if any(path is None for path in paths):
+        # The compact holdout name is also the final legacy fold name. A full
+        # legacy fold set is safe to use when the merged 1–4 file is absent.
+        if paths[0] is None and task.original_fold_filenames:
+            if all(
+                _optional_data_file(name) is not None
+                for name in task.original_fold_filenames
+            ):
+                return None
+        missing = [name for name, path in zip(names, paths) if path is None]
+        raise FileNotFoundError(
+            "The compact original dataset is incomplete; missing: "
+            + ", ".join(missing)
+        )
+    train_path, validation_path = paths
+    assert train_path is not None and validation_path is not None
     return train_path, validation_path
 
 
 def labeled_input_filenames(task: TaskConfig) -> tuple[str, ...]:
-    """List labeled inputs actually used, including the compact layout."""
+    """Return the labeled CSVs actually selected for loading and fingerprints."""
 
     if _compact_original_paths(task) is not None:
         assert task.compact_train_filename and task.compact_validation_filename
-        return task.compact_train_filename, task.compact_validation_filename
-    return task.labeled_filenames()
+        return (task.compact_train_filename, task.compact_validation_filename)
+    if task.original_fold_filenames:
+        augmentation_files = (
+            task.augmentation_fold_filenames if task.use_augmentation else ()
+        )
+        return task.original_fold_filenames + augmentation_files
+    return (task.train_filename,)
 
 
-def _load_compact_originals(task: TaskConfig, paths: tuple[Path, Path]) -> pd.DataFrame:
-    if task.selection_validation_fold is None:
-        raise ValueError("Compact originals require a predefined validation fold.")
+def _load_compact_originals(
+    task: TaskConfig, paths: tuple[Path, Path]
+) -> pd.DataFrame:
+    if task.selection_validation_fold != 5:
+        raise ValueError("Compact original files require validation fold 5.")
     frames = []
-    for path, fold in zip(paths, (0, task.selection_validation_fold), strict=True):
+    for fold, path in zip((1, 5), paths):
         frame = _read_csv(path)
         _validate_columns(frame, path, {"id", "Comment", task.label_column})
         frame = frame.copy()
-        # The merged file has no per-source fold column. Zero means the combined
-        # training group; the untouched holdout keeps its configured fold number.
         frame["fold"] = fold
         frame["data_origin"] = "original"
         frames.append(frame)
@@ -384,7 +414,7 @@ def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     compact_paths = _compact_original_paths(task)
     if compact_paths is not None:
         train_df = _load_compact_originals(task, compact_paths)
-        train_description = "merged original training file and original holdout"
+        train_description = "compact original train and validation files"
     elif task.original_fold_filenames:
         train_df = _load_predefined_folds(task)
         train_description = (

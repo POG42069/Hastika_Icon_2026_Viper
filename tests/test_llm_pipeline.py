@@ -63,10 +63,10 @@ class TestChatTokenizer:
         messages,
         tokenize=True,
         add_generation_prompt=False,
-        enable_thinking=None,
+        **kwargs,
     ):
-        self.thinking_values = getattr(self, "thinking_values", [])
-        self.thinking_values.append(enable_thinking)
+        self.template_kwargs = getattr(self, "template_kwargs", [])
+        self.template_kwargs.append(kwargs)
         role_ids = {"system": 3, "user": 4, "assistant": 5}
         ids = []
         for message in messages:
@@ -154,8 +154,8 @@ class LLMTests(unittest.TestCase):
         )
 
     def test_answer_mask_and_truncation_preserve_configured_answers(self):
-        self.assertTrue(self.tokenizer.thinking_values)
-        self.assertTrue(all(value is False for value in self.tokenizer.thinking_values))
+        self.assertTrue(self.tokenizer.template_kwargs)
+        self.assertTrue(all(not kwargs for kwargs in self.tokenizer.template_kwargs))
         self.assertEqual(TASK_A.label_codes, TASK_A.labels)
         self.assertIn(
             "Allowed labels: Non-Hate; Hate", self.encoder.system_text
@@ -190,29 +190,6 @@ class LLMTests(unittest.TestCase):
             )
             self.assertEqual(
                 self.encoder.feature(prompt, label_id)["input_ids"], expected
-            )
-
-    def test_sarvam_completion_prompt_is_compact_and_answer_only(self):
-        encoder = ChatEncoder(
-            self.tokenizer,
-            TASK_B,
-            512,
-            prompt_style="sarvam_completion",
-        )
-        messages = encoder.messages("sample comment")
-        self.assertEqual([message["role"] for message in messages], ["user"])
-        self.assertIn("Kannada-English", messages[0]["content"])
-        self.assertIn("Choose exactly one label", messages[0]["content"])
-        self.assertIn("Comment:\nsample comment\nAnswer:", messages[0]["content"])
-        self.assertNotIn("untrusted text", messages[0]["content"])
-        prompt, truncated = encoder.encode_prompt("sample comment")
-        self.assertFalse(truncated)
-        for label_id, answer in enumerate(TASK_B.label_codes):
-            expected = self.tokenizer.apply_chat_template(
-                messages + [{"role": "assistant", "content": answer}]
-            )
-            self.assertEqual(
-                encoder.feature(prompt, label_id)["input_ids"], expected
             )
 
     def test_shifted_answer_loss_matches_full_qwen_loss(self):
@@ -815,12 +792,7 @@ class LLMTests(unittest.TestCase):
                     calls.count("Development prediction from full-data adapter"),
                     len(test_seeds) if task.ensemble_all_seeds else 1,
                 )
-                encoder = ChatEncoder(
-                    self.tokenizer,
-                    task,
-                    config.max_length,
-                    prompt_style=config.prompt_style,
-                )
+                encoder = ChatEncoder(self.tokenizer, task, config.max_length)
                 data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
                 if task.ensemble_all_seeds:
                     seed_label_ids = []
@@ -877,6 +849,42 @@ class LLMTests(unittest.TestCase):
                         for index in scores["probabilities"].argmax(axis=1)
                     ]
                 self.assertEqual(result["label"].tolist(), expected)
+
+                # A second invocation over the completed local artifacts must
+                # rebuild only the ensemble reports: no model load, inference,
+                # or training is allowed.
+                with (
+                    patch("src.llm_training.require_cuda"),
+                    patch(
+                        "src.llm_training.initialize_runtime",
+                        return_value=cpu_runtime(),
+                    ),
+                    patch(
+                        "src.llm_training.AutoTokenizer.from_pretrained",
+                        return_value=self.tokenizer,
+                    ),
+                    patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                    patch(
+                        "src.llm_training.resolve_data_file", side_effect=root.joinpath
+                    ),
+                    patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                    patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                    patch(
+                        "src.llm_training.load_lora_model",
+                        side_effect=AssertionError("completed resume loaded a model"),
+                    ),
+                    patch(
+                        "src.llm_training.train_llm_epoch",
+                        side_effect=AssertionError("completed resume trained"),
+                    ),
+                    patch(
+                        "src.llm_training.score_candidates",
+                        side_effect=AssertionError("completed resume ran inference"),
+                    ),
+                ):
+                    run_llm_task(task, config, auto_resume=False)
+                resumed = pd.read_csv(output / "predictions.csv", dtype={"id": str})
+                self.assertEqual(resumed.to_dict("records"), result.to_dict("records"))
 
 
 if __name__ == "__main__":

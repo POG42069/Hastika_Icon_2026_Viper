@@ -1,4 +1,4 @@
-"""Select and retrain Sarvam-1 with LoRA, then export Task B predictions."""
+"""Select and retrain Qwen with LoRA, then export Task B predictions."""
 
 from llm_config import LLM_TRAINING_B, TASK_B_LLM
 from src.llm_training import run_llm_cli

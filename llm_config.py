@@ -29,10 +29,10 @@ class TaskConfig:
     checkpoint_subdir: str
     output_subdir: str
     submission_zip_name: str
-    compact_train_filename: str | None = None
-    compact_validation_filename: str | None = None
     original_fold_filenames: tuple[str, ...] = ()
     augmentation_fold_filenames: tuple[str, ...] = ()
+    compact_train_filename: str | None = None
+    compact_validation_filename: str | None = None
     use_augmentation: bool = True
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
@@ -46,8 +46,14 @@ class TaskConfig:
     augmentation_min_source_similarity: float = 0.20
 
     def labeled_filenames(self) -> tuple[str, ...]:
-        """Return every labeled CSV used by this task."""
+        """Return the preferred labeled CSV names for this task."""
 
+        if (
+            not self.use_augmentation
+            and self.compact_train_filename
+            and self.compact_validation_filename
+        ):
+            return (self.compact_train_filename, self.compact_validation_filename)
         if self.original_fold_filenames:
             augmentation_files = (
                 self.augmentation_fold_filenames if self.use_augmentation else ()
@@ -62,17 +68,14 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "sarvamai/sarvam-1"
+            "HASTIKA_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"
         )
     )
-    # Pin the model snapshot so a later Hub update cannot silently change a run.
-    model_revision: str = "f7c5f371d2e0bbe082caede3b3b0e1e403fc5839"
-    # Sarvam-1 is a base completion model, so use a compact downstream-task
-    # prompt rather than the verbose system/user instruction used by Qwen.
-    prompt_style: str = "sarvam_completion"
+    # Exact Hugging Face revision for Qwen2.5-3B-Instruct.
+    model_revision: str = "aa8e72537993ba99e69dfaafa59ed015b17504d1"
     validation_size: float = 0.20
     seed: int = 42
-    max_length: int = 256  # Full prompt, including the answer and EOS.
+    max_length: int = 256  # Full chat, including instructions, answer and EOS.
     max_epochs: int = 5
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
@@ -82,7 +85,7 @@ class LLMTrainingConfig:
     eval_batch_size_per_gpu: int = 2
     gradient_accumulation_steps: int = 2
     max_grad_norm: float = 1.0
-    early_stopping_patience: int = 4
+    early_stopping_patience: int = 3
     lora_rank: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
@@ -103,21 +106,21 @@ TASK_A = TaskConfig(
     label_column="Label",
     labels=("Non-Hate", "Hate"),
     label_codes=("Non-Hate", "Hate"),
-    checkpoint_subdir="task_a_sarvam1_lora",
-    output_subdir="task_a_sarvam1_lora",
+    checkpoint_subdir="task_a_qwen2_5_3b_lora",
+    output_subdir="task_a_qwen2_5_3b_lora",
     submission_zip_name="task_a_submission.zip",
-    compact_train_filename="binary_original_1_4.csv",
-    compact_validation_filename="binary_original_5.csv",
     original_fold_filenames=tuple(
         f"binary_original_{fold}.csv" for fold in range(1, 6)
     ),
     augmentation_fold_filenames=tuple(
         f"binary_augment{fold}.csv" for fold in range(1, 6)
     ),
+    compact_train_filename="binary_original_1_4.csv",
+    compact_validation_filename="binary_original_5.csv",
     use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
-    selection_seeds=(42, 52, 62, 72, 82),
+    selection_seeds=(42, 52, 62),
     ensemble_all_seeds=True,
     report_per_class_metrics=True,
 )
@@ -144,13 +147,13 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    checkpoint_subdir="task_b_sarvam1_lora",
-    output_subdir="task_b_sarvam1_lora",
+    checkpoint_subdir="task_b_qwen2_5_3b_lora",
+    output_subdir="task_b_qwen2_5_3b_lora",
     submission_zip_name="task_b_submission.zip",
-    compact_train_filename="original_1_4.csv",
-    compact_validation_filename="original_5.csv",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
+    compact_train_filename="original_1_4.csv",
+    compact_validation_filename="original_5.csv",
     use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
@@ -170,7 +173,7 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-# Standard LoRA consumes more VRAM than QLoRA, so Task B also starts at batch/GPU=1.
+# Task B currently uses the same training defaults as Task A.
 LLM_TRAINING_B = replace(LLM_TRAINING)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B

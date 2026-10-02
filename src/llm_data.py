@@ -10,9 +10,6 @@ from torch.utils.data import Dataset
 from llm_config import TaskConfig
 
 
-PROMPT_STYLES = ("chat_instruction", "sarvam_completion")
-
-
 def system_prompt(task: TaskConfig) -> str:
     """Treat the comment as data and request exactly one legal answer."""
 
@@ -20,9 +17,9 @@ def system_prompt(task: TaskConfig) -> str:
         raise ValueError("labels and label_codes must have the same length")
 
     instruction = (
-        "Detect hate speech in a Kannada-English code-mixed comment."
+        "Detect hate speech in an English comment."
         if len(task.labels) == 2
-        else "Classify the target category of a hateful Kannada-English code-mixed comment."
+        else "Classify the target category of a hateful English comment."
     )
     prefix = (
         instruction
@@ -45,31 +42,8 @@ def system_prompt(task: TaskConfig) -> str:
     )
 
 
-def sarvam_completion_prompt(task: TaskConfig, text: str) -> str:
-    """Build a compact supervised-completion prompt for the Sarvam base model."""
-
-    if len(task.labels) != len(task.label_codes):
-        raise ValueError("labels and label_codes must have the same length")
-    task_text = (
-        "Detect hate speech in this Kannada-English code-mixed comment."
-        if len(task.labels) == 2
-        else (
-            "Classify the hate-target category in this Kannada-English "
-            "code-mixed comment."
-        )
-    )
-    answer_kind = "label" if task.label_codes == task.labels else "code"
-    allowed = "; ".join(task.label_codes)
-    return (
-        f"Task: {task_text}\n"
-        f"Choose exactly one {answer_kind} from: {allowed}.\n"
-        f"Comment:\n{text}\n"
-        "Answer:"
-    )
-
-
 class ChatEncoder:
-    """Keep the model scaffold and complete answer when truncating comments.
+    """Keep the chat scaffold and complete answer when truncating long comments.
 
     Each configured answer is encoded as an assistant response with the model's own template.
     The longest response is reserved for EVERY candidate, so candidate scores for
@@ -77,30 +51,15 @@ class ChatEncoder:
     single-token labels, newlines, EOS IDs, or role-token spellings are made.
     """
 
-    def __init__(
-        self,
-        tokenizer: object,
-        task: TaskConfig,
-        max_length: int,
-        prompt_style: str = "chat_instruction",
-    ) -> None:
+    def __init__(self, tokenizer: object, task: TaskConfig, max_length: int) -> None:
         if not tokenizer.chat_template:
             raise ValueError("The LLM tokenizer must provide a chat template.")
         if tokenizer.pad_token_id is None:
             raise ValueError("The LLM tokenizer must have a padding token.")
-        if prompt_style not in PROMPT_STYLES:
-            raise ValueError(
-                f"prompt_style must be one of {PROMPT_STYLES}, got {prompt_style!r}"
-            )
         self.tokenizer = tokenizer
         self.task = task
         self.max_length = max_length
-        self.prompt_style = prompt_style
-        self.system_text = (
-            system_prompt(task)
-            if prompt_style == "chat_instruction"
-            else sarvam_completion_prompt(task, "<COMMENT>")
-        )
+        self.system_text = system_prompt(task)
         empty_messages = self.messages("")
         empty_prompt = self._template(empty_messages, generation=True)
         self.completions = []
@@ -111,9 +70,8 @@ class ChatEncoder:
             )
             if full[: len(empty_prompt)] != empty_prompt:
                 raise ValueError(
-                    "The tokenizer template changes the prompt when an assistant answer "
-                    "is appended, so answer-only training cannot identify a stable "
-                    "completion boundary."
+                    "Chat template response prefix is incompatible with "
+                    "answer-only training."
                 )
             completion = full[len(empty_prompt) :]
             if not completion:
@@ -132,13 +90,6 @@ class ChatEncoder:
             )
 
     def messages(self, text: str) -> list[dict[str, str]]:
-        if self.prompt_style == "sarvam_completion":
-            return [
-                {
-                    "role": "user",
-                    "content": sarvam_completion_prompt(self.task, text),
-                }
-            ]
         return [
             {"role": "system", "content": self.system_text},
             {"role": "user", "content": "Comment:\n" + text},
@@ -150,10 +101,6 @@ class ChatEncoder:
                 messages,
                 tokenize=True,
                 add_generation_prompt=generation,
-                # Candidate scoring/training must predict the label directly.
-                # Thinking-capable templates otherwise may prepend a reasoning
-                # block before the assistant answer. Other templates ignore it.
-                enable_thinking=False,
             )
         )
 
