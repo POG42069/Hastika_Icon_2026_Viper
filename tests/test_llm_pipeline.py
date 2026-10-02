@@ -11,6 +11,7 @@ import copy
 import json
 import tempfile
 import unittest
+import weakref
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -831,20 +832,6 @@ class LLMTests(unittest.TestCase):
                         task.label_column: original_labels,
                     }
                 )
-                augment = pd.DataFrame(
-                    {
-                        "id": [f"augment-{fold}-{i}" for i in range(len(task.labels))],
-                        "Comment": [
-                            f"paraphrase {fold}-{i}" for i in range(len(task.labels))
-                        ],
-                        task.label_column: list(task.labels),
-                        "source_id": original["id"].iloc[: len(task.labels)],
-                        "source_group": [
-                            f"group-{fold}-{i}" for i in range(len(task.labels))
-                        ],
-                        "fold": fold,
-                    }
-                )
                 original.to_csv(root / original_name, index=False)
                 # Deliberately unreadable: original-only training must not touch it.
                 (root / augment_name).write_text("invalid augmentation CSV", encoding="utf-8")
@@ -877,8 +864,12 @@ class LLMTests(unittest.TestCase):
             train_calls = []
 
             def model_factory(*_args, **_kwargs):
+                self.assertTrue(
+                    all(reference() is None for reference in loaded_models),
+                    "Previous full-data model must be released before the next seed loads.",
+                )
                 model = tiny_model()
-                loaded_models.append(model)
+                loaded_models.append(weakref.ref(model))
                 return model
 
             def tracked_train(*args, **kwargs):
@@ -897,7 +888,7 @@ class LLMTests(unittest.TestCase):
                     "src.llm_training.initialize_runtime", return_value=cpu_runtime()
                 ),
                 patch(
-                    "src.llm_training.load_lora_model", side_effect=model_factory
+                    "src.llm_training.load_lora_model", new=model_factory
                 ),
                 patch(
                     "src.llm_training.AutoTokenizer.from_pretrained",
@@ -910,10 +901,10 @@ class LLMTests(unittest.TestCase):
                 patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
                 patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
                 patch(
-                    "src.llm_training.score_candidates", side_effect=real_score
+                    "src.llm_training.score_candidates", new=real_score
                 ),
                 patch(
-                    "src.llm_training.train_llm_epoch", side_effect=tracked_train
+                    "src.llm_training.train_llm_epoch", new=tracked_train
                 ),
                 patch("src.llm_training.log") as logged,
             ):
@@ -992,6 +983,10 @@ class LLMTests(unittest.TestCase):
                 self.assertEqual(archive.namelist(), ["predictions.csv"])
 
             self.assertEqual(len(loaded_models), len(retrain_seeds))
+            self.assertTrue(
+                all(reference() is None for reference in loaded_models),
+                "The last full-data model must also be released after prediction.",
+            )
             self.assertEqual(
                 [call["rows"] for call in train_calls],
                 [rows_per_fold * 5]

@@ -1601,7 +1601,9 @@ def _run_fixed_epoch_full_retrain_ensemble(
                 "validation_loss": validation_metrics["loss"],
             }
         )
-        del model, full_loader
+        # Both names own the backbone (model may be its DDP wrapper). Release
+        # the unwrapped alias too before loading the next full-data seed.
+        del model, loaded_model, full_loader
         gc.collect()
         torch.cuda.empty_cache()
 

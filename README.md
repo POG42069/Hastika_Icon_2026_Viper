@@ -2,9 +2,10 @@
 
 Trên `Khangtest3`, Task B train **original-only** và đưa cả comment raw
 code-mixed lẫn bản dịch tiếng Anh `Comment_en` vào cùng prompt plain text.
-Nhánh này lấy từ `Khangtest` tại commit `4b8d507`; chỉ đổi backbone
-Task B sang `Qwen/Qwen3-4B-Instruct-2507` (4,0 tỷ tham số). Task A giữ
-nguyên `Qwen/Qwen2.5-3B-Instruct` và pipeline hiện có.
+Nhánh này lấy từ `Khangtest` tại commit `4b8d507`. Task B đổi backbone
+sang `Qwen/Qwen3-4B-Instruct-2507` (4,0 tỷ tham số), giữ các cấu hình
+huấn luyện còn lại. Task A giữ nguyên `Qwen/Qwen2.5-3B-Instruct` và
+pipeline hiện có.
 
 Checkpoint Task B chỉ hỗ trợ **non-thinking**, không cần truyền
 `enable_thinking=False`. Xem [model card chính thức của Qwen](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507).
@@ -239,6 +240,11 @@ kết quả.
 ```
 
 Khi Kaggle có T4 x2, entry point tự relaunch bằng DDP với hai worker.
+
+Sau khi lưu adapter và dự đoán xong mỗi seed Task B, code giải phóng
+cả model DDP và tham chiếu backbone `loaded_model` trước khi nạp seed
+tiếp theo. Điều này sửa lỗi giữ model seed trước trong VRAM khi
+chuyển từ seed 42 sang seed 52; không đổi batch size hay số epoch.
 
 Có thể đổi tham số qua CLI:
 
