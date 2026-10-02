@@ -424,4 +424,28 @@ def load_epoch_validation_frame(
     validated, _ = _validate_and_encode_frames(
         frame, frame[prediction_columns], task, str(path)
     )
+    if task.epoch_validation_input_filename and column is None:
+        # The gold CSV retains raw comments while the translated dataset stores
+        # English in Comment. Match labels to that English input by ID, never
+        # row position, and retain the original gold Comment for traceability.
+        # Read the dedicated validation input even when --prediction-file is test.
+        input_path = resolve_data_file(task.epoch_validation_input_filename)
+        inputs = _read_csv(input_path)
+        _validate_columns(inputs, input_path, {"id", "Comment"})
+        if inputs["id"].isna().any() or inputs["id"].duplicated().any():
+            raise ValueError("English validation input requires unique, nonmissing IDs.")
+        reference = inputs.set_index("id")["Comment"].map(normalize_text)
+        missing_ids = ~validated["id"].isin(reference.index)
+        if missing_ids.any():
+            raise ValueError(
+                "Official validation IDs are missing from English validation input: "
+                f"{validated.loc[missing_ids, 'id'].head(10).tolist()}"
+            )
+        english = validated["id"].map(reference)
+        if english.eq("").any():
+            raise ValueError(
+                "English validation input contains empty comments for IDs: "
+                f"{validated.loc[english.eq(''), 'id'].head(10).tolist()}"
+            )
+        validated["text"] = english
     return validated

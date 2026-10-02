@@ -1354,11 +1354,26 @@ class TaskBValidationMonitor:
             "truncated_comments": self.data.truncated_count,
             "purpose": "reporting only; never used for training or epoch selection",
         }
+        if task.epoch_validation_input_filename and task.translation_column is None:
+            input_path = resolve_data_file(task.epoch_validation_input_filename)
+            self.summary["input_text_source"] = {
+                "filename": task.epoch_validation_input_filename,
+                "column": "Comment",
+                "language": task.comment_language,
+                "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
+                "alignment": "match English input to gold labels by id; preserve gold row order",
+            }
         log(
             f"Task B per-epoch validation | file={task.epoch_validation_filename} "
             f"| rows={len(self.data)} | reporting only",
             runtime,
         )
+        if "input_text_source" in self.summary:
+            log(
+                "Task B validation input | English Comment from "
+                f"{task.epoch_validation_input_filename} | gold labels matched by id",
+                runtime,
+            )
 
     def evaluate(self, model, seed: int, epoch: int, output_dir: Path) -> dict:
         heading = f"Official validation | seed={seed} | epoch={epoch}"
@@ -1601,7 +1616,9 @@ def _run_fixed_epoch_full_retrain_ensemble(
                 "validation_loss": validation_metrics["loss"],
             }
         )
-        del model, full_loader
+        # Release the unwrapped alias as well as any DDP wrapper before loading
+        # the next seed, so the previous backbone cannot remain in VRAM.
+        del model, loaded_model, full_loader
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1701,10 +1718,16 @@ def _run_fixed_epoch_full_retrain_ensemble(
                 "parameters": parameter_counts,
                 "system_prompt": encoder.system_text,
                 "prompt_input": {
-                    "raw_column": "Comment",
+                    "comment_column": "Comment",
+                    "comment_language": task.comment_language,
+                    "raw_column": None if task.comment_language == "English" else "Comment",
                     "translation_column": task.translation_column,
                     "use_augmentation": task.use_augmentation,
-                    "truncation": "share content budget between raw and English; preserve chat and labels",
+                    "truncation": (
+                        "share content budget between raw and English; preserve chat and labels"
+                        if task.translation_column
+                        else "truncate Comment only; preserve chat and labels"
+                    ),
                 },
                 "label_order": list(task.labels),
                 "completion_token_ids": encoder.completions,
@@ -2373,6 +2396,13 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 f"Task B inputs | original-only={not task.use_augmentation} "
                 f"| train={len(frame)} | development={len(prediction_frame)} "
                 f"| prompt=raw Comment + English {task.translation_column}",
+                runtime,
+            )
+        elif task.comment_language == "English":
+            log(
+                f"Task B inputs | original-only={not task.use_augmentation} "
+                f"| train={len(frame)} | development={len(prediction_frame)} "
+                "| prompt=English Comment only | Comment_en not required",
                 runtime,
             )
         if task.fixed_full_retrain_epochs is not None:

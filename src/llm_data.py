@@ -17,9 +17,9 @@ def system_prompt(task: TaskConfig) -> str:
         raise ValueError("labels and label_codes must have the same length")
 
     instruction = (
-        "Detect hate speech in a Kannada-English code-mixed comment."
+        f"Detect hate speech in a {task.comment_language} comment."
         if len(task.labels) == 2
-        else "Classify the target category of a hateful Kannada-English code-mixed comment."
+        else f"Classify the target category of a hateful {task.comment_language} comment."
     )
     prefix = (
         instruction

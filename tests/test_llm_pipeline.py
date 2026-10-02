@@ -11,6 +11,7 @@ import copy
 import json
 import tempfile
 import unittest
+import weakref
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -803,7 +804,7 @@ class LLMTests(unittest.TestCase):
     def test_task_b_skips_oof_and_soft_ensembles_fixed_epoch_full_models(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            retrain_seeds = (42, 52)
+            retrain_seeds = TASK_B.selection_seeds
             task = replace(
                 TASK_B,
                 selection_seeds=retrain_seeds,
@@ -823,26 +824,9 @@ class LLMTests(unittest.TestCase):
                     {
                         "id": [f"original-{fold}-{i}" for i in range(rows_per_fold)],
                         "Comment": [
-                            f"original comment {fold}-{i}" for i in range(rows_per_fold)
-                        ],
-                        "Comment_en": [
-                            f"translated original {fold}-{i}" for i in range(rows_per_fold)
+                            f"English original comment {fold}-{i}" for i in range(rows_per_fold)
                         ],
                         task.label_column: original_labels,
-                    }
-                )
-                augment = pd.DataFrame(
-                    {
-                        "id": [f"augment-{fold}-{i}" for i in range(len(task.labels))],
-                        "Comment": [
-                            f"paraphrase {fold}-{i}" for i in range(len(task.labels))
-                        ],
-                        task.label_column: list(task.labels),
-                        "source_id": original["id"].iloc[: len(task.labels)],
-                        "source_group": [
-                            f"group-{fold}-{i}" for i in range(len(task.labels))
-                        ],
-                        "fold": fold,
                     }
                 )
                 original.to_csv(root / original_name, index=False)
@@ -852,15 +836,14 @@ class LLMTests(unittest.TestCase):
             prediction_frame = pd.DataFrame(
                 {
                     "id": ["0100", "0101", "0102"],
-                    "Comment": ["one", "two", "three"],
-                    "Comment_en": ["English one", "English two", "English three"],
+                    "Comment": ["English one", "English two", "English three"],
                 }
             )
             prediction_frame.to_csv(root / task.prediction_filename, index=False)
             gold_frame = pd.DataFrame(
                 {
                     "id": prediction_frame["id"],
-                    "Comment": prediction_frame["Comment"],
+                    "Comment": ["raw comment one", "raw comment two", "raw comment three"],
                     task.label_column: list(task.labels[:len(prediction_frame)]),
                 }
             )
@@ -877,9 +860,21 @@ class LLMTests(unittest.TestCase):
             train_calls = []
 
             def model_factory(*_args, **_kwargs):
+                self.assertTrue(
+                    all(reference() is None for reference in loaded_models),
+                    "Previous full-data model must be released before the next seed loads.",
+                )
                 model = tiny_model()
-                loaded_models.append(model)
+                loaded_models.append(weakref.ref(model))
                 return model
+
+            def tracked_score(*args, **kwargs):
+                dataset = args[1]
+                self.assertEqual(dataset.prompts, [
+                    ChatEncoder(self.tokenizer, task, config.max_length).encode_prompt(text)[0]
+                    for text in prediction_frame["Comment"]
+                ])
+                return real_score(*args, **kwargs)
 
             def tracked_train(*args, **kwargs):
                 train_calls.append(
@@ -897,7 +892,7 @@ class LLMTests(unittest.TestCase):
                     "src.llm_training.initialize_runtime", return_value=cpu_runtime()
                 ),
                 patch(
-                    "src.llm_training.load_lora_model", side_effect=model_factory
+                    "src.llm_training.load_lora_model", new=model_factory
                 ),
                 patch(
                     "src.llm_training.AutoTokenizer.from_pretrained",
@@ -910,10 +905,10 @@ class LLMTests(unittest.TestCase):
                 patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
                 patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
                 patch(
-                    "src.llm_training.score_candidates", side_effect=real_score
+                    "src.llm_training.score_candidates", new=tracked_score
                 ),
                 patch(
-                    "src.llm_training.train_llm_epoch", side_effect=tracked_train
+                    "src.llm_training.train_llm_epoch", new=tracked_train
                 ),
                 patch("src.llm_training.log") as logged,
             ):
@@ -992,17 +987,21 @@ class LLMTests(unittest.TestCase):
                 self.assertEqual(archive.namelist(), ["predictions.csv"])
 
             self.assertEqual(len(loaded_models), len(retrain_seeds))
+            self.assertTrue(all(reference() is None for reference in loaded_models))
             self.assertEqual(
                 [call["rows"] for call in train_calls],
                 [rows_per_fold * 5]
                 * (len(retrain_seeds) * task.fixed_full_retrain_epochs),
             )
             self.assertTrue(all(
-                "original comment 1-0" in call["prompt"]
-                and "English translation:\ntranslated original 1-0" in call["prompt"]
+                "Comment:\nEnglish original comment 1-0" in call["prompt"]
+                and "English translation:" not in call["prompt"]
+                and "raw code-mixed" not in call["prompt"]
                 for call in train_calls
             ))
-            self.assertEqual(summary["prompt_input"]["translation_column"], "Comment_en")
+            self.assertIsNone(summary["prompt_input"]["translation_column"])
+            self.assertEqual(summary["prompt_input"]["comment_column"], "Comment")
+            self.assertEqual(summary["prompt_input"]["comment_language"], "English")
             self.assertFalse(summary["prompt_input"]["use_augmentation"])
             self.assertFalse(any(name.startswith("augment") for name in summary["input_sha256"]))
             self.assertTrue(

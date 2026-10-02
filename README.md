@@ -1,7 +1,8 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
-Trên `Khangtest`, Task B train **original-only** và đưa cả comment raw
-code-mixed lẫn bản dịch tiếng Anh `Comment_en` vào cùng prompt plain text.
+Trên `Khangtest`, Task B train **original-only** với dataset đã dịch sang
+tiếng Anh và lưu trực tiếp trong cột `Comment`. Prompt plain text chỉ
+đưa nội dung cột này vào một lần; không yêu cầu `Comment_en`.
 Backbone vẫn là `Qwen/Qwen2.5-3B-Instruct`. Task A giữ nguyên pipeline hiện có.
 
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
@@ -43,7 +44,7 @@ Task B không còn downsample Gender và không loại bất kỳ câu train nà
 
 Class-weighted loss vẫn được áp dụng cho cả năm model. Mỗi model được khởi tạo
 mới để mọi hàng dữ liệu được học đúng năm epoch như nhau.
-Prompt raw + English được áp dụng nhất quán ở train, validation mỗi epoch
+Prompt tiếng Anh được áp dụng nhất quán ở train, validation mỗi epoch
 và development prediction. Nhãn gold chỉ dùng cho loss hoặc tính metric.
 
 ## Class-weighted loss của Task B
@@ -98,10 +99,10 @@ tokenizer:
 - Không xóa stopword, không lemmatize và không chuẩn hóa ký tự/từ lặp.
 
 Khi comment quá dài, `ChatEncoder` chỉ cắt phần comment để system prompt và
-assistant label vẫn nằm trong `max_length`. Với Task B, phần token còn lại
-được chia cho raw và English; phần ngắn nhường token thừa cho phần dài.
-Nếu phải cắt, giữ đầu của cả hai phần, các tiêu đề và toàn bộ assistant label.
-`max_length` vẫn là 256; việc thêm bản dịch không tự tăng giới hạn này.
+assistant label vẫn nằm trong `max_length`. Task B chỉ dùng cột `Comment`
+tiếng Anh, nên không chia ngân sách token cho hai bản raw/English.
+Nếu phải cắt, giữ đầu comment và toàn bộ assistant label.
+`max_length` vẫn là 256.
 
 ## Cấu hình LoRA mặc định
 
@@ -163,17 +164,19 @@ Các file augment Task A cần thêm `source_id`,
 `source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn cùng fold,
 nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
 
-Task B: dùng năm original và development từ `enhanced_hastika_augment_translate.zip`.
-Original cần `id`, `Comment`, `Comment_en`, `Hate Category`; development cần
-`id`, `Comment`, `Comment_en`. Thiếu cột hoặc bản dịch trống sẽ báo lỗi,
-không tự dịch và không bỏ qua English. Các file augment có thể vẫn nằm trong
-dataset nhưng Task B không đọc chúng.
+Task B: năm original cần `id`, `Comment`, `Hate Category`; development cần
+`id`, `Comment`. Trong cả năm original và development, `Comment` phải là
+phiên bản đã dịch sang tiếng Anh. Code không tự dịch và không đọc
+`Comment_en`, kể cả khi cột này có trong file. Các file augment có thể
+vẫn nằm trong dataset nhưng Task B không đọc chúng.
 
 `hastika_multiclass_validation.csv` vẫn là file gold để báo cáo metric, không
-tham gia train. File này không bắt buộc có `Comment_en`: loader ghép bản dịch
-từ development theo ID và kiểm tra comment raw khớp sau chuẩn hóa nhẹ. ID
-thiếu, raw không khớp hoặc bản dịch có sẵn khác development sẽ báo lỗi.
-Thứ tự file gold được giữ nguyên khi ghép.
+tham gia train. File này giữ nguyên comment code-mixed và nhãn của BTC.
+Loader lấy nhãn từ file gold, ghép với `Comment` tiếng Anh trong
+`multiclass_validation_inputs.csv` theo `id`, và giữ thứ tự file gold.
+Model chỉ nhận tiếng Anh; comment raw trong gold không vào prompt.
+Không cần dịch lại hoặc sửa file gold. ID thiếu/trùng hay comment
+tiếng Anh rỗng sẽ báo lỗi. Tên và nhãn sáu class giữ nguyên.
 
 `augmentation_audit.csv` của Task A đánh dấu câu quá ngắn, trùng lặp, quá khác câu
 nguồn hoặc gần giống original khác. Cấu hình
@@ -200,17 +203,15 @@ Prompt liệt kê các nhãn hợp lệ; file submission giữ nguyên tên nhã
 User prompt Task B (plain text, không mã hóa A–F):
 
 ```text
-Comment (raw code-mixed):
-<normalized Comment>
-
-English translation:
-<normalized Comment_en>
+Comment:
+<normalized English Comment>
 ```
 
-Nội dung system prompt và cách chấm likelihood của nhãn giữ nguyên. Không
+System prompt ghi rõ comment tiếng Anh; cách chấm likelihood của nhãn giữ nguyên. Không
 đưa nhãn gold hoặc ghi chú trong `translation_audit.csv` vào user prompt.
-`run_summary.json` ghi thêm `prompt_input` để xác nhận cột raw, cột dịch,
-augmentation đã tắt và cách truncate.
+`run_summary.json` ghi `prompt_input` để xác nhận cột `Comment`, ngôn ngữ
+tiếng Anh, augmentation đã tắt và cách truncate. Metadata validation ghi
+cả SHA-256 file gold và file input tiếng Anh dùng để ghép theo ID.
 
 Code gọi `apply_chat_template`. Prompt và padding được mask bằng `-100`;
 loss chỉ áp dụng cho token của assistant label và token kết thúc chat. Khi dự
@@ -229,6 +230,9 @@ kết quả.
 
 Khi Kaggle có T4 x2, entry point tự relaunch bằng DDP với hai worker.
 
+Cuối mỗi seed Task B, code lưu adapter, dự đoán, rồi giải phóng
+cả model DDP và tham chiếu backbone trước khi nạp seed tiếp theo.
+
 Có thể đổi tham số qua CLI:
 
 ```bash
@@ -246,8 +250,9 @@ giá trị cố định này.
 
 Thêm file gold `hastika_multiclass_validation.csv` của BTC vào Kaggle Dataset
 hoặc `data/`. File cần các cột `id`, `Comment`, `Hate Category` và có 395 câu.
-Pipeline đọc file này độc lập với input dùng để tạo submission, nên vẫn có
-thể dùng `--prediction-file` để dự đoán test không nhãn.
+Pipeline ghép nhãn từ file này với `multiclass_validation_inputs.csv`
+đã dịch sang tiếng Anh theo ID. Khi dùng `--prediction-file` để dự đoán
+test không nhãn, validation vẫn lấy tiếng Anh từ file development cố định.
 
 Sau mỗi epoch của từng seed, Task B đánh giá trên gold validation và in:
 
@@ -261,7 +266,7 @@ train; ID trùng với train sẽ gây lỗi. Trạng thái RNG được giữ l
 để bước đánh giá không làm thay đổi random của epoch train tiếp theo.
 
 Khi cả năm model hoàn tất, code cũng in metric của soft ensemble trên cùng
-gold validation. Metric này dùng để so sánh hai nhánh có/không augment.
+gold validation. Metric này dùng để so sánh các thí nghiệm Task B.
 Task A giữ nguyên pipeline và cách log hiện tại.
 
 Metric mỗi epoch được lưu trong `seed_<seed>/full_data_training_history.json`.

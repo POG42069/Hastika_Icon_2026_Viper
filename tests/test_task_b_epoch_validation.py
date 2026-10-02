@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from llm_config import LLMTrainingConfig, TASK_A, TASK_B
+from llm_config import TASK_A, TASK_B, LLMTrainingConfig
 from src.data import load_epoch_validation_frame
 from src.llm_data import ChatEncoder, CompletionCollator
 from src.llm_training import (
@@ -29,10 +29,15 @@ class TaskBEpochValidationTests(unittest.TestCase):
             {
                 "id": [f"gold-{i}" for i in range(len(TASK_B.labels))],
                 "Comment": [f"comment {i}" for i in range(len(TASK_B.labels))],
-                "Comment_en": [f"English {i}" for i in range(len(TASK_B.labels))],
                 TASK_B.label_column: list(TASK_B.labels),
             }
         )
+
+    def write_inputs(self, root: Path) -> None:
+        pd.DataFrame({
+            "id": self.gold()["id"],
+            "Comment": [f"English {i}" for i in range(len(TASK_B.labels))],
+        }).to_csv(root / TASK_B.epoch_validation_input_filename, index=False)
 
     def test_external_gold_schema_and_labels_are_validated(self):
         for invalid in ("missing_label", "duplicate_id", "unknown_label", "empty"):
@@ -48,26 +53,32 @@ class TaskBEpochValidationTests(unittest.TestCase):
                 else:
                     gold = gold.iloc[:0]
                 gold.to_csv(root / TASK_B.epoch_validation_filename, index=False)
-                with patch("src.data.resolve_data_file", side_effect=root.joinpath):
-                    with self.assertRaises(ValueError):
-                        load_epoch_validation_frame(TASK_B)
+                with (
+                    patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                    self.assertRaises(ValueError),
+                ):
+                    load_epoch_validation_frame(TASK_B)
 
     def test_monitor_rejects_validation_ids_in_training(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.gold().to_csv(root / TASK_B.epoch_validation_filename, index=False)
+            self.write_inputs(root)
             encoder = ChatEncoder(TestChatTokenizer(), TASK_B, 512)
-            with patch("src.data.resolve_data_file", side_effect=root.joinpath):
-                with self.assertRaisesRegex(ValueError, "must not occur in training"):
-                    TaskBValidationMonitor(
-                        TASK_B, LLMTrainingConfig(), cpu_runtime(),
-                        pd.DataFrame({"id": ["gold-0"]}), encoder, CompletionCollator(0),
-                    )
+            with (
+                patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                self.assertRaisesRegex(ValueError, "must not occur in training"),
+            ):
+                TaskBValidationMonitor(
+                    TASK_B, LLMTrainingConfig(), cpu_runtime(),
+                    pd.DataFrame({"id": ["gold-0"]}), encoder, CompletionCollator(0),
+                )
 
     def test_epoch_report_preserves_rng_mode_and_writes_full_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.gold().to_csv(root / TASK_B.epoch_validation_filename, index=False)
+            self.write_inputs(root)
             config = replace(LLMTrainingConfig(), max_length=512)
             encoder = ChatEncoder(TestChatTokenizer(), TASK_B, 512)
             with (
