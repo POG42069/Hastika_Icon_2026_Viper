@@ -1,5 +1,6 @@
 """Regressions for paired comments, safe truncation, loading and resume policy."""
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,13 +10,72 @@ import os
 import pandas as pd
 
 from llm_config import TASK_A, TASK_B, LLMTrainingConfig
-from src.data import load_task_frames, prompt_inputs, resolve_data_file
+from src.data import (
+    _optional_data_file, labeled_input_filenames, load_task_frames,
+    prompt_inputs, resolve_data_file,
+)
 from src.llm_data import ChatEncoder, CompletionDataset
 from src.llm_training import _resume_signature
 from tests.test_llm_pipeline import TestChatTokenizer, cpu_runtime
 
 
 class BilingualTests(unittest.TestCase):
+    def test_selected_directory_loads_five_bilingual_folds_without_merged_file(self):
+        for task in (TASK_A, TASK_B):
+            with self.subTest(task=task.task_name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for fold, filename in enumerate(task.original_fold_filenames, start=1):
+                    pd.DataFrame({
+                        'id': [f'{fold:03d}'],
+                        'Comment': [f'English {fold}!'],
+                        'OriginalComment': [f'Original {fold}!'],
+                        task.label_column: [task.labels[(fold - 1) % len(task.labels)]],
+                    }).to_csv(root / filename, index=False)
+                pd.DataFrame({
+                    'id': ['006'], 'Comment': ['English prediction!'],
+                    'OriginalComment': ['Original prediction!'],
+                }).to_csv(root / task.prediction_filename, index=False)
+                # Keep real file resolution and its environment-dependent errors.
+                resolver = partial(resolve_data_file, configured_dir=root)
+                with patch.dict(os.environ, {'HASTIKA_DATA_DIR': directory}), patch(
+                    'src.data.resolve_data_file', side_effect=resolver,
+                ):
+                    frame, prediction = load_task_frames(task)
+                    filenames = labeled_input_filenames(task)
+                self.assertEqual(filenames, task.original_fold_filenames)
+                self.assertEqual(frame['id'].tolist(), ['001', '002', '003', '004', '005'])
+                self.assertEqual(frame['fold'].tolist(), [1, 2, 3, 4, 5])
+                self.assertEqual(frame['data_origin'].tolist(), ['original'] * 5)
+                self.assertEqual(frame[task.label_column].tolist(), [
+                    task.labels[(fold - 1) % len(task.labels)] for fold in range(1, 6)
+                ])
+                self.assertEqual(prompt_inputs(frame, task), [
+                    (f'English {fold}!', f'Original {fold}!') for fold in range(1, 6)
+                ])
+                self.assertEqual(prompt_inputs(prediction, task), [
+                    ('English prediction!', 'Original prediction!')
+                ])
+
+    def test_selected_directory_missing_required_fold_still_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame({
+                'id': ['001'], 'Comment': ['English'], 'OriginalComment': ['Original'],
+            }).to_csv(root / TASK_A.prediction_filename, index=False)
+            resolver = partial(resolve_data_file, configured_dir=root)
+            with patch.dict(os.environ, {'HASTIKA_DATA_DIR': directory}), patch(
+                'src.data.resolve_data_file', side_effect=resolver,
+            ):
+                with self.assertRaisesRegex(FileNotFoundError, 'binary_original_1.csv'):
+                    load_task_frames(TASK_A)
+
+    def test_optional_lookup_does_not_suppress_ambiguous_dataset_error(self):
+        with patch('src.data.resolve_data_file', side_effect=FileNotFoundError(
+            'Found multiple copies of original_1_4.csv. Set HASTIKA_DATA_DIR.'
+        )):
+            with self.assertRaisesRegex(FileNotFoundError, 'multiple copies'):
+                _optional_data_file('original_1_4.csv')
+
     def test_explicit_dataset_directory_cannot_borrow_missing_file_from_an_old_release(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

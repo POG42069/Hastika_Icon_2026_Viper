@@ -14,6 +14,10 @@ from llm_config import DATA_DIR, OUTPUT_ROOT, TaskConfig
 from src.preprocessing import normalize_text
 
 
+class MissingDataFileError(FileNotFoundError):
+    """An input is absent, rather than ambiguous among attached datasets."""
+
+
 def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
     """Find an input locally or in an attached Kaggle Dataset."""
 
@@ -23,7 +27,7 @@ def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
     if "HASTIKA_DATA_DIR" in os.environ:
         # An explicitly selected release must not borrow a missing compact
         # file (or any other input) from an older attached dataset.
-        raise FileNotFoundError(
+        raise MissingDataFileError(
             f"Could not find {filename} in the selected HASTIKA_DATA_DIR: {configured_dir}"
         )
     candidates = [Path(__file__).resolve().parents[1] / "data" / filename]
@@ -43,7 +47,7 @@ def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
                 f"the intended directory:\n  - {rendered}"
             )
 
-    raise FileNotFoundError(
+    raise MissingDataFileError(
         f"Could not find {filename}. Attach the private HASTIKA dataset on "
         "Kaggle or set the HASTIKA_DATA_DIR environment variable."
     )
@@ -367,9 +371,9 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
 def _optional_data_file(name: str) -> Path | None:
     try:
         path = resolve_data_file(name)
-    except FileNotFoundError as exc:
-        if not str(exc).startswith(f"Could not find {name}."):
-            raise
+    except MissingDataFileError:
+        # A missing optional compact file permits the original-fold fallback.
+        # Ambiguous dataset paths and other resolution errors still propagate.
         return None
     return path if path.is_file() else None
 
