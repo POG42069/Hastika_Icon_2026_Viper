@@ -1354,14 +1354,19 @@ class TaskBValidationMonitor:
             "truncated_comments": self.data.truncated_count,
             "purpose": "reporting only; never used for training or epoch selection",
         }
-        if task.epoch_validation_input_filename and task.translation_column is None:
+        if task.epoch_validation_input_filename:
             input_path = resolve_data_file(task.epoch_validation_input_filename)
             self.summary["input_text_source"] = {
                 "filename": task.epoch_validation_input_filename,
                 "column": "Comment",
+                "translation_column": task.translation_column,
                 "language": task.comment_language,
                 "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
-                "alignment": "match English input to gold labels by id; preserve gold row order",
+                "alignment": (
+                    "match raw + English input to gold by id; verify raw text; preserve gold row order"
+                    if task.translation_column
+                    else "match English input to gold labels by id; preserve gold row order"
+                ),
             }
         log(
             f"Task B per-epoch validation | file={task.epoch_validation_filename} "
@@ -1369,8 +1374,12 @@ class TaskBValidationMonitor:
             runtime,
         )
         if "input_text_source" in self.summary:
+            fields = (
+                f"raw Comment + English {task.translation_column}"
+                if task.translation_column else "English Comment"
+            )
             log(
-                "Task B validation input | English Comment from "
+                f"Task B validation input | {fields} from "
                 f"{task.epoch_validation_input_filename} | gold labels matched by id",
                 runtime,
             )

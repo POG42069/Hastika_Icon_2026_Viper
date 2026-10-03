@@ -1,15 +1,15 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
-Trên `Khangtest`, Task B train **original-only** với dataset đã dịch sang
-tiếng Anh và lưu trực tiếp trong cột `Comment`. Prompt plain text chỉ
-đưa nội dung cột này vào một lần; không yêu cầu `Comment_en`.
+Trên `Khangtest`, Task B train **original-only** với hai phiên bản của mỗi câu:
+`Comment` giữ code-mixed gốc, `Comment_en` giữ bản dịch tiếng Anh. Prompt plain
+text đưa cả hai vào cùng một user message.
 Backbone Task B là `Qwen/Qwen3-4B-Instruct-2507` (khoảng 4 tỷ tham số).
 Task A giữ nguyên `Qwen/Qwen2.5-3B-Instruct` và pipeline hiện có.
 
 Checkpoint Task B chỉ hỗ trợ **non-thinking**, không cần truyền
 `enable_thinking=False`. Xem [model card chính thức của Qwen](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507).
-Nội dung prompt, dữ liệu, loss, số seed, số epoch và hyperparameter
-giữ nguyên; chat template và tokenization dùng tokenizer của checkpoint mới.
+Loss, số seed, số epoch và hyperparameter giữ nguyên; chat template và
+tokenization dùng tokenizer của checkpoint.
 
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
 
@@ -50,7 +50,7 @@ Task B không còn downsample Gender và không loại bất kỳ câu train nà
 
 Class-weighted loss vẫn được áp dụng cho cả năm model. Mỗi model được khởi tạo
 mới để mọi hàng dữ liệu được học đúng năm epoch như nhau.
-Prompt tiếng Anh được áp dụng nhất quán ở train, validation mỗi epoch
+Prompt raw + English được áp dụng nhất quán ở train, validation mỗi epoch
 và development prediction. Nhãn gold chỉ dùng cho loss hoặc tính metric.
 
 ## Class-weighted loss của Task B
@@ -95,7 +95,7 @@ Khoảng clip áp dụng trước chuẩn hóa nên weight cuối có thể lớ
 
 ## Light text normalization
 
-Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa cột `Comment` vào chat
+Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa các trường comment vào chat
 tokenizer:
 
 - Sửa lỗi encoding bằng `ftfy`, chuẩn hóa Unicode NFKC và giải mã HTML entity.
@@ -104,10 +104,10 @@ tokenizer:
 - Không lowercase; giữ hashtag, emoji và dấu câu.
 - Không xóa stopword, không lemmatize và không chuẩn hóa ký tự/từ lặp.
 
-Khi comment quá dài, `ChatEncoder` chỉ cắt phần comment để system prompt và
-assistant label vẫn nằm trong `max_length`. Task B chỉ dùng cột `Comment`
-tiếng Anh, nên không chia ngân sách token cho hai bản raw/English.
-Nếu phải cắt, giữ đầu comment và toàn bộ assistant label.
+Khi comment quá dài, `ChatEncoder` chỉ cắt nội dung để system prompt và
+assistant label vẫn nằm trong `max_length`. Task B chia ngân sách token
+giữa raw và English; trường ngắn nhường phần dư cho trường dài. Nếu phải cắt,
+giữ đầu cả hai phiên bản và toàn bộ assistant label.
 `max_length` vẫn là 256.
 
 ## Cấu hình LoRA mặc định
@@ -173,19 +173,22 @@ Các file augment Task A cần thêm `source_id`,
 `source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn cùng fold,
 nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
 
-Task B: năm original cần `id`, `Comment`, `Hate Category`; development cần
-`id`, `Comment`. Trong cả năm original và development, `Comment` phải là
-phiên bản đã dịch sang tiếng Anh. Code không tự dịch và không đọc
-`Comment_en`, kể cả khi cột này có trong file. Các file augment có thể
-vẫn nằm trong dataset nhưng Task B không đọc chúng.
+Task B: năm original cần `id`, `Comment`, `Comment_en`, `Hate Category`;
+development cần `id`, `Comment`, `Comment_en`. `Comment` phải là code-mixed
+gốc và `Comment_en` là bản dịch tiếng Anh. Code không tự dịch. Nếu dataset
+cũ đã thay `Comment` bằng tiếng Anh, chuyển nguyên nội dung đó sang
+`Comment_en` rồi khôi phục `Comment` từ nguồn gốc theo `id`; không ghép theo
+vị trí dòng và không chép tiếng Anh vào cả hai cột. Giữ ID, nhãn và fold.
+Các file augment có thể vẫn nằm trong dataset nhưng Task B không đọc chúng.
 
 `hastika_multiclass_validation.csv` vẫn là file gold để báo cáo metric, không
 tham gia train. File này giữ nguyên comment code-mixed và nhãn của BTC.
-Loader lấy nhãn từ file gold, ghép với `Comment` tiếng Anh trong
+Loader lấy nhãn từ file gold, ghép bản dịch từ `Comment_en` trong
 `multiclass_validation_inputs.csv` theo `id`, và giữ thứ tự file gold.
-Model chỉ nhận tiếng Anh; comment raw trong gold không vào prompt.
-Không cần dịch lại hoặc sửa file gold. ID thiếu/trùng hay comment
-tiếng Anh rỗng sẽ báo lỗi. Tên và nhãn sáu class giữ nguyên.
+Code kiểm tra raw comment trong hai file khớp nhau sau chuẩn hóa. Model
+nhận cả raw và English, không nhận nhãn gold trong prompt. Không cần sửa
+file gold. ID thiếu/trùng, raw không khớp hoặc bản dịch rỗng sẽ báo lỗi.
+Tên và nhãn sáu class giữ nguyên.
 
 `augmentation_audit.csv` của Task A đánh dấu câu quá ngắn, trùng lặp, quá khác câu
 nguồn hoặc gần giống original khác. Cấu hình
@@ -212,15 +215,18 @@ Prompt liệt kê các nhãn hợp lệ; file submission giữ nguyên tên nhã
 User prompt Task B (plain text, không mã hóa A–F):
 
 ```text
-Comment:
-<normalized English Comment>
+Comment (raw code-mixed):
+<normalized raw Comment>
+
+English translation:
+<normalized Comment_en>
 ```
 
-System prompt ghi rõ comment tiếng Anh; cách chấm likelihood của nhãn giữ nguyên. Không
+System prompt ghi rõ comment Kannada-English code-mixed; cách chấm likelihood của nhãn giữ nguyên. Không
 đưa nhãn gold hoặc ghi chú trong `translation_audit.csv` vào user prompt.
-`run_summary.json` ghi `prompt_input` để xác nhận cột `Comment`, ngôn ngữ
-tiếng Anh, augmentation đã tắt và cách truncate. Metadata validation ghi
-cả SHA-256 file gold và file input tiếng Anh dùng để ghép theo ID.
+`run_summary.json` ghi `prompt_input` để xác nhận cột raw `Comment`, cột
+`Comment_en`, augmentation đã tắt và cách truncate. Metadata validation ghi
+cả SHA-256 file gold và file input raw + English dùng để ghép theo ID.
 
 Code gọi `apply_chat_template`. Prompt và padding được mask bằng `-100`;
 loss chỉ áp dụng cho token của assistant label và token kết thúc chat. Khi dự
@@ -264,8 +270,9 @@ thành Qwen2.5, hãy bỏ giá trị cũ hoặc truyền `--model` Qwen3 như tr
 Thêm file gold `hastika_multiclass_validation.csv` của BTC vào Kaggle Dataset
 hoặc `data/`. File cần các cột `id`, `Comment`, `Hate Category` và có 395 câu.
 Pipeline ghép nhãn từ file này với `multiclass_validation_inputs.csv`
-đã dịch sang tiếng Anh theo ID. Khi dùng `--prediction-file` để dự đoán
-test không nhãn, validation vẫn lấy tiếng Anh từ file development cố định.
+chứa raw + English theo ID. Khi dùng `--prediction-file` để dự đoán
+test không nhãn, validation vẫn lấy hai phiên bản từ file development cố định.
+File test cũng phải có `id`, `Comment` gốc và `Comment_en`.
 
 Sau mỗi epoch của từng seed, Task B đánh giá trên gold validation và in:
 

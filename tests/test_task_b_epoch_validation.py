@@ -36,7 +36,8 @@ class TaskBEpochValidationTests(unittest.TestCase):
     def write_inputs(self, root: Path) -> None:
         pd.DataFrame({
             "id": self.gold()["id"],
-            "Comment": [f"English {i}" for i in range(len(TASK_B.labels))],
+            "Comment": self.gold()["Comment"],
+            "Comment_en": [f"English {i}" for i in range(len(TASK_B.labels))],
         }).to_csv(root / TASK_B.epoch_validation_input_filename, index=False)
 
     def test_external_gold_schema_and_labels_are_validated(self):
@@ -53,6 +54,7 @@ class TaskBEpochValidationTests(unittest.TestCase):
                 else:
                     gold = gold.iloc[:0]
                 gold.to_csv(root / TASK_B.epoch_validation_filename, index=False)
+                self.write_inputs(root)
                 with (
                     patch("src.data.resolve_data_file", side_effect=root.joinpath),
                     self.assertRaises(ValueError),

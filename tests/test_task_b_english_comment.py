@@ -1,4 +1,4 @@
-"""English-in-Comment inputs with unchanged raw gold labels matched by ID."""
+"""Compatibility coverage for the former English-in-Comment configuration."""
 
 from __future__ import annotations
 
@@ -10,10 +10,12 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from llm_config import TASK_B
+from llm_config import TASK_B as BILINGUAL_TASK_B
 from src.data import load_epoch_validation_frame, load_task_frames
 from src.llm_data import ChatEncoder, CompletionDataset
 from tests.test_llm_pipeline import TestChatTokenizer
+
+TASK_B = replace(BILINGUAL_TASK_B, translation_column=None, comment_language="English")
 
 
 class EnglishCommentTests(unittest.TestCase):

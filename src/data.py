@@ -390,13 +390,18 @@ def load_epoch_validation_frame(
     if frame.empty:
         raise ValueError(f"Labeled validation must not be empty: {path}")
     column = task.translation_column
-    if column and (prediction_frame is not None or column not in frame.columns):
+    if column and (
+        task.epoch_validation_input_filename
+        or prediction_frame is not None
+        or column not in frame.columns
+    ):
         # Gold files need not duplicate translations: reuse the prediction input
         # by ID, checking raw text as well so English never gets paired wrongly.
-        if prediction_frame is None:
-            prediction_frame = _read_csv(resolve_data_file(task.prediction_filename))
+        reference_filename = task.epoch_validation_input_filename or task.prediction_filename
+        if task.epoch_validation_input_filename or prediction_frame is None:
+            prediction_frame = _read_csv(resolve_data_file(reference_filename))
         _validate_columns(
-            prediction_frame, Path(task.prediction_filename), {"id", "Comment", column}
+            prediction_frame, Path(reference_filename), {"id", "Comment", column}
         )
         if prediction_frame["id"].isna().any() or prediction_frame["id"].duplicated().any():
             raise ValueError("Translation reference requires unique, nonmissing IDs.")

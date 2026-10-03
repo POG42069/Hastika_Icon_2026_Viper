@@ -824,6 +824,9 @@ class LLMTests(unittest.TestCase):
                     {
                         "id": [f"original-{fold}-{i}" for i in range(rows_per_fold)],
                         "Comment": [
+                            f"raw original comment {fold}-{i}" for i in range(rows_per_fold)
+                        ],
+                        "Comment_en": [
                             f"English original comment {fold}-{i}" for i in range(rows_per_fold)
                         ],
                         task.label_column: original_labels,
@@ -836,7 +839,8 @@ class LLMTests(unittest.TestCase):
             prediction_frame = pd.DataFrame(
                 {
                     "id": ["0100", "0101", "0102"],
-                    "Comment": ["English one", "English two", "English three"],
+                    "Comment": ["raw comment one", "raw comment two", "raw comment three"],
+                    "Comment_en": ["English one", "English two", "English three"],
                 }
             )
             prediction_frame.to_csv(root / task.prediction_filename, index=False)
@@ -871,8 +875,8 @@ class LLMTests(unittest.TestCase):
             def tracked_score(*args, **kwargs):
                 dataset = args[1]
                 self.assertEqual(dataset.prompts, [
-                    ChatEncoder(self.tokenizer, task, config.max_length).encode_prompt(text)[0]
-                    for text in prediction_frame["Comment"]
+                    ChatEncoder(self.tokenizer, task, config.max_length).encode_prompt(raw, english)[0]
+                    for raw, english in zip(prediction_frame["Comment"], prediction_frame["Comment_en"])
                 ])
                 return real_score(*args, **kwargs)
 
@@ -994,14 +998,14 @@ class LLMTests(unittest.TestCase):
                 * (len(retrain_seeds) * task.fixed_full_retrain_epochs),
             )
             self.assertTrue(all(
-                "Comment:\nEnglish original comment 1-0" in call["prompt"]
-                and "English translation:" not in call["prompt"]
-                and "raw code-mixed" not in call["prompt"]
+                "Comment (raw code-mixed):\nraw original comment 1-0" in call["prompt"]
+                and "English translation:\nEnglish original comment 1-0" in call["prompt"]
                 for call in train_calls
             ))
-            self.assertIsNone(summary["prompt_input"]["translation_column"])
+            self.assertEqual(summary["prompt_input"]["translation_column"], "Comment_en")
             self.assertEqual(summary["prompt_input"]["comment_column"], "Comment")
-            self.assertEqual(summary["prompt_input"]["comment_language"], "English")
+            self.assertEqual(summary["prompt_input"]["comment_language"], "Kannada-English code-mixed")
+            self.assertEqual(summary["prompt_input"]["raw_column"], "Comment")
             self.assertFalse(summary["prompt_input"]["use_augmentation"])
             self.assertFalse(any(name.startswith("augment") for name in summary["input_sha256"]))
             self.assertTrue(

@@ -151,9 +151,9 @@ TASK_B = TaskConfig(
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
     use_augmentation=False,
-    # The translated dataset stores English directly in Comment.
-    translation_column=None,
-    comment_language="English",
+    # Keep the original code-mixed comment and its English translation together.
+    translation_column="Comment_en",
+    comment_language="Kannada-English code-mixed",
     selection_validation_fold=None,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),
@@ -167,7 +167,7 @@ TASK_B = TaskConfig(
     class_weight_max=1.50,
     report_per_class_metrics=True,
     epoch_validation_filename="hastika_multiclass_validation.csv",
-    # Gold retains raw comments; evaluate the English input matched by ID.
+    # Match raw + English development input to gold by ID, even when predicting test.
     epoch_validation_input_filename="multiclass_validation_inputs.csv",
     enable_augmentation_audit=True,
     augmentation_audit_action="report",

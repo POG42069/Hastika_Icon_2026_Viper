@@ -1,4 +1,4 @@
-"""Regression coverage for the optional legacy raw/English configuration."""
+"""Regression coverage for Task B raw code-mixed + English prompts."""
 from __future__ import annotations
 
 import tempfile
@@ -14,12 +14,7 @@ from src.data import load_epoch_validation_frame, load_task_frames
 from src.llm_data import ChatEncoder, CompletionDataset
 from tests.test_llm_pipeline import TestChatTokenizer
 
-BILINGUAL_TASK_B = replace(
-    TASK_B,
-    translation_column="Comment_en",
-    comment_language="Kannada-English code-mixed",
-    epoch_validation_input_filename=None,
-)
+BILINGUAL_TASK_B = TASK_B
 
 
 class BilingualPromptTests(unittest.TestCase):
@@ -154,6 +149,36 @@ class BilingualPromptTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "differ|missing from translated"),
                 ):
                     load_epoch_validation_frame(BILINGUAL_TASK_B, prediction)
+
+    def test_test_prediction_override_keeps_bilingual_development_monitor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prediction = self.write_inputs(root)
+            gold = prediction.iloc[::-1].drop(columns="Comment_en").copy()
+            gold[BILINGUAL_TASK_B.label_column] = ["Violence", "Others"]
+            gold.to_csv(root / BILINGUAL_TASK_B.epoch_validation_filename, index=False)
+            task = replace(BILINGUAL_TASK_B, prediction_filename="test.csv")
+            test_input = pd.DataFrame({
+                "id": ["test-1"], "Comment": ["raw test"], "Comment_en": ["English test"],
+            })
+            with patch("src.data.resolve_data_file", side_effect=root.joinpath):
+                validated = load_epoch_validation_frame(task, test_input)
+            self.assertEqual(validated["id"].tolist(), ["002", "001"])
+            self.assertEqual(validated["text"].tolist(), ["raw two", "raw one"])
+            self.assertEqual(validated["text_en"].tolist(), ["English two", "English one"])
+
+    def test_english_only_dataset_is_rejected_instead_of_used_as_raw(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_inputs(root)
+            path = root / BILINGUAL_TASK_B.original_fold_filenames[0]
+            frame = pd.read_csv(path).drop(columns="Comment_en")
+            frame.to_csv(path, index=False)
+            with (
+                patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                self.assertRaisesRegex(ValueError, "Comment_en"),
+            ):
+                load_task_frames(BILINGUAL_TASK_B)
 
 
 if __name__ == '__main__':
