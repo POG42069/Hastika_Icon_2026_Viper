@@ -85,7 +85,7 @@ class LLMTrainingConfig:
     eval_batch_size_per_gpu: int = 2
     gradient_accumulation_steps: int = 2
     max_grad_norm: float = 1.0
-    early_stopping_patience: int = 3
+    early_stopping_patience: int = 4
     lora_rank: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
@@ -120,7 +120,7 @@ TASK_A = TaskConfig(
     use_augmentation=False,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
-    selection_seeds=(42, 52, 62, 72, 82),
+    selection_seeds=(42, 52, 62),
     ensemble_all_seeds=True,
     report_per_class_metrics=True,
 )
