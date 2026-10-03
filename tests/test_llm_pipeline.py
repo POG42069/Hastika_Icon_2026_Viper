@@ -1,4 +1,4 @@
-"""Offline tests with a real, tiny random Qwen2 and trainable PEFT adapters.
+"""Offline tests with a real, tiny random Qwen3 and trainable PEFT adapters.
 
 No pretrained weights, competition data or GPU kernels are needed.
 The integration tests replace only the CUDA/model loading boundary; token loss,
@@ -21,7 +21,7 @@ import pandas as pd
 import torch
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from llm_config import LLMTrainingConfig, TASK_A, TASK_B, llm_task
 from src.distributed import RuntimeContext
@@ -90,20 +90,21 @@ class TestChatTokenizer:
 
 
 def tiny_model():
-    config = Qwen2Config(
+    config = Qwen3Config(
         vocab_size=256,
         hidden_size=16,
         intermediate_size=32,
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=1,
+        head_dim=8,
         max_position_embeddings=1024,
         pad_token_id=0,
         eos_token_id=2,
         use_cache=False,
         attention_dropout=0.0,
     )
-    model = Qwen2ForCausalLM(config)
+    model = Qwen3ForCausalLM(config)
     return get_peft_model(
         model,
         LoraConfig(

@@ -70,11 +70,11 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct"
+            "HASTIKA_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507"
         )
     )
-    # Exact Hugging Face revision for Qwen2.5-3B-Instruct.
-    model_revision: str = "aa8e72537993ba99e69dfaafa59ed015b17504d1"
+    # Exact Hugging Face revision for the non-thinking Qwen3 Instruct release.
+    model_revision: str = "cdbee75f17c01a7cc42f958dc650907174af0554"
     validation_size: float = 0.20
     seed: int = 42
     max_length: int = 256  # Full chat, including instructions, answer and EOS.
@@ -108,8 +108,8 @@ TASK_A = TaskConfig(
     label_column="Label",
     labels=("Non-Hate", "Hate"),
     label_codes=("Non-Hate", "Hate"),
-    checkpoint_subdir="task_a_qwen2_5_3b_lora_bilingual",
-    output_subdir="task_a_qwen2_5_3b_lora_bilingual",
+    checkpoint_subdir="task_a_qwen3_4b_2507_lora_bilingual",
+    output_subdir="task_a_qwen3_4b_2507_lora_bilingual",
     submission_zip_name="task_a_submission.zip",
     original_fold_filenames=tuple(
         f"binary_original_{fold}.csv" for fold in range(1, 6)
@@ -150,8 +150,8 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    checkpoint_subdir="task_b_qwen2_5_3b_lora_bilingual",
-    output_subdir="task_b_qwen2_5_3b_lora_bilingual",
+    checkpoint_subdir="task_b_qwen3_4b_2507_lora_bilingual",
+    output_subdir="task_b_qwen3_4b_2507_lora_bilingual",
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),

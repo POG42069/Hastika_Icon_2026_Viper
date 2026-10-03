@@ -56,8 +56,10 @@ Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa cột `Comment` và
 - Không lowercase; giữ hashtag, emoji và dấu câu.
 - Không xóa stopword, không lemmatize và không chuẩn hóa ký tự/từ lặp.
 
-Khi comment quá dài, `ChatEncoder` chỉ cắt phần cuối comment để toàn bộ system
-prompt và assistant label vẫn nằm trong `max_length`.
+Khi prompt song ngữ quá dài, `ChatEncoder` chia ngân sách token cho cả hai
+phiên bản, giữ phần đầu/cuối và đánh dấu `[...]` ở phần bị lược. System prompt
+và assistant label vẫn nằm đầy đủ trong `max_length`. Chế độ English-only
+giữ quy tắc cắt phần cuối comment.
 
 ## LoRA
 
@@ -65,14 +67,14 @@ Cấu hình mặc định trong `llm_config.py`:
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `Qwen/Qwen2.5-3B-Instruct` |
-| Model revision | `aa8e72537993ba99e69dfaafa59ed015b17504d1` |
+| Backbone | `Qwen/Qwen3-4B-Instruct-2507` |
+| Model revision | `cdbee75f17c01a7cc42f958dc650907174af0554` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
 | Max epochs để chọn | 5 |
-| Early-stopping patience | 3 |
+| Early-stopping patience | 4 |
 | Max chat length | 256 |
 | Learning rate | `2e-4` |
 | Batch/GPU | 4 |
@@ -92,10 +94,10 @@ cập nhật.
 Đây không còn là QLoRA: code không dùng NF4, double quantization hay
 `BitsAndBytesConfig`. Vì vậy standard LoRA dùng VRAM nhiều hơn đáng kể.
 Pipeline dùng chat template chính thức của
-https://huggingface.co/Qwen/Qwen2.5-3B-Instruct. Bản 3B nhẹ hơn bản Qwen3 4B
-trước đó và phù hợp hơn với T4 16 GB. DDP không cộng VRAM của hai GPU: mỗi GPU
-giữ một bản backbone. Revision model được pin để tránh thay đổi checkpoint
-giữa các lần chạy.
+https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507. Đây là bản Instruct
+non-thinking; template không thêm phần suy luận `<think>`. DDP không cộng VRAM
+của hai GPU: mỗi GPU giữ một bản backbone. Revision model được pin để tránh
+thay đổi checkpoint giữa các lần chạy.
 Mức `2e-4` là thiết lập thí nghiệm, chưa được xác nhận là LR tối ưu trên dev.
 Nếu đặt `HASTIKA_LLM_MODEL` trong môi trường, giá trị đó sẽ ghi đè model mặc
 định; khi đổi sang model khác, cần truyền `--revision` phù hợp với model đó.
@@ -223,8 +225,8 @@ seed đang chạy dở.
 Đổi backbone hoặc giới hạn tài nguyên:
 
 ```bash
-!python Train_A_LLM.py --model Qwen/Qwen2.5-3B-Instruct \
-  --revision aa8e72537993ba99e69dfaafa59ed015b17504d1
+!python Train_A_LLM.py --model Qwen/Qwen3-4B-Instruct-2507 \
+  --revision cdbee75f17c01a7cc42f958dc650907174af0554
 !python Train_A_LLM.py --max-epochs 3 --batch-size 1 --max-length 256
 !python Train_B_LLM.py --single-gpu --gradient-accumulation 16
 !python Train_A_LLM.py --prediction-file /path/to/official_inputs.csv
@@ -271,25 +273,23 @@ nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện,
 Task A:
 
 ```text
-checkpoints/task_a_qwen2_5_3b_lora/seed_42/best_holdout_adapter/
-checkpoints/task_a_qwen2_5_3b_lora/seed_42/final_full_data_adapter/
-checkpoints/task_a_qwen2_5_3b_lora/seed_52/...
-checkpoints/task_a_qwen2_5_3b_lora/seed_62/...
-checkpoints/task_a_qwen2_5_3b_lora/seed_72/...
-checkpoints/task_a_qwen2_5_3b_lora/seed_82/...
-checkpoints/task_a_qwen2_5_3b_lora/metrics.json
-outputs/task_a_qwen2_5_3b_lora/seed_42/validation_predictions.csv
-outputs/task_a_qwen2_5_3b_lora/seed_42/predictions.csv
-outputs/task_a_qwen2_5_3b_lora/seed_42/prediction_scores.npz
-outputs/task_a_qwen2_5_3b_lora/seed_52/...
-outputs/task_a_qwen2_5_3b_lora/selection_training_history.json
-outputs/task_a_qwen2_5_3b_lora/split_manifest.csv
-outputs/task_a_qwen2_5_3b_lora/validation_predictions.csv
-outputs/task_a_qwen2_5_3b_lora/seed_selection_results.csv
-outputs/task_a_qwen2_5_3b_lora/voting_predictions.csv
-outputs/task_a_qwen2_5_3b_lora/predictions.csv
-outputs/task_a_qwen2_5_3b_lora/task_a_submission.zip
-outputs/task_a_qwen2_5_3b_lora/run_summary.json
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_42/best_holdout_adapter/
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_42/final_full_data_adapter/
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_52/...
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_62/...
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/metrics.json
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/validation_predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/prediction_scores.npz
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_52/...
+outputs/task_a_qwen3_4b_2507_lora_bilingual/selection_training_history.json
+outputs/task_a_qwen3_4b_2507_lora_bilingual/split_manifest.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/validation_predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_selection_results.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/voting_predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/task_a_submission.zip
+outputs/task_a_qwen3_4b_2507_lora_bilingual/run_summary.json
 ```
 
 Trong lúc một epoch vừa hoàn tất nhưng phase chưa xong, checkpoint có thêm:
@@ -304,13 +304,13 @@ cập nhật sau khi adapter và `training_state.pt` đã ghi xong, tránh nhậ
 checkpoint bị cắt giữa lúc Kaggle timeout.
 
 `validation_predictions.csv` ở thư mục gốc là kết quả của seed có holdout tốt
-nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 5 seed,
+nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 3 seed Task A,
 số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
 kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
 Task B có cấu trúc artifact tương tự Task A: mỗi seed có
 `best_holdout_adapter/`, `final_full_data_adapter/`, prediction và lịch sử
-retrain riêng. `outputs/task_b_qwen2_5_3b_lora/voting_predictions.csv` lưu nhãn của từng
+retrain riêng. `outputs/task_b_qwen3_4b_2507_lora_bilingual/voting_predictions.csv` lưu nhãn của từng
 seed, số phiếu, điểm Borda, tổng candidate score đã chuẩn hóa, phương thức phá
 hòa và nhãn cuối. Các file `predictions.csv`, ZIP và `run_summary.json` ở thư
 mục gốc là kết quả ensemble; seed có holdout tốt nhất chỉ được dùng để xuất báo
