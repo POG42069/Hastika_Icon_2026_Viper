@@ -48,7 +48,7 @@ def worker(rank: int, port: int) -> None:
         encoder = ChatEncoder(TestChatTokenizer(), TASK_B, 512)
         collator = CompletionCollator(0)
         dataset = CompletionDataset(
-            ["one", "two", "three", "four", "five"], encoder, [0, 1, 2, 3, 4]
+            [(text, "raw " + text) for text in ("one", "two", "three", "four", "five")], encoder, [0, 1, 2, 3, 4]
         )
         model = DistributedDataParallel(
             tiny_model(), broadcast_buffers=False, find_unused_parameters=False
@@ -70,7 +70,7 @@ def worker(rank: int, port: int) -> None:
             1,
         )
         for count in (5, 1):
-            evaluation = CompletionDataset(["eval"] * count, encoder)
+            evaluation = CompletionDataset([("eval", "raw eval")] * count, encoder)
             distributed = score_candidates(
                 model, evaluation, collator, config, runtime, "DDP eval"
             )

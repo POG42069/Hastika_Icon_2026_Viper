@@ -34,6 +34,8 @@ class TaskConfig:
     compact_train_filename: str | None = None
     compact_validation_filename: str | None = None
     use_augmentation: bool = True
+    input_mode: str = "english"
+    original_comment_column: str = "OriginalComment"
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
@@ -106,8 +108,8 @@ TASK_A = TaskConfig(
     label_column="Label",
     labels=("Non-Hate", "Hate"),
     label_codes=("Non-Hate", "Hate"),
-    checkpoint_subdir="task_a_qwen2_5_3b_lora",
-    output_subdir="task_a_qwen2_5_3b_lora",
+    checkpoint_subdir="task_a_qwen2_5_3b_lora_bilingual",
+    output_subdir="task_a_qwen2_5_3b_lora_bilingual",
     submission_zip_name="task_a_submission.zip",
     original_fold_filenames=tuple(
         f"binary_original_{fold}.csv" for fold in range(1, 6)
@@ -118,6 +120,7 @@ TASK_A = TaskConfig(
     compact_train_filename="binary_original_1_4.csv",
     compact_validation_filename="binary_original_5.csv",
     use_augmentation=False,
+    input_mode="bilingual",
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62),
@@ -147,14 +150,15 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    checkpoint_subdir="task_b_qwen2_5_3b_lora",
-    output_subdir="task_b_qwen2_5_3b_lora",
+    checkpoint_subdir="task_b_qwen2_5_3b_lora_bilingual",
+    output_subdir="task_b_qwen2_5_3b_lora_bilingual",
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
     compact_train_filename="original_1_4.csv",
     compact_validation_filename="original_5.csv",
     use_augmentation=False,
+    input_mode="bilingual",
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_train_label_caps=(("Gender", 870),),

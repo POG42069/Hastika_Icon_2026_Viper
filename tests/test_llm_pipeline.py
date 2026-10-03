@@ -42,6 +42,11 @@ from src.llm_training import (
 )
 from src.training import cap_training_labels, stratified_holdout_indices
 
+# Retain the original unit fixtures; the integration test also runs both tasks
+# with bilingual inputs explicitly below.
+TASK_A = replace(TASK_A, input_mode="english")
+TASK_B = replace(TASK_B, input_mode="english")
+
 
 class TestChatTokenizer:
     """Character tokenizer deliberately makes every label multi-token."""
@@ -56,7 +61,12 @@ class TestChatTokenizer:
         return [ord(character) + 10 for character in text]
 
     def decode(self, ids, skip_special_tokens=False):
-        return "".join(chr(value - 10) for value in ids)
+        special = {0: "<pad>", 2: "<end>", 3: "<system>", 4: "<user>", 5: "<assistant>"}
+        return "".join(
+            ("" if skip_special_tokens else special[value])
+            if value in special else chr(value - 10)
+            for value in ids
+        )
 
     def apply_chat_template(
         self,
@@ -301,7 +311,7 @@ class LLMTests(unittest.TestCase):
 
     def test_candidate_scores_independent_of_batching_and_gold_labels(self):
         model = tiny_model().eval()
-        encoder = ChatEncoder(self.tokenizer, TASK_B, 512)
+        encoder = ChatEncoder(self.tokenizer, replace(TASK_B, report_per_class_metrics=True), 512)
         data = CompletionDataset(["a", "some other text", "xyz"], encoder, [0, 1, 5])
         before = {name: p.detach().clone() for name, p in model.named_parameters()}
         scores = score_candidates(
@@ -527,9 +537,13 @@ class LLMTests(unittest.TestCase):
             require_cuda(cpu_runtime())
 
     def test_both_pipelines_select_then_retrain_retained_data_before_prediction(self):
-        for original_task in (TASK_A, TASK_B):
+        for original_task in (
+            TASK_A, TASK_B,
+            replace(TASK_A, input_mode="bilingual"),
+            replace(TASK_B, input_mode="bilingual"),
+        ):
             with (
-                self.subTest(task=original_task.task_name),
+                self.subTest(task=original_task.task_name, input_mode=original_task.input_mode),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 root = Path(directory)
@@ -585,6 +599,8 @@ class LLMTests(unittest.TestCase):
                                 "fold": fold,
                             }
                         )
+                        original["OriginalComment"] = "raw " + original["Comment"]
+                        augment["OriginalComment"] = "raw " + augment["Comment"]
                         original.to_csv(root / original_name, index=False)
                         if task.use_augmentation:
                             augment.to_csv(root / augment_name, index=False)
@@ -631,6 +647,7 @@ class LLMTests(unittest.TestCase):
                 prediction_frame = pd.DataFrame(
                     {"id": ["0100", "0101", "0102"], "Comment": ["one", "two", "three"]}
                 )
+                prediction_frame["OriginalComment"] = "raw " + prediction_frame["Comment"]
                 prediction_frame.to_csv(root / task.prediction_filename, index=False)
                 config = replace(
                     self.config,
@@ -651,9 +668,19 @@ class LLMTests(unittest.TestCase):
 
                 def tracked_train(*args, **kwargs):
                     train_sizes.append(len(args[1].dataset))
+                    if task.input_mode == "bilingual":
+                        for prompt in args[1].dataset.prompts:
+                            decoded = self.tokenizer.decode(prompt, skip_special_tokens=True)
+                            self.assertIn("English translation:\noriginal comment", decoded)
+                            self.assertIn("Original code-mixed comment:\nraw original comment", decoded)
                     return train_llm_epoch(*args, **kwargs)
 
                 def controlled_score(*args, real_score=real_score, calls=calls):
+                    if task.input_mode == "bilingual":
+                        for prompt in args[1].prompts:
+                            decoded = self.tokenizer.decode(prompt, skip_special_tokens=True)
+                            self.assertIn("English translation:\n", decoded)
+                            self.assertIn("Original code-mixed comment:\nraw ", decoded)
                     result = real_score(*args)
                     calls.append(args[-1])
                     # Force epoch 1 to win; full-data replay must use one epoch.
@@ -765,7 +792,9 @@ class LLMTests(unittest.TestCase):
                     len(test_seeds) if task.ensemble_all_seeds else 1
                 )
                 self.assertEqual(train_sizes, expected_train_sizes)
-                manifest = pd.read_csv(output / "split_manifest.csv", dtype={"id": str})
+                # Label-cap sampling differs per seed; inspect seed 42 itself.
+                manifest_path = output / "seed_42" / "split_manifest.csv" if task.ensemble_all_seeds else output / "split_manifest.csv"
+                manifest = pd.read_csv(manifest_path, dtype={"id": str})
                 self.assertEqual(
                     manifest.loc[val, "split"].tolist(),
                     ["selection_validation"] * len(val),
@@ -793,7 +822,11 @@ class LLMTests(unittest.TestCase):
                     len(test_seeds) if task.ensemble_all_seeds else 1,
                 )
                 encoder = ChatEncoder(self.tokenizer, task, config.max_length)
-                data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
+                prediction_inputs = (
+                    list(zip(prediction_frame["Comment"], prediction_frame["OriginalComment"], strict=True))
+                    if task.input_mode == "bilingual" else prediction_frame["Comment"].tolist()
+                )
+                data = CompletionDataset(prediction_inputs, encoder)
                 if task.ensemble_all_seeds:
                     seed_label_ids = []
                     seed_mean_token_log_probs = []

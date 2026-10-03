@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import pandas as pd
 import numpy as np
@@ -16,10 +17,16 @@ from src.preprocessing import normalize_text
 def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
     """Find an input locally or in an attached Kaggle Dataset."""
 
-    candidates = [
-        configured_dir / filename,
-        Path(__file__).resolve().parents[1] / "data" / filename,
-    ]
+    selected = configured_dir / filename
+    if selected.is_file():
+        return selected.resolve()
+    if "HASTIKA_DATA_DIR" in os.environ:
+        # An explicitly selected release must not borrow a missing compact
+        # file (or any other input) from an older attached dataset.
+        raise FileNotFoundError(
+            f"Could not find {filename} in the selected HASTIKA_DATA_DIR: {configured_dir}"
+        )
+    candidates = [Path(__file__).resolve().parents[1] / "data" / filename]
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
@@ -46,6 +53,7 @@ def _read_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(
         path,
         encoding="utf-8-sig",
+        keep_default_na=False,
         dtype={"id": str, "source_id": str, "source_group": str},
     )
 
@@ -68,13 +76,18 @@ def _validate_and_encode_frames(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     required_train = {"id", "Comment", task.label_column}
     required_prediction = {"id", "Comment"}
+    if task.input_mode not in {"english", "bilingual"}:
+        raise ValueError("input_mode must be english or bilingual")
+    if task.input_mode == "bilingual":
+        required_train.add(task.original_comment_column)
+        required_prediction.add(task.original_comment_column)
     _validate_columns(train_df, Path(train_description), required_train)
     _validate_columns(
         prediction_df,
         Path(task.prediction_filename),
         required_prediction,
     )
-    if train_df["id"].isna().any() or prediction_df["id"].isna().any():
+    if any(frame["id"].isna().any() or frame["id"].eq("").any() for frame in (train_df, prediction_df)):
         raise ValueError("Missing IDs were found; every row needs an ID.")
     if train_df["id"].duplicated().any():
         duplicates = train_df.loc[train_df["id"].duplicated(False), "id"].unique()
@@ -97,9 +110,26 @@ def _validate_and_encode_frames(
     prediction_df = prediction_df.copy()
     train_df["text"] = train_df["Comment"].map(normalize_text)
     prediction_df["text"] = prediction_df["Comment"].map(normalize_text)
+    if task.input_mode == "bilingual":
+        for frame in (train_df, prediction_df):
+            frame["original_text"] = frame[task.original_comment_column].map(normalize_text)
+            missing_original = frame["original_text"].eq("") & frame["text"].ne("")
+            if missing_original.any():
+                raise ValueError(
+                    "Bilingual input has missing original comments for IDs: "
+                    f"{frame.loc[missing_original, 'id'].head(10).tolist()}"
+                )
     label_to_id = {label: index for index, label in enumerate(task.labels)}
     train_df["label_id"] = train_df[task.label_column].map(label_to_id).astype(int)
     return train_df, prediction_df
+
+
+def prompt_inputs(frame: pd.DataFrame, task: TaskConfig) -> list:
+    """Return explicit English/original pairs for every pipeline phase."""
+
+    if task.input_mode == "bilingual":
+        return list(zip(frame["text"].tolist(), frame["original_text"].tolist(), strict=True))
+    return frame["text"].tolist()
 
 
 def _normalise_for_audit(values: pd.Series) -> pd.Series:

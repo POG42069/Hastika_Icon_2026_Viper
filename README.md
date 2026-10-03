@@ -1,5 +1,9 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
+Bản Nhotest này mặc định dùng **bản gốc code-mixed + bản dịch tiếng Anh** trong
+cùng một prompt. Xem [BILINGUAL.md](BILINGUAL.md) để chọn đúng thư mục dữ liệu,
+chạy huấn luyện và so sánh với English-only.
+
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
 
 - Task A: phát hiện `Non-Hate` / `Hate`.
@@ -14,13 +18,14 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
 
-1. Cả hai task dùng dữ liệu original tiếng Anh, không dùng augmentation.
+1. Cả hai task dùng dữ liệu original với hai cột ngôn ngữ, không dùng augmentation.
    Task A train trên `binary_original_1_4.csv` và validation trên
    `binary_original_5.csv`. Task B tương ứng dùng `original_1_4.csv` và
    `original_5.csv`. Loader gán fold 1 cho nhóm 1–4 đã gộp và fold 5 cho
    validation để giữ nguyên logic chia tập. Nếu không có cả hai file gộp,
    loader vẫn có thể đọc các file original 1–5 kiểu cũ (không đọc augment).
-2. Task A và Task B đều chạy 5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
+2. Theo cấu hình Nhotest hiện có, Task A chạy 3 seed `42, 52, 62`; Task B chạy
+   5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
    và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
    thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
    lấy ngẫu nhiên một tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
@@ -28,7 +33,7 @@ Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộ
    trên dữ liệu đầy đủ theo `best_epoch` riêng. Task B tiếp tục loại đúng tập
    Gender mà seed đó đã chọn khi chạy phase selection; vì vậy 5 seed có thể
    retrain trên 5 tập Gender khác nhau nhưng cùng số lượng mẫu.
-4. Năm adapter dự đoán development độc lập và có trọng số ngang nhau. Task A
+4. Các adapter dự đoán development độc lập và có trọng số ngang nhau. Task A
    dùng majority vote. Task B dùng plurality vote; nếu nhiều nhãn cùng số phiếu
    cao nhất thì lần lượt phá hòa bằng tổng điểm Borda, tổng `mean_token_log_probs`
    đã z-normalize riêng trong từng seed/mẫu, rồi thứ tự label cố định trong

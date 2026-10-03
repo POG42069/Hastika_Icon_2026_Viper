@@ -71,7 +71,7 @@ def main():
             tokenizer = TestChatTokenizer()
             encoder = ChatEncoder(tokenizer, task, 512)
             collator = CompletionCollator(0)
-            data = CompletionDataset(["one", "two", "three"], encoder, [0, 1, 0])
+            data = CompletionDataset([("one", "raw one"), ("two", "raw two"), ("three", "raw three")], encoder, [0, 1, 0])
             loader = DataLoader(data, batch_size=1, collate_fn=collator)
             optimizer = torch.optim.AdamW(
                 [p for p in model.parameters() if p.requires_grad], lr=0.001

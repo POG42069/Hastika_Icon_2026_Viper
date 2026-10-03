@@ -45,7 +45,7 @@ from llm_config import (
     LLMTrainingConfig,
     TaskConfig,
 )
-from src.data import labeled_input_filenames, load_task_frames, resolve_data_file
+from src.data import labeled_input_filenames, load_task_frames, prompt_inputs, resolve_data_file
 from src.distributed import (
     RuntimeContext,
     cleanup_runtime,
@@ -655,7 +655,10 @@ def _resume_signature(
     """Fields that must match before training state can be continued exactly."""
 
     return {
-        "format_version": 1,
+        "format_version": 2,
+        "input_mode": task.input_mode,
+        "original_comment_column": task.original_comment_column,
+        "prompt_policy": "bilingual-balanced-head-tail-v1" if task.input_mode == "bilingual" else "english-comment-tail-v1",
         "task": task.task_name,
         "training_sha256": training_sha256,
         "model": config.model_name,
@@ -951,8 +954,8 @@ def _completed_selection_from_catalogs(
             if int(summary["best_epoch"]) != int(history_best["epoch"]):
                 raise ValueError("best_epoch differs from selection history")
             if (
-                "resume_signature" in summary
-                and summary["resume_signature"] != expected_signature
+                (task.input_mode == "bilingual" or "resume_signature" in summary)
+                and summary.get("resume_signature") != expected_signature
             ):
                 raise ValueError("data/model/training signature differs")
             if int(summary["selection_train_rows"]) != len(train_indices):
@@ -1121,8 +1124,8 @@ def _completed_retrain_from_catalogs(
             ):
                 raise ValueError("seed/epoch count differs")
             if (
-                "resume_signature" in summary
-                and summary["resume_signature"] != expected_signature
+                (task.input_mode == "bilingual" or "resume_signature" in summary)
+                and summary.get("resume_signature") != expected_signature
             ):
                 raise ValueError("data/model/training signature differs")
             predictions_frame = pd.read_csv(
@@ -1505,7 +1508,7 @@ def _run_seed_ensemble(
         full_train_indices = result["full_train_indices"]
         full_train_frame = frame.iloc[full_train_indices]
         full_train_data = CompletionDataset(
-            full_train_frame["text"].tolist(),
+            prompt_inputs(full_train_frame, task),
             encoder,
             full_train_frame["label_id"].tolist(),
         )
@@ -1572,14 +1575,11 @@ def _run_seed_ensemble(
             full_train_data, collator, config, runtime, seed
         )
         final_model = _wrap_for_ddp(load_lora_model(config, runtime), runtime)
-        reusable_final_adapter = (
-            (completed_retrain["adapter"], completed_retrain["source"])
-            if completed_retrain is not None
-            and completed_retrain["mode"] == "adapter"
-            else _final_adapter_from_catalogs(
-                resume_catalogs, seed, best_epoch
-            )
-        )
+        reusable_final_adapter = None
+        if completed_retrain is not None and completed_retrain["mode"] == "adapter":
+            reusable_final_adapter = (completed_retrain["adapter"], completed_retrain["source"])
+        elif task.input_mode != "bilingual":
+            reusable_final_adapter = _final_adapter_from_catalogs(resume_catalogs, seed, best_epoch)
         if reusable_final_adapter is not None:
             adapter, source = reusable_final_adapter
             restore_adapter(final_model, adapter)
@@ -1953,6 +1953,9 @@ def _run_seed_ensemble(
                 "training_config": asdict(config),
                 "parameters": parameter_counts,
                 "system_prompt": encoder.system_text,
+                "input_mode": task.input_mode,
+                "comment_columns": ["Comment", task.original_comment_column] if task.input_mode == "bilingual" else ["Comment"],
+                "truncation_policy": "balanced_head_tail_per_view" if task.input_mode == "bilingual" else "comment_tail",
                 "label_order": list(task.labels),
                 "completion_token_ids": encoder.completions,
                 "completion_token_diagnostics": token_diagnostics,
@@ -2091,9 +2094,9 @@ def run_llm_task(
         log_completion_token_diagnostics(token_diagnostics, runtime)
         val_frame = frame.iloc[val_indices]
         val_data = CompletionDataset(
-            val_frame["text"].tolist(), encoder, val_frame["label_id"].tolist()
+            prompt_inputs(val_frame, task), encoder, val_frame["label_id"].tolist()
         )
-        prediction_data = CompletionDataset(prediction_frame["text"].tolist(), encoder)
+        prediction_data = CompletionDataset(prompt_inputs(prediction_frame, task), encoder)
         collator = CompletionCollator(tokenizer.pad_token_id)
 
         output_dir = OUTPUT_ROOT / task.output_subdir
@@ -2164,7 +2167,7 @@ def run_llm_task(
             )
             train_frame = frame.iloc[train_indices]
             selection_train_data = CompletionDataset(
-                train_frame["text"].tolist(),
+                prompt_inputs(train_frame, task),
                 encoder,
                 train_frame["label_id"].tolist(),
             )
@@ -2333,7 +2336,7 @@ def run_llm_task(
                     )
                     selection_history = []
                     completed_epoch = 0
-            elif (legacy := _legacy_partial_selection(
+            elif task.input_mode != "bilingual" and (legacy := _legacy_partial_selection(
                 catalogs=resume_catalogs,
                 seed=selection_seed,
                 frame=frame,
@@ -2609,7 +2612,7 @@ def run_llm_task(
         train_frame = winner["train_frame"]
         full_train_frame = frame.iloc[full_train_indices]
         full_train_data = CompletionDataset(
-            full_train_frame["text"].tolist(),
+            prompt_inputs(full_train_frame, task),
             encoder,
             full_train_frame["label_id"].tolist(),
         )
@@ -2834,6 +2837,9 @@ def run_llm_task(
                     "training_config": asdict(config),
                     "parameters": parameter_counts,
                     "system_prompt": encoder.system_text,
+                    "input_mode": task.input_mode,
+                    "comment_columns": ["Comment", task.original_comment_column] if task.input_mode == "bilingual" else ["Comment"],
+                    "truncation_policy": "balanced_head_tail_per_view" if task.input_mode == "bilingual" else "comment_tail",
                     "label_order": list(task.labels),
                     "completion_token_ids": encoder.completions,
                     "completion_token_diagnostics": token_diagnostics,
@@ -2914,6 +2920,10 @@ def run_llm_cli(
     )
     parser.add_argument("--single-gpu", action="store_true")
     parser.add_argument(
+        "--input-mode", choices=("english", "bilingual"), default=task.input_mode,
+        help="Use the English translation alone, or both original and translated versions.",
+    )
+    parser.add_argument(
         "--prediction-file",
         default=task.prediction_filename,
         help="CSV input filename, or full path (e.g. official test inputs).",
@@ -2948,7 +2958,7 @@ def run_llm_cli(
     validate_config(config)
     relaunch_with_torchrun_if_needed(config)
     run_llm_task(
-        replace(task, prediction_filename=args.prediction_file),
+        replace(task, prediction_filename=args.prediction_file, input_mode=args.input_mode),
         config,
         tuple(Path(path) for path in args.resume_from),
         auto_resume=not args.no_auto_resume,

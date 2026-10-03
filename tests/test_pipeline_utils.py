@@ -15,6 +15,10 @@ from llm_config import TASK_A, TASK_B
 from src.data import labeled_input_filenames, load_task_frames
 from src.submission import write_submission
 
+# These legacy fixtures exercise the English-only compatibility path.
+TASK_A = replace(TASK_A, input_mode="english")
+TASK_B = replace(TASK_B, input_mode="english")
+
 
 class TextNormalizationTests(unittest.TestCase):
     """Verify technical cleanup does not discard authored content."""
