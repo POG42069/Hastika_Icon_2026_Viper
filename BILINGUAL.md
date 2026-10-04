@@ -3,10 +3,10 @@
 Code được sửa từ checkout Nhotest, không dùng code Sarvam. Backbone được chuyển sang
 `Qwen/Qwen3-4B-Instruct-2507`, revision
 `cdbee75f17c01a7cc42f958dc650907174af0554`. Đây là bản Instruct non-thinking,
-dùng chat template chính thức và chỉ chấm điểm các nhãn hợp lệ. Ngoài model
-và revision, các thiết lập huấn luyện trong `LLMTrainingConfig` giữ nguyên,
-gồm max_length 256, tối đa 5 epoch, learning rate,
-batch size, LoRA và voting. Số seed theo cấu hình sẵn trong checkout: Task A
+dùng chat template chính thức và chỉ chấm điểm các nhãn hợp lệ. Giới hạn toàn bộ
+chat được tăng từ 256 lên 512 token cho cả Task A và Task B. Các thiết lập
+huấn luyện khác giữ nguyên, gồm tối đa 5 epoch, learning rate, batch size,
+LoRA và voting. Số seed theo cấu hình sẵn trong checkout: Task A
 `42, 52, 62`; Task B `42, 52, 62, 72, 82`. Gender cap của Task B vẫn là 870.
 
 ## Dữ liệu
@@ -58,11 +58,12 @@ trả một nhãn hợp lệ. Loss vẫn chỉ tính trên nhãn trả lời; kh
 một nhiệm vụ sinh bản dịch. Cả selection, full retrain và inference dùng cùng
 cách tạo prompt.
 
-Nếu prompt vượt 256 token, code chia chỗ cho cả hai phiên bản, giữ phần đầu/cuối
+Nếu prompt vượt 512 token, code chia chỗ cho cả hai phiên bản, giữ phần đầu/cuối
 và đánh dấu `[...]` nơi bị lược. Bản ngắn được giữ nguyên nếu đủ chỗ. Nhãn và
 phần kết thúc câu trả lời luôn được giữ đầy đủ; không bỏ hoàn toàn một phiên
-bản. Việc lược vẫn có thể mất chi tiết ở giữa câu. Có thể thử `--max-length 512`
-nếu cần, nhưng đó là thay đổi cấu hình và tăng thời gian/bộ nhớ; mặc định vẫn 256.
+bản. Việc lược vẫn có thể mất chi tiết ở giữa câu. Mặc định là 512; có thể truyền
+`--max-length 256` để đối chiếu với cấu hình trước. Checkpoint huấn luyện ở 256
+không khớp chữ ký resume của cấu hình 512, nên cần huấn luyện lại ở độ dài mới.
 
 Output/checkpoint dùng thư mục `task_a_qwen3_4b_2507_lora_bilingual` và
 `task_b_qwen3_4b_2507_lora_bilingual` để giữ lại kết quả cũ. Resume kiểm tra
