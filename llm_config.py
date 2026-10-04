@@ -38,6 +38,7 @@ class TaskConfig:
     original_comment_column: str = "OriginalComment"
     prompt_style: str = "paired"
     prompt_order: str | None = None
+    fixed_prompt_order: str | None = None
     fixed_full_retrain_epochs: int | None = None
     full_retrain_soft_ensemble: bool = False
     class_weight_power: float | None = None
@@ -161,8 +162,8 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    checkpoint_subdir="task_b_qwen3_4b_2507_lora_bilingual_selection_soft",
-    output_subdir="task_b_qwen3_4b_2507_lora_bilingual_selection_soft",
+    checkpoint_subdir="task_b_qwen3_4b_2507_lora_bilingual_selection_soft_english_first_256",
+    output_subdir="task_b_qwen3_4b_2507_lora_bilingual_selection_soft_english_first_256",
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
@@ -171,6 +172,7 @@ TASK_B = TaskConfig(
     use_augmentation=False,
     input_mode="bilingual",
     prompt_style="khangtest",
+    fixed_prompt_order="english-first",
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),
@@ -200,7 +202,9 @@ def with_prompt_order(task: TaskConfig, order: str) -> TaskConfig:
         raise ValueError("--prompt-order requires --input-mode bilingual.")
     if order not in {"english-first", "original-first"}:
         raise ValueError("prompt_order must be english-first or original-first.")
-    default = "original-first" if task.prompt_style == "khangtest" else "english-first"
+    if task.fixed_prompt_order is not None and order != task.fixed_prompt_order:
+        raise ValueError(f"{task.task_name} fixes --prompt-order to {task.fixed_prompt_order}.")
+    default = task.fixed_prompt_order or ("original-first" if task.prompt_style == "khangtest" else "english-first")
     changed = replace(task, prompt_order=order)
     if order != default:
         suffix = "_" + order.replace("-", "_")
@@ -210,7 +214,7 @@ def with_prompt_order(task: TaskConfig, order: str) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-# Match Khangtest Task B optimization, retaining the pinned Qwen3 and 512 tokens.
-LLM_TRAINING_B = replace(LLM_TRAINING, max_length=512, learning_rate=1e-4, early_stopping_patience=2)
+# Match Khangtest Task B optimization, retaining the pinned Qwen3 and 256 tokens.
+LLM_TRAINING_B = replace(LLM_TRAINING, max_length=256, learning_rate=1e-4, early_stopping_patience=2)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B

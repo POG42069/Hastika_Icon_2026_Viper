@@ -4,7 +4,7 @@ Code được sửa từ checkout Nhotest, không dùng code Sarvam. Backbone đ
 `Qwen/Qwen3-4B-Instruct-2507`, revision
 `cdbee75f17c01a7cc42f958dc650907174af0554`. Đây là bản Instruct non-thinking,
 dùng chat template chính thức và chỉ chấm điểm các nhãn hợp lệ. Giới hạn toàn bộ
-chat mặc định là 256 token cho Task A và 512 token cho Task B. Task A giữ cấu hình
+chat mặc định là 256 token cho cả Task A và Task B. Task A giữ cấu hình
 và luồng huấn luyện của Nhotest, 5 seed
 `42, 52, 62, 72, 82`. Task B giữ learning rate `1e-4`, class-weighted loss và soft ensemble từ Khangtest;
 bỏ cap Gender. Chọn best epoch cho từng seed trên fold 1–4/validation fold 5
@@ -55,8 +55,9 @@ Original code-mixed comment:
 <OriginalComment>
 ```
 
-Task B đặt câu gốc trước, dưới tiêu đề `Comment (raw code-mixed):`, rồi tới
-`English translation:`. System prompt yêu cầu phân loại cùng một comment từ cả
+Task B cố định `English translation:` trước, rồi tới câu gốc dưới tiêu đề
+`Comment (raw code-mixed):`. Cờ `--prompt-order original-first` bị từ chối cho Task B.
+System prompt yêu cầu phân loại cùng một comment từ cả
 hai phiên bản và chỉ
 trả một nhãn hợp lệ. Loss vẫn chỉ tính trên nhãn trả lời; không huấn luyện thêm
 một nhiệm vụ sinh bản dịch. Cả selection, full retrain và inference dùng cùng
@@ -65,12 +66,12 @@ cách tạo prompt.
 Nếu prompt vượt giới hạn của task, code chia chỗ cho cả hai phiên bản, giữ phần đầu/cuối
 và đánh dấu `[...]` nơi bị lược. Bản ngắn được giữ nguyên nếu đủ chỗ. Nhãn và
 phần kết thúc câu trả lời luôn được giữ đầy đủ; không bỏ hoàn toàn một phiên
-bản. Việc lược vẫn có thể mất chi tiết ở giữa câu. Mặc định Task A là 256,
-Task B là 512; có thể truyền `--max-length` để đổi độ dài. Checkpoint huấn luyện ở 256
+bản. Việc lược vẫn có thể mất chi tiết ở giữa câu. Mặc định cả hai task là 256;
+có thể truyền `--max-length` để đổi độ dài. Checkpoint huấn luyện ở 256
 không khớp chữ ký resume của cấu hình 512, nên cần huấn luyện lại ở độ dài mới.
 
 Output/checkpoint dùng thư mục `task_a_qwen3_4b_2507_lora_bilingual` và
-`task_b_qwen3_4b_2507_lora_bilingual_selection_soft` để giữ lại kết quả cũ. Resume kiểm tra
+`task_b_qwen3_4b_2507_lora_bilingual_selection_soft_english_first_256` để giữ lại kết quả cũ. Resume kiểm tra
 model, revision, input mode, cột nguồn, phiên bản prompt và dữ liệu; checkpoint English-only
 hoặc legacy thiếu thông tin tương thích không được dùng lại cho bilingual.
 

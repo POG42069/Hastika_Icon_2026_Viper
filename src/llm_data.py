@@ -14,7 +14,9 @@ CommentInput = str | tuple[str, str]
 
 
 def effective_prompt_order(task: TaskConfig) -> str:
-    order = task.prompt_order or (
+    if task.fixed_prompt_order is not None and task.prompt_order not in {None, task.fixed_prompt_order}:
+        raise ValueError(f"{task.task_name} fixes prompt_order to {task.fixed_prompt_order}.")
+    order = task.fixed_prompt_order or task.prompt_order or (
         "original-first" if task.prompt_style == "khangtest" else "english-first"
     )
     if order not in {"english-first", "original-first"}:

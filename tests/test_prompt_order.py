@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from llm_config import TASK_B, LLM_TRAINING_B, with_prompt_order
+from llm_config import TASK_B as FIXED_TASK_B, LLM_TRAINING_B, with_prompt_order
 from src.llm_data import ChatEncoder
 from src.llm_training import _resume_signature, run_llm_cli, run_llm_task
 from src.resume import ResumeCatalog
@@ -16,7 +16,31 @@ from tests.test_llm_pipeline import TestChatTokenizer, cpu_runtime
 from tests import test_task_b_khangtest as fixtures
 
 
+# Keep testing optional order experiments independently of the fixed Task B policy.
+TASK_B = replace(FIXED_TASK_B, fixed_prompt_order=None)
+LLM_TRAINING_B = replace(LLM_TRAINING_B, max_length=512)
+
+
 class PromptOrderTests(unittest.TestCase):
+    def test_fixed_task_b_is_english_first_and_rejects_opposite_order(self):
+        pair = ('English first!', 'Original second!')
+        encoder = ChatEncoder(TestChatTokenizer(), FIXED_TASK_B, 700)
+        self.assertEqual(encoder.messages(pair)[1]['content'],
+                         'English translation:\nEnglish first!\n\nComment (raw code-mixed):\nOriginal second!')
+        same = with_prompt_order(FIXED_TASK_B, 'english-first')
+        self.assertEqual(same.output_subdir, FIXED_TASK_B.output_subdir)
+        with self.assertRaisesRegex(ValueError, 'fixes --prompt-order'):
+            with_prompt_order(FIXED_TASK_B, 'original-first')
+        with self.assertRaisesRegex(ValueError, 'fixes prompt_order'):
+            ChatEncoder(TestChatTokenizer(), replace(FIXED_TASK_B, prompt_order='original-first'), 700)
+        with patch('sys.argv', ['Train_B_LLM.py', '--prompt-order', 'original-first']), patch(
+            'src.llm_training.run_llm_task'
+        ) as runner:
+            with self.assertRaises(SystemExit) as failure:
+                run_llm_cli(FIXED_TASK_B, LLM_TRAINING_B)
+        self.assertEqual(failure.exception.code, 2)
+        runner.assert_not_called()
+
     def test_only_view_order_changes_and_labels_and_instructions_stay_identical(self):
         tokenizer = TestChatTokenizer()
         before = ChatEncoder(tokenizer, TASK_B, 700)

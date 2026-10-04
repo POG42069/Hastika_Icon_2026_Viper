@@ -93,7 +93,7 @@ class BilingualTests(unittest.TestCase):
                 self.assertFalse(truncated)
                 body = encoder.messages(pair)[1]['content']
                 expected = (
-                    f'Comment (raw code-mixed):\n{pair[1]}\n\nEnglish translation:\n{pair[0]}'
+                    f'English translation:\n{pair[0]}\n\nComment (raw code-mixed):\n{pair[1]}'
                     if task.prompt_style == 'khangtest' else
                     f'English translation:\n{pair[0]}\nOriginal code-mixed comment:\n{pair[1]}'
                 )

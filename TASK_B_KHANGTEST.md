@@ -1,6 +1,6 @@
 # Task B trên Nhotest theo Khangtest
 
-Task B giữ prompt, class-weighted loss và soft ensemble đã đối chiếu với
+Task B giữ system prompt, class-weighted loss và soft ensemble đã đối chiếu với
 `Khangtest` tại commit `e27514b`. Theo yêu cầu mới, Nhotest thêm lại bước chọn
 best epoch trước khi retrain, giống hai giai đoạn của Task A:
 
@@ -22,33 +22,28 @@ Task A giữ nguyên cấu hình và luồng huấn luyện hiện tại.
 
 Các điều chỉnh để dùng dataset đã giao: `Comment` chứa tiếng Anh,
 `OriginalComment` chứa câu gốc. Không yêu cầu đổi cột sang `Comment_en` như
-Khangtest. Prompt Task B giữ cách trình bày của Khangtest:
+Khangtest. Prompt Task B dùng các tiêu đề của Khangtest, cố định tiếng Anh trước câu gốc:
 
 ```text
-Comment (raw code-mixed):
-<OriginalComment>
-
 English translation:
 <Comment>
+
+Comment (raw code-mixed):
+<OriginalComment>
 ```
 
-Giữ giới hạn 512 token và revision Qwen3 đã pin theo yêu cầu trước. Nếu quá
+Giới hạn mặc định là 256 token, dùng revision Qwen3 đã pin. Nếu quá
 dài, cả hai phiên bản được chia ngân sách token và giữ phần đầu/cuối. Nhãn
 trả lời được giữ đầy đủ. Dữ liệu và nhãn trong CSV không bị sửa.
 
-Đảo riêng thứ tự sang tiếng Anh trước, câu gốc sau mà vẫn giữ nguyên system
-prompt, tiêu đề, dữ liệu và cấu hình train:
+Không cần truyền cờ để đặt tiếng Anh trước. Cờ này vẫn được chấp nhận:
 
 ```python
 !python Train_B_LLM.py --prompt-order english-first
 ```
 
-Thêm cờ này vào lệnh đang dùng, giữ lại các cờ khác (bao gồm file gold nếu có).
-Lần đảo thứ tự dùng thư mục task có thêm hậu tố `_english_first`, train lại
-và không dùng checkpoint của thứ tự cũ. Cờ được áp dụng nhất quán khi train,
-validation và prediction. Các run đảo thứ tự bị timeout vẫn resume được với
-cùng cờ. Không truyền cờ, hoặc dùng `--prompt-order original-first`, giữ cách
-chạy mặc định của pipeline mới. So sánh macro-F1 trên cùng validation.
+`--prompt-order original-first` bị từ chối cho Task B để tránh đảo thứ tự ngoài ý muốn.
+Thứ tự cố định áp dụng nhất quán khi train, validation và prediction.
 
 ## Chạy trên Kaggle
 
@@ -82,8 +77,8 @@ file bằng cờ trên thì file phải tồn tại và nhãn/ID phải hợp l�
 
 ## Checkpoint và kết quả
 
-Thư mục task mới: `task_b_qwen3_4b_2507_lora_bilingual_selection_soft` dưới
-`checkpoints/` và `outputs/`, tách biệt với run train cố định 5 epoch trước đó.
+Thư mục task mới: `task_b_qwen3_4b_2507_lora_bilingual_selection_soft_english_first_256` dưới
+`checkpoints/` và `outputs/`, tách biệt với run 512 hoặc câu gốc trước.
 Mỗi epoch hoàn tất ở cả selection và full retrain lưu adapter, optimizer,
 scheduler, GradScaler và RNG bằng cơ chế resume của Nhotest. Epoch bị timeout
 giữa chừng được chạy lại; seed đã hoàn thành được tái sử dụng. Khi đổi input

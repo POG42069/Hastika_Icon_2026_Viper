@@ -21,7 +21,7 @@ class TaskBSelectionTests(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.TaskBKhangtestTests()
         self.task = replace(TASK_B, selection_seeds=(42, 52))
-        self.config = replace(LLM_TRAINING_B, max_epochs=4, early_stopping_patience=2)
+        self.config = replace(LLM_TRAINING_B, max_length=512, max_epochs=4, early_stopping_patience=2)
 
     def test_per_seed_best_epochs_precede_fresh_full_data_training_and_keep_soft_ensemble(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:

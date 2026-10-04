@@ -24,6 +24,10 @@ from src.task_b_training import (
 from tests.test_llm_pipeline import TestChatTokenizer, cpu_runtime, tiny_model
 
 
+# The character-level fixture needs more space than the real Qwen tokenizer.
+LLM_TRAINING_B = replace(LLM_TRAINING_B, max_length=512)
+
+
 class TaskBKhangtestTests(unittest.TestCase):
     def write_data(self, root, task, gold=True):
         for fold, filename in enumerate(task.original_fold_filenames, 1):
@@ -95,7 +99,7 @@ class TaskBKhangtestTests(unittest.TestCase):
             self.assertEqual(frame['original_text'].iloc[0], 'raw dev 5!')
             encoder = ChatEncoder(TestChatTokenizer(), TASK_B, 512)
             body = encoder.messages((frame['text'].iloc[0], frame['original_text'].iloc[0]))[1]['content']
-            self.assertEqual(body, 'Comment (raw code-mixed):\nraw dev 5!\n\nEnglish translation:\nEnglish dev 5!')
+            self.assertEqual(body, 'English translation:\nEnglish dev 5!\n\nComment (raw code-mixed):\nraw dev 5!')
             self.assertNotIn('Others', body)
             # A test prediction override must not change the development source.
             with patch('src.data.resolve_data_file', side_effect=root.joinpath):
