@@ -45,7 +45,9 @@ from src.training import cap_training_labels, stratified_holdout_indices
 # Retain the original unit fixtures; the integration test also runs both tasks
 # with bilingual inputs explicitly below.
 TASK_A = replace(TASK_A, input_mode="english")
-TASK_B = replace(TASK_B, input_mode="english")
+TASK_B = replace(TASK_B, input_mode="english", fixed_full_retrain_epochs=None,
+                 selection_validation_fold=5, ensemble_all_seeds=True,
+                 selection_train_label_caps=(("Gender", 870),), prompt_style="paired")
 
 
 class TestChatTokenizer:

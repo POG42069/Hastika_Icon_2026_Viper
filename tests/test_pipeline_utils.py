@@ -17,7 +17,8 @@ from src.submission import write_submission
 
 # These legacy fixtures exercise the English-only compatibility path.
 TASK_A = replace(TASK_A, input_mode="english")
-TASK_B = replace(TASK_B, input_mode="english")
+TASK_B = replace(TASK_B, input_mode="english", fixed_full_retrain_epochs=None,
+                 selection_validation_fold=5)
 
 
 class TextNormalizationTests(unittest.TestCase):

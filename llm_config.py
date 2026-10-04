@@ -36,6 +36,15 @@ class TaskConfig:
     use_augmentation: bool = True
     input_mode: str = "english"
     original_comment_column: str = "OriginalComment"
+    prompt_style: str = "paired"
+    fixed_full_retrain_epochs: int | None = None
+    full_retrain_soft_ensemble: bool = False
+    class_weight_power: float | None = None
+    class_weight_min: float = 0.75
+    class_weight_max: float = 1.50
+    epoch_validation_filename: str | None = None
+    epoch_validation_input_filename: str | None = None
+    epoch_validation_required: bool = False
     selection_validation_fold: int | None = None
     selection_validation_data_origins: tuple[str, ...] = ()
     selection_train_label_caps: tuple[tuple[str, int], ...] = ()
@@ -52,6 +61,7 @@ class TaskConfig:
 
         if (
             not self.use_augmentation
+            and self.fixed_full_retrain_epochs is None
             and self.compact_train_filename
             and self.compact_validation_filename
         ):
@@ -150,8 +160,8 @@ TASK_B = TaskConfig(
         "Violence",
         "Others",
     ),
-    checkpoint_subdir="task_b_qwen3_4b_2507_lora_bilingual",
-    output_subdir="task_b_qwen3_4b_2507_lora_bilingual",
+    checkpoint_subdir="task_b_qwen3_4b_2507_lora_bilingual_fixed_soft",
+    output_subdir="task_b_qwen3_4b_2507_lora_bilingual_fixed_soft",
     submission_zip_name="task_b_submission.zip",
     original_fold_filenames=tuple(f"original_{fold}.csv" for fold in range(1, 6)),
     augmentation_fold_filenames=tuple(f"augment{fold}.csv" for fold in range(1, 6)),
@@ -159,12 +169,19 @@ TASK_B = TaskConfig(
     compact_validation_filename="original_5.csv",
     use_augmentation=False,
     input_mode="bilingual",
-    selection_validation_fold=5,
+    prompt_style="khangtest",
+    selection_validation_fold=None,
     selection_validation_data_origins=("original",),
-    selection_train_label_caps=(("Gender", 870),),
     selection_seeds=(42, 52, 62, 72, 82),
-    ensemble_all_seeds=True,
-    report_per_class_metrics=False,
+    ensemble_all_seeds=False,
+    fixed_full_retrain_epochs=5,
+    full_retrain_soft_ensemble=True,
+    class_weight_power=0.50,
+    class_weight_min=0.75,
+    class_weight_max=1.50,
+    report_per_class_metrics=True,
+    epoch_validation_filename="hastika_multiclass_validation.csv",
+    epoch_validation_input_filename="multiclass_validation_inputs.csv",
     enable_augmentation_audit=True,
     augmentation_audit_action="report",
 )
@@ -177,7 +194,7 @@ def llm_task(task: TaskConfig) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-# Task B currently uses the same training defaults as Task A.
-LLM_TRAINING_B = replace(LLM_TRAINING)
+# Match Khangtest Task B optimization, retaining the pinned Qwen3 and 512 tokens.
+LLM_TRAINING_B = replace(LLM_TRAINING, learning_rate=1e-4, early_stopping_patience=2)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B

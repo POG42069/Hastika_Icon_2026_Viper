@@ -16,31 +16,22 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 ## Quy trình huấn luyện
 
-Mỗi entry point tự chạy hai giai đoạn. Cách tạo holdout phụ thuộc vào task:
+Task A giữ luồng holdout selection và full retrain của Nhotest:
 
-1. Cả hai task dùng dữ liệu original với hai cột ngôn ngữ, không dùng augmentation.
-   Task A train trên `binary_original_1_4.csv` và validation trên
-   `binary_original_5.csv`. Task B tương ứng dùng `original_1_4.csv` và
-   `original_5.csv`. Loader gán fold 1 cho nhóm 1–4 đã gộp và fold 5 cho
-   validation để giữ nguyên logic chia tập. Nếu không có cả hai file gộp,
-   loader vẫn có thể đọc các file original 1–5 kiểu cũ (không đọc augment).
-2. Theo cấu hình Nhotest hiện có, Task A chạy 3 seed `42, 52, 62`; Task B chạy
-   5 seed `42, 52, 62, 72, 82`. Mỗi seed train LoRA
-   và tự chọn `best_epoch` trên cùng một validation cố định. Macro-F1 cao hơn
-   thắng; validation loss thấp hơn dùng để phá hòa trong cùng seed. Task B còn
-   lấy ngẫu nhiên một tập Gender khác nhau xuống tối đa 870 câu cho mỗi seed.
-3. Với cả hai task, từng seed khởi tạo lại backbone và LoRA từ đầu rồi retrain
-   trên dữ liệu đầy đủ theo `best_epoch` riêng. Task B tiếp tục loại đúng tập
-   Gender mà seed đó đã chọn khi chạy phase selection; vì vậy 5 seed có thể
-   retrain trên 5 tập Gender khác nhau nhưng cùng số lượng mẫu.
-4. Các adapter dự đoán development độc lập và có trọng số ngang nhau. Task A
-   dùng majority vote. Task B dùng plurality vote; nếu nhiều nhãn cùng số phiếu
-   cao nhất thì lần lượt phá hòa bằng tổng điểm Borda, tổng `mean_token_log_probs`
-   đã z-normalize riêng trong từng seed/mẫu, rồi thứ tự label cố định trong
-   `llm_config.py` nếu mọi giá trị vẫn bằng nhau.
-5. Kết quả ensemble dùng để tạo
-   `predictions.csv` cùng file ZIP nộp CodaBench. Full-retrain không đánh giá
-   lại fold 5 vì fold này đã được đưa vào dữ liệu huấn luyện đầy đủ.
+1. Dùng original song ngữ, không augmentation; train fold 1–4, validation fold 5.
+   Có thể đọc file compact `binary_original_1_4.csv` + `binary_original_5.csv`,
+   hoặc đủ năm file `binary_original_1.csv` tới `binary_original_5.csv`.
+2. Chạy 5 seed `42, 52, 62, 72, 82`, chọn best epoch bằng macro-F1 validation,
+   rồi dùng validation loss để phá hòa.
+3. Từng seed khởi tạo lại backbone/LoRA và retrain dữ liệu đầy đủ theo best epoch.
+4. Dự đoán từng seed và majority vote với trọng số ngang nhau.
+5. Xuất `predictions.csv` và ZIP nộp CodaBench.
+
+Task B theo nhánh Khangtest (`e27514b`): train đủ 5 fold trong 5 epoch cho mỗi
+seed, class-weighted loss, không OOF/holdout selection, không cap Gender,
+ensemble bằng trung bình xác suất. Loader dùng `OriginalComment` (gốc) và
+`Comment` (tiếng Anh) từ dataset song ngữ. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md)
+để chạy, cung cấp gold validation và resume. Task B vẫn dùng 512 token như yêu cầu.
 
 Việc khởi tạo lại ở bước full-retrain giúp tất cả mẫu được học số epoch như nhau. Nếu
 tiếp tục trực tiếp từ adapter 80%, nhóm 80% ban đầu sẽ được học nhiều lần hơn
@@ -76,7 +67,7 @@ Cấu hình mặc định trong `llm_config.py`:
 | Max epochs để chọn | 5 |
 | Early-stopping patience | 4 |
 | Max chat length | 512 |
-| Learning rate | `2e-4` |
+| Learning rate | Task A `2e-4`; Task B `1e-4` |
 | Batch/GPU | 4 |
 | Gradient accumulation | 2 |
 | Eval batch/GPU | 2 candidate completions |
@@ -118,17 +109,18 @@ binary_validation_inputs.csv
 Task B (mặc định):
 
 ```text
-original_1_4.csv
+original_1.csv
+original_2.csv
+original_3.csv
+original_4.csv
 original_5.csv
 multiclass_validation_inputs.csv
 ```
 
-Train CSV cần các cột `id`, `Comment` và cột nhãn tương ứng. Development CSV
-cần `id`, `Comment`. Giải nén `hastika_english_only.zip` rồi trỏ
-`HASTIKA_DATA_DIR` tới thư mục chứa các CSV, hoặc gắn dataset đã giải nén
-trên Kaggle. Nếu chỉ tìm thấy một trong hai file original của task, loader
-báo lỗi thay vì âm thầm trộn bộ dữ liệu mới với file cũ. File
-`translation_map.csv` không được dùng để huấn luyện.
+Train CSV cần `id`, `Comment`, `OriginalComment` và cột nhãn tương ứng.
+Development CSV cần `id`, `Comment`, `OriginalComment`. Giải nén
+`hastika_bilingual_no_augments.zip` và trỏ `HASTIKA_DATA_DIR` vào đúng thư mục
+chứa CSV. Cả hai task giữ cột tiếng Anh và câu gốc trong cùng một mẫu.
 
 Script thử nghiệm augmentation Task A dưới đây chỉ dành cho bộ dữ liệu cũ;
 pipeline tiếng Anh mặc định không dùng output của script này:
@@ -304,17 +296,14 @@ cập nhật sau khi adapter và `training_state.pt` đã ghi xong, tránh nhậ
 checkpoint bị cắt giữa lúc Kaggle timeout.
 
 `validation_predictions.csv` ở thư mục gốc là kết quả của seed có holdout tốt
-nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 3 seed Task A,
+nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 5 seed Task A,
 số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
 kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
-Task B có cấu trúc artifact tương tự Task A: mỗi seed có
-`best_holdout_adapter/`, `final_full_data_adapter/`, prediction và lịch sử
-retrain riêng. `outputs/task_b_qwen3_4b_2507_lora_bilingual/voting_predictions.csv` lưu nhãn của từng
-seed, số phiếu, điểm Borda, tổng candidate score đã chuẩn hóa, phương thức phá
-hòa và nhãn cuối. Các file `predictions.csv`, ZIP và `run_summary.json` ở thư
-mục gốc là kết quả ensemble; seed có holdout tốt nhất chỉ được dùng để xuất báo
-cáo validation đại diện, không còn là seed duy nhất được retrain.
+Task B dùng thư mục `task_b_qwen3_4b_2507_lora_bilingual_fixed_soft`.
+`ensemble_predictions.csv` lưu nhãn từng seed và xác suất trung bình dùng cho
+nhãn cuối. Mỗi seed có final adapter, lịch sử full-data và cache prediction;
+không có best holdout adapter. Chi tiết trong [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
 
 Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
 tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức

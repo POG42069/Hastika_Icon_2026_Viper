@@ -267,7 +267,7 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
         )
     if not task.original_fold_filenames:
         raise ValueError("At least one predefined fold is required.")
-    if task.selection_validation_fold not in range(
+    if task.fixed_full_retrain_epochs is None and task.selection_validation_fold not in range(
         1, len(task.original_fold_filenames) + 1
     ):
         raise ValueError("selection_validation_fold does not identify a configured fold.")
@@ -381,7 +381,7 @@ def _optional_data_file(name: str) -> Path | None:
 def _compact_original_paths(task: TaskConfig) -> tuple[Path, Path] | None:
     """Select the compact originals only when both files are available."""
 
-    if task.use_augmentation:
+    if task.use_augmentation or task.fixed_full_retrain_epochs is not None:
         return None
     names = (task.compact_train_filename, task.compact_validation_filename)
     if not any(names):
@@ -466,3 +466,53 @@ def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
         task,
         train_description,
     )
+
+
+def load_epoch_validation_frame(task: TaskConfig) -> pd.DataFrame | None:
+    """Align external gold by ID to the bilingual development inputs.
+
+    Gold comments may be raw code-mixed, while this release stores English in
+    Comment. Keep gold row order, use the paired input text, and check the raw
+    source when present. Never use prediction-file overrides as this reference.
+    """
+    if task.epoch_validation_filename is None:
+        return None
+    if task.epoch_validation_required:
+        path = resolve_data_file(task.epoch_validation_filename)
+    else:
+        path = _optional_data_file(task.epoch_validation_filename)
+        if path is None:
+            return None
+    gold = _read_csv(path)
+    _validate_columns(gold, path, {"id", task.label_column})
+    if gold.empty or gold['id'].eq('').any() or gold['id'].duplicated().any():
+        raise ValueError("Official validation requires nonempty data and unique, nonmissing IDs.")
+    if not set(gold[task.label_column]).issubset(task.labels):
+        raise ValueError("Official validation has missing or unknown labels.")
+    name = task.epoch_validation_input_filename or task.prediction_filename
+    input_path = resolve_data_file(name)
+    inputs = _read_csv(input_path)
+    required = {'id', 'Comment'}
+    if task.input_mode == 'bilingual':
+        required.add(task.original_comment_column)
+    _validate_columns(inputs, input_path, required)
+    if inputs['id'].eq('').any() or inputs['id'].duplicated().any():
+        raise ValueError("Validation input requires unique, nonmissing IDs.")
+    reference = inputs.set_index('id')
+    missing = ~gold['id'].isin(reference.index)
+    if missing.any():
+        raise ValueError(f"Official validation IDs are missing from development: {gold.loc[missing, 'id'].head(10).tolist()}")
+    aligned = reference.loc[gold['id']].reset_index()
+    if task.input_mode == 'bilingual' and 'Comment' in gold:
+        raw = aligned[task.original_comment_column].map(normalize_text)
+        translated = aligned['Comment'].map(normalize_text)
+        authored = gold['Comment'].map(normalize_text)
+        if (~(authored.eq(raw) | authored.eq(translated))).any():
+            raise ValueError("Official validation comments differ from paired development inputs.")
+    aligned[task.label_column] = gold[task.label_column].to_numpy()
+    validated, _ = _validate_and_encode_frames(aligned, inputs, task, str(path))
+    if validated['text'].eq('').any() or (
+        task.input_mode == 'bilingual' and validated['original_text'].eq('').any()
+    ):
+        raise ValueError("Official validation inputs contain empty comments.")
+    return validated

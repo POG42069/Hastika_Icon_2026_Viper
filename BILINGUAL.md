@@ -4,10 +4,11 @@ Code được sửa từ checkout Nhotest, không dùng code Sarvam. Backbone đ
 `Qwen/Qwen3-4B-Instruct-2507`, revision
 `cdbee75f17c01a7cc42f958dc650907174af0554`. Đây là bản Instruct non-thinking,
 dùng chat template chính thức và chỉ chấm điểm các nhãn hợp lệ. Giới hạn toàn bộ
-chat được tăng từ 256 lên 512 token cho cả Task A và Task B. Các thiết lập
-huấn luyện khác giữ nguyên, gồm tối đa 5 epoch, learning rate, batch size,
-LoRA và voting. Số seed theo cấu hình sẵn trong checkout: Task A
-`42, 52, 62`; Task B `42, 52, 62, 72, 82`. Gender cap của Task B vẫn là 870.
+chat được tăng từ 256 lên 512 token cho cả Task A và Task B. Task A giữ cấu hình
+và luồng huấn luyện của Nhotest, 5 seed
+`42, 52, 62, 72, 82`. Task B được chuyển sang luồng của Khangtest: train đủ
+5 fold trong 5 epoch/seed, learning rate `1e-4`, class-weighted loss và soft
+ensemble; bỏ cap Gender. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
 
 ## Dữ liệu
 
@@ -44,7 +45,7 @@ Trong Kaggle, thay đường dẫn bằng thư mục của Dataset mới. Cài d
 bằng requirements.txt như trước. Các tùy chọn model/epoch/batch đã dùng ở lần
 chạy tốt nhất cần tiếp tục truyền đúng giá trị nếu khác cấu hình hiện có.
 
-Prompt của mỗi mẫu có dạng:
+Prompt Task A có dạng:
 
 ```text
 English translation:
@@ -53,7 +54,9 @@ Original code-mixed comment:
 <OriginalComment>
 ```
 
-System prompt yêu cầu phân loại cùng một comment từ cả hai phiên bản và chỉ
+Task B đặt câu gốc trước, dưới tiêu đề `Comment (raw code-mixed):`, rồi tới
+`English translation:`. System prompt yêu cầu phân loại cùng một comment từ cả
+hai phiên bản và chỉ
 trả một nhãn hợp lệ. Loss vẫn chỉ tính trên nhãn trả lời; không huấn luyện thêm
 một nhiệm vụ sinh bản dịch. Cả selection, full retrain và inference dùng cùng
 cách tạo prompt.
@@ -66,7 +69,7 @@ bản. Việc lược vẫn có thể mất chi tiết ở giữa câu. Mặc đ
 không khớp chữ ký resume của cấu hình 512, nên cần huấn luyện lại ở độ dài mới.
 
 Output/checkpoint dùng thư mục `task_a_qwen3_4b_2507_lora_bilingual` và
-`task_b_qwen3_4b_2507_lora_bilingual` để giữ lại kết quả cũ. Resume kiểm tra
+`task_b_qwen3_4b_2507_lora_bilingual_fixed_soft` để giữ lại kết quả cũ. Resume kiểm tra
 model, revision, input mode, cột nguồn, phiên bản prompt và dữ liệu; checkpoint English-only
 hoặc legacy thiếu thông tin tương thích không được dùng lại cho bilingual.
 
@@ -85,7 +88,8 @@ HASTIKA_CHECKPOINT_DIR=/absolute/path/checkpoints/bilingual \
 python Train_A_LLM.py --input-mode bilingual --no-auto-resume
 ```
 
-Task A dùng lại đầy đủ 1.317 câu fold 5; Task B dùng 631 câu. Không dùng quy tắc
+Task A dùng đầy đủ 1.317 câu fold 5. Task B train cả 3.155 câu của 5 fold;
+395 câu development được báo điểm riêng nếu có file nhãn gold. Không dùng quy tắc
 lọc xuống 1.302 câu của bản Task A repair trước. Các kiểm tra CPU và tokenizer
 xác nhận pipeline đúng dữ liệu, không xác nhận macro-F1 tốt hơn; cần chạy lại
 backbone trên GPU để đánh giá chất lượng.

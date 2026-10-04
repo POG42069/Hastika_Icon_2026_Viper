@@ -92,7 +92,12 @@ class BilingualTests(unittest.TestCase):
                 prompt, truncated = encoder.encode_prompt(pair)
                 self.assertFalse(truncated)
                 body = encoder.messages(pair)[1]['content']
-                self.assertEqual(body, f'English translation:\n{pair[0]}\nOriginal code-mixed comment:\n{pair[1]}')
+                expected = (
+                    f'Comment (raw code-mixed):\n{pair[1]}\n\nEnglish translation:\n{pair[0]}'
+                    if task.prompt_style == 'khangtest' else
+                    f'English translation:\n{pair[0]}\nOriginal code-mixed comment:\n{pair[1]}'
+                )
+                self.assertEqual(body, expected)
                 data = CompletionDataset([pair], encoder, [0])
                 self.assertEqual(len(data), 1)
                 feature = data[0]
@@ -110,7 +115,8 @@ class BilingualTests(unittest.TestCase):
                 ))
                 self.assertTrue(truncated)
                 decoded = tokenizer.decode(prompt, skip_special_tokens=True)
-                for part in ('English translation:', 'Original code-mixed comment:', 'EN_START', 'EN_END!', 'RAW_START', 'RAW_END!', '[...]'):
+                raw_header = 'Comment (raw code-mixed):' if task.prompt_style == 'khangtest' else 'Original code-mixed comment:'
+                for part in ('English translation:', raw_header, 'EN_START', 'EN_END!', 'RAW_START', 'RAW_END!', '[...]'):
                     self.assertIn(part, decoded)
                 for label_id in range(len(task.labels)):
                     feature = encoder.feature(prompt, label_id)

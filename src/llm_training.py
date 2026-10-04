@@ -2026,6 +2026,11 @@ def run_llm_task(
     """Select epochs, retrain configured seeds, then predict development."""
 
     validate_config(config)
+    if task.fixed_full_retrain_epochs is not None:
+        from src.task_b_training import run_fixed_task_b
+
+        run_fixed_task_b(task, config, resume_sources, auto_resume)
+        return
     selection_seeds = task.selection_seeds or (config.seed,)
     if len(set(selection_seeds)) != len(selection_seeds):
         raise ValueError("selection_seeds must not contain duplicates")
@@ -2943,7 +2948,15 @@ def run_llm_cli(
         action="store_true",
         help="Do not automatically scan /kaggle/input for earlier result artifacts.",
     )
+    if task.fixed_full_retrain_epochs is not None:
+        parser.add_argument(
+            "--epoch-validation-file", default=None,
+            help="Optional external gold CSV; an explicitly supplied path is required to exist.",
+        )
     args = parser.parse_args()
+    if getattr(args, "epoch_validation_file", None) is not None:
+        task = replace(task, epoch_validation_filename=args.epoch_validation_file,
+                       epoch_validation_required=True)
     config = replace(
         defaults,
         model_name=args.model,
