@@ -104,7 +104,7 @@ class BilingualTests(unittest.TestCase):
                 self.assertEqual(feature['labels'][:len(prompt)], [-100] * len(prompt))
                 self.assertEqual(feature['labels'][len(prompt):], encoder.completions[0])
 
-    def test_long_pair_retains_both_headers_beginnings_endings_and_whole_answer(self):
+    def test_long_pair_retains_both_headers_beginnings_and_whole_answer(self):
         for task in (TASK_A, TASK_B):
             with self.subTest(task=task.task_name):
                 tokenizer = TestChatTokenizer()
@@ -116,8 +116,10 @@ class BilingualTests(unittest.TestCase):
                 self.assertTrue(truncated)
                 decoded = tokenizer.decode(prompt, skip_special_tokens=True)
                 raw_header = 'Comment (raw code-mixed):' if task.prompt_style == 'khangtest' else 'Original code-mixed comment:'
-                for part in ('English translation:', raw_header, 'EN_START', 'EN_END!', 'RAW_START', 'RAW_END!', '[...]'):
+                for part in ('English translation:', raw_header, 'EN_START', 'RAW_START'):
                     self.assertIn(part, decoded)
+                for part in ('EN_END!', 'RAW_END!', '[...]'):
+                    self.assertNotIn(part, decoded)
                 for label_id in range(len(task.labels)):
                     feature = encoder.feature(prompt, label_id)
                     self.assertLessEqual(len(feature['input_ids']), 700)
@@ -188,6 +190,7 @@ class BilingualTests(unittest.TestCase):
         self.assertNotEqual(bilingual, english)
         self.assertNotEqual(bilingual, other_column)
         self.assertEqual(bilingual['format_version'], 2)
+        self.assertEqual(bilingual['prompt_policy'], 'bilingual-balanced-prefix-v1')
 
 
 if __name__ == '__main__':

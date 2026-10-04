@@ -4,7 +4,7 @@ Code được sửa từ checkout Nhotest, không dùng code Sarvam. Backbone đ
 `Qwen/Qwen3-4B-Instruct-2507`, revision
 `cdbee75f17c01a7cc42f958dc650907174af0554`. Đây là bản Instruct non-thinking,
 dùng chat template chính thức và chỉ chấm điểm các nhãn hợp lệ. Giới hạn toàn bộ
-chat được tăng từ 256 lên 512 token cho cả Task A và Task B. Task A giữ cấu hình
+chat mặc định là 256 token cho cả Task A và Task B. Task A giữ cấu hình
 và luồng huấn luyện của Nhotest, 5 seed
 `42, 52, 62, 72, 82`. Task B được chuyển sang luồng của Khangtest: train đủ
 5 fold trong 5 epoch/seed, learning rate `1e-4`, class-weighted loss và soft
@@ -61,12 +61,12 @@ trả một nhãn hợp lệ. Loss vẫn chỉ tính trên nhãn trả lời; kh
 một nhiệm vụ sinh bản dịch. Cả selection, full retrain và inference dùng cùng
 cách tạo prompt.
 
-Nếu prompt vượt 512 token, code chia chỗ cho cả hai phiên bản, giữ phần đầu/cuối
-và đánh dấu `[...]` nơi bị lược. Bản ngắn được giữ nguyên nếu đủ chỗ. Nhãn và
+Nếu prompt vượt 256 token, code chia chỗ cho cả hai phiên bản và giữ phần đầu
+của mỗi phiên bản. Bản ngắn được giữ nguyên nếu đủ chỗ. Nhãn và
 phần kết thúc câu trả lời luôn được giữ đầy đủ; không bỏ hoàn toàn một phiên
-bản. Việc lược vẫn có thể mất chi tiết ở giữa câu. Mặc định là 512; có thể truyền
-`--max-length 256` để đối chiếu với cấu hình trước. Checkpoint huấn luyện ở 256
-không khớp chữ ký resume của cấu hình 512, nên cần huấn luyện lại ở độ dài mới.
+bản. Việc lược vẫn có thể mất chi tiết ở cuối câu. Có thể truyền
+`--max-length 512` để đổi độ dài. Checkpoint dùng độ dài khác hoặc cách giữ
+đầu/cuối cũ không khớp chữ ký resume, nên cần huấn luyện lại với cấu hình mới.
 
 Output/checkpoint dùng thư mục `task_a_qwen3_4b_2507_lora_bilingual` và
 `task_b_qwen3_4b_2507_lora_bilingual_fixed_soft` để giữ lại kết quả cũ. Resume kiểm tra

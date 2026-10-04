@@ -31,7 +31,7 @@ Task B theo nhánh Khangtest (`e27514b`): train đủ 5 fold trong 5 epoch cho m
 seed, class-weighted loss, không OOF/holdout selection, không cap Gender,
 ensemble bằng trung bình xác suất. Loader dùng `OriginalComment` (gốc) và
 `Comment` (tiếng Anh) từ dataset song ngữ. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md)
-để chạy, cung cấp gold validation và resume. Task B vẫn dùng 512 token như yêu cầu.
+để chạy, cung cấp gold validation và resume. Giới hạn mặc định là 256 token.
 
 Việc khởi tạo lại ở bước full-retrain giúp tất cả mẫu được học số epoch như nhau. Nếu
 tiếp tục trực tiếp từ adapter 80%, nhóm 80% ban đầu sẽ được học nhiều lần hơn
@@ -48,7 +48,7 @@ Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa cột `Comment` và
 - Không xóa stopword, không lemmatize và không chuẩn hóa ký tự/từ lặp.
 
 Khi prompt song ngữ quá dài, `ChatEncoder` chia ngân sách token cho cả hai
-phiên bản, giữ phần đầu/cuối và đánh dấu `[...]` ở phần bị lược. System prompt
+phiên bản và giữ phần đầu của mỗi phiên bản. System prompt
 và assistant label vẫn nằm đầy đủ trong `max_length`. Chế độ English-only
 giữ quy tắc cắt phần cuối comment.
 
@@ -66,7 +66,7 @@ Cấu hình mặc định trong `llm_config.py`:
 | Target modules | `all-linear` |
 | Max epochs để chọn | 5 |
 | Early-stopping patience | 4 |
-| Max chat length | 512 |
+| Max chat length | 256 |
 | Learning rate | Task A `2e-4`; Task B `1e-4` |
 | Batch/GPU | 4 |
 | Gradient accumulation | 2 |

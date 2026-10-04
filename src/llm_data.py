@@ -151,52 +151,39 @@ class ChatEncoder:
         return prompt, True
 
     def _encode_bilingual_truncated(self, texts: tuple[str, str]) -> list[int]:
-        """Share the token budget, retaining the beginning/end of both views.
+        """Share the token budget and retain the beginning of both views.
 
-        Short views release unused space to the longer view. Render and measure
-        the full template again after decoding to account for token boundaries
-        and the explicit omission markers; never truncate the answer.
+        Allocate in prompt order, as Khangtest does for raw then English text.
+        Short views release unused space to the longer view. Re-render after
+        decoding to account for token boundaries; never truncate the answer.
         """
 
-        tokens = [self.tokenizer.encode(text, add_special_tokens=False) for text in texts]
-        lengths = [len(ids) for ids in tokens]
-        minimum = [int(length > 0) for length in lengths]
+        order = (1, 0) if self.task.prompt_style == "khangtest" else (0, 1)
+        tokens = [self.tokenizer.encode(texts[i], add_special_tokens=False) for i in order]
+        minimum = [int(bool(ids)) for ids in tokens]
         scaffold = self._template(self.messages(self.empty_input), generation=True)
         available = self.max_length - self.response_reserve - len(scaffold)
-        budgets = [min(lengths[0], max(0, available // 2)), 0]
-        budgets[1] = min(lengths[1], max(0, available - budgets[0]))
-        spare = max(0, available - sum(budgets))
-        for i in range(2):
-            extra = min(spare, lengths[i] - budgets[i])
-            budgets[i] += extra
-            spare -= extra
-
-        def shorten(index: int) -> str:
-            if budgets[index] >= lengths[index]:
-                return texts[index]
-            count = budgets[index]
-            head = (count + 1) // 2
-            tail = count // 2
-            first = self.tokenizer.decode(tokens[index][:head], skip_special_tokens=False)
-            last = self.tokenizer.decode(tokens[index][-tail:], skip_special_tokens=False) if tail else ""
-            return first + " [...] " + last
+        if available < sum(minimum):
+            raise ValueError("max_length is too small to retain both comment versions; increase --max-length.")
+        first_limit = min(len(tokens[0]), max(minimum[0], available // 2))
+        second_limit = min(len(tokens[1]), available - first_limit)
+        first_limit = min(len(tokens[0]), available - second_limit)
+        parts = [tokens[0][:first_limit], tokens[1][:second_limit]]
 
         while True:
-            if any(budget < needed for budget, needed in zip(budgets, minimum, strict=True)):
-                raise ValueError("max_length is too small to retain both comment versions; increase --max-length.")
-            pair = tuple(shorten(i) for i in range(2))
-            prompt = self._template(self.messages(pair), generation=True)
+            pair = ["", ""]
+            for index, ids in zip(order, parts, strict=True):
+                pair[index] = self.tokenizer.decode(ids, skip_special_tokens=False)
+            prompt = self._template(self.messages(tuple(pair)), generation=True)
             overflow = len(prompt) + self.response_reserve - self.max_length
             if overflow <= 0:
                 return prompt
-            remaining = max(1, overflow)
-            while remaining:
-                candidates = [i for i in range(2) if budgets[i] > minimum[i]]
-                if not candidates:
-                    raise ValueError("max_length is too small to retain both comment versions; increase --max-length.")
-                index = max(candidates, key=lambda i: (budgets[i], -i))
-                budgets[index] -= 1
-                remaining -= 1
+            removable = [len(ids) - keep for ids, keep in zip(parts, minimum, strict=True)]
+            if max(removable) <= 0:
+                raise ValueError("max_length is too small to retain both comment versions; increase --max-length.")
+            index = max(range(2), key=lambda i: removable[i])
+            remove = min(removable[index], max(1, overflow))
+            parts[index] = parts[index][:-remove]
 
     def feature(self, prompt: Sequence[int], label_id: int) -> dict[str, list[int]]:
         response = self.completions[label_id]

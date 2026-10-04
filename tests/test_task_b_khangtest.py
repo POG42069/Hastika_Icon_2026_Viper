@@ -24,6 +24,10 @@ from src.task_b_training import (
 from tests.test_llm_pipeline import TestChatTokenizer, cpu_runtime, tiny_model
 
 
+# The character-level test tokenizer needs more space than the real Qwen tokenizer.
+LLM_TRAINING_B = replace(LLM_TRAINING_B, max_length=512)
+
+
 class TaskBKhangtestTests(unittest.TestCase):
     def write_data(self, root, task, gold=True):
         for fold, filename in enumerate(task.original_fold_filenames, 1):

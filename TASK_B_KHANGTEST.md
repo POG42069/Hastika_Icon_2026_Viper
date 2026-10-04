@@ -25,8 +25,8 @@ English translation:
 <Comment>
 ```
 
-Giữ giới hạn 512 token và revision Qwen3 đã pin theo yêu cầu trước. Nếu quá
-dài, cả hai phiên bản được chia ngân sách token và giữ phần đầu/cuối. Nhãn
+Giới hạn mặc định là 256 token, dùng revision Qwen3 đã pin. Nếu quá
+dài, cả hai phiên bản được chia ngân sách token và giữ phần đầu như Khangtest. Nhãn
 trả lời được giữ đầy đủ. Dữ liệu và nhãn trong CSV không bị sửa.
 
 ## Chạy trên Kaggle
