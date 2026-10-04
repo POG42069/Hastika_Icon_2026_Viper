@@ -13,6 +13,15 @@ from llm_config import TaskConfig
 CommentInput = str | tuple[str, str]
 
 
+def effective_prompt_order(task: TaskConfig) -> str:
+    order = task.prompt_order or (
+        "original-first" if task.prompt_style == "khangtest" else "english-first"
+    )
+    if order not in {"english-first", "original-first"}:
+        raise ValueError("prompt_order must be english-first or original-first.")
+    return order
+
+
 def comment_body(task: TaskConfig, text: CommentInput) -> str:
     """Keep the two views separate without parsing user-authored comment text."""
 
@@ -20,9 +29,12 @@ def comment_body(task: TaskConfig, text: CommentInput) -> str:
         if not isinstance(text, tuple) or len(text) != 2 or not all(isinstance(part, str) for part in text):
             raise ValueError("Bilingual prompts require an (English, original) text pair.")
         english, original = text
-        if task.prompt_style == "khangtest":
-            return f"Comment (raw code-mixed):\n{original}\n\nEnglish translation:\n{english}"
-        return f"English translation:\n{english}\nOriginal code-mixed comment:\n{original}"
+        english_block = f"English translation:\n{english}"
+        raw_header = "Comment (raw code-mixed):" if task.prompt_style == "khangtest" else "Original code-mixed comment:"
+        original_block = f"{raw_header}\n{original}"
+        blocks = (english_block, original_block) if effective_prompt_order(task) == "english-first" else (original_block, english_block)
+        separator = "\n\n" if task.prompt_style == "khangtest" else "\n"
+        return separator.join(blocks)
     if not isinstance(text, str):
         raise ValueError("English-only prompts require a single text string.")
     return "Comment:\n" + text

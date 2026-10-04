@@ -37,6 +37,7 @@ class TaskConfig:
     input_mode: str = "english"
     original_comment_column: str = "OriginalComment"
     prompt_style: str = "paired"
+    prompt_order: str | None = None
     fixed_full_retrain_epochs: int | None = None
     full_retrain_soft_ensemble: bool = False
     class_weight_power: float | None = None
@@ -191,6 +192,21 @@ def llm_task(task: TaskConfig) -> TaskConfig:
     """Compatibility helper retained for callers that already use it."""
 
     return task
+
+
+def with_prompt_order(task: TaskConfig, order: str) -> TaskConfig:
+    """Choose view order and isolate artifacts when it differs from the default."""
+    if task.input_mode != "bilingual":
+        raise ValueError("--prompt-order requires --input-mode bilingual.")
+    if order not in {"english-first", "original-first"}:
+        raise ValueError("prompt_order must be english-first or original-first.")
+    default = "original-first" if task.prompt_style == "khangtest" else "english-first"
+    changed = replace(task, prompt_order=order)
+    if order != default:
+        suffix = "_" + order.replace("-", "_")
+        changed = replace(changed, checkpoint_subdir=task.checkpoint_subdir + suffix,
+                          output_subdir=task.output_subdir + suffix)
+    return changed
 
 
 LLM_TRAINING = LLMTrainingConfig()

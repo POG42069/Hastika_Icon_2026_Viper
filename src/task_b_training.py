@@ -27,7 +27,7 @@ from transformers import AutoTokenizer
 from llm_config import CHECKPOINT_ROOT, OUTPUT_ROOT, LLMTrainingConfig, TaskConfig
 from src.data import labeled_input_filenames, load_epoch_validation_frame, load_task_frames, prompt_inputs, resolve_data_file
 from src.distributed import RuntimeContext, initialize_runtime, cleanup_runtime, synchronize
-from src.llm_data import ChatEncoder, CompletionDataset, CompletionCollator
+from src.llm_data import ChatEncoder, CompletionDataset, CompletionCollator, effective_prompt_order
 from src.llm_training import (
     LineProgress, _autocast, completion_log_probs, compute_dtype, require_cuda,
     load_lora_model, save_adapter, restore_adapter, on_main, score_candidates,
@@ -610,6 +610,7 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
                        'full_data_retrains': [result['summary'] for result in results],
                        'official_validation': {'dataset': monitor.summary, 'ensemble_metrics': validation_summary},
                        'prompt_input': {'input_mode': task.input_mode, 'prompt_style': task.prompt_style,
+                                        'prompt_order': effective_prompt_order(task),
                                         'raw_column': task.original_comment_column, 'english_column': 'Comment'},
                        'truncated_comments': {'full_train': training.truncated_count, 'prediction': prediction.truncated_count},
                        'completion_token_diagnostics': diagnostics, 'resume_signature': signature}

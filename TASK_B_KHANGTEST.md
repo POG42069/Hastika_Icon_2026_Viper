@@ -29,6 +29,20 @@ Giữ giới hạn 512 token và revision Qwen3 đã pin theo yêu cầu trướ
 dài, cả hai phiên bản được chia ngân sách token và giữ phần đầu/cuối. Nhãn
 trả lời được giữ đầy đủ. Dữ liệu và nhãn trong CSV không bị sửa.
 
+Đảo riêng thứ tự sang tiếng Anh trước, câu gốc sau mà vẫn giữ nguyên system
+prompt, tiêu đề, dữ liệu và cấu hình train:
+
+```python
+!python Train_B_LLM.py --prompt-order english-first
+```
+
+Thêm cờ này vào lệnh đang dùng, giữ lại các cờ khác (bao gồm file gold nếu có).
+Lần đảo thứ tự dùng thư mục task có thêm hậu tố `_english_first`, train lại
+và không dùng checkpoint của thứ tự cũ. Cờ được áp dụng nhất quán khi train,
+validation và prediction. Các run đảo thứ tự bị timeout vẫn resume được với
+cùng cờ. Không truyền cờ, hoặc dùng `--prompt-order original-first`, giữ cách
+chạy ban đầu và checkpoint tương thích. So sánh macro-F1 trên cùng validation.
+
 ## Chạy trên Kaggle
 
 ```python

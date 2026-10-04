@@ -44,6 +44,7 @@ from llm_config import (
     LLM_TRAINING,
     LLMTrainingConfig,
     TaskConfig,
+    with_prompt_order,
 )
 from src.data import labeled_input_filenames, load_task_frames, prompt_inputs, resolve_data_file
 from src.distributed import (
@@ -54,7 +55,7 @@ from src.distributed import (
     relaunch_with_torchrun_if_needed,
     synchronize,
 )
-from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
+from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset, effective_prompt_order
 from src.submission import write_submission
 from src.resume import (
     ResumeCatalog,
@@ -654,7 +655,7 @@ def _resume_signature(
 ) -> dict[str, object]:
     """Fields that must match before training state can be continued exactly."""
 
-    return {
+    signature = {
         "format_version": 2,
         "input_mode": task.input_mode,
         "original_comment_column": task.original_comment_column,
@@ -687,6 +688,10 @@ def _resume_signature(
         "target_modules": config.target_modules,
         "compute_dtype": str(compute_dtype(config, runtime)),
     }
+    default_order = "original-first" if task.prompt_style == "khangtest" else "english-first"
+    if task.input_mode == "bilingual" and effective_prompt_order(task) != default_order:
+        signature["prompt_order"] = effective_prompt_order(task)
+    return signature
 
 
 def _capture_rng_state() -> dict[str, object]:
@@ -2929,6 +2934,10 @@ def run_llm_cli(
         help="Use the English translation alone, or both original and translated versions.",
     )
     parser.add_argument(
+        "--prompt-order", choices=("english-first", "original-first"), default=None,
+        help="Change bilingual view order only; nondefault order uses separate outputs/checkpoints.",
+    )
+    parser.add_argument(
         "--prediction-file",
         default=task.prediction_filename,
         help="CSV input filename, or full path (e.g. official test inputs).",
@@ -2957,6 +2966,12 @@ def run_llm_cli(
     if getattr(args, "epoch_validation_file", None) is not None:
         task = replace(task, epoch_validation_filename=args.epoch_validation_file,
                        epoch_validation_required=True)
+    task = replace(task, prediction_filename=args.prediction_file, input_mode=args.input_mode)
+    if args.prompt_order is not None:
+        try:
+            task = with_prompt_order(task, args.prompt_order)
+        except ValueError as exc:
+            parser.error(str(exc))
     config = replace(
         defaults,
         model_name=args.model,
@@ -2971,7 +2986,7 @@ def run_llm_cli(
     validate_config(config)
     relaunch_with_torchrun_if_needed(config)
     run_llm_task(
-        replace(task, prediction_filename=args.prediction_file, input_mode=args.input_mode),
+        task,
         config,
         tuple(Path(path) for path in args.resume_from),
         auto_resume=not args.no_auto_resume,
