@@ -1,4 +1,4 @@
-"""Train Task B like Khangtest: five full-data epochs per seed, soft ensemble."""
+"""Select Task B best epochs per seed, retrain full data, then soft ensemble."""
 
 from llm_config import LLM_TRAINING_B, TASK_B_LLM
 from src.llm_training import run_llm_cli

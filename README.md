@@ -27,9 +27,10 @@ Task A giữ luồng holdout selection và full retrain của Nhotest:
 4. Dự đoán từng seed và majority vote với trọng số ngang nhau.
 5. Xuất `predictions.csv` và ZIP nộp CodaBench.
 
-Task B theo nhánh Khangtest (`e27514b`): train đủ 5 fold trong 5 epoch cho mỗi
-seed, class-weighted loss, không OOF/holdout selection, không cap Gender,
-ensemble bằng trung bình xác suất. Loader dùng `OriginalComment` (gốc) và
+Task B giữ prompt, class-weighted loss và soft ensemble từ Khangtest (`e27514b`).
+Chạy 5 seed trên fold 1–4, chọn best epoch bằng macro-F1 fold 5 (loss phá hòa),
+tối đa 5 epoch và patience 2. Sau đó khởi tạo lại từng seed để retrain cả 5 fold
+theo best epoch riêng, không cap Gender; ensemble bằng trung bình xác suất. Loader dùng `OriginalComment` (gốc) và
 `Comment` (tiếng Anh) từ dataset song ngữ. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md)
 để chạy, cung cấp gold validation và resume. Task B vẫn dùng 512 token như yêu cầu.
 
@@ -300,10 +301,10 @@ nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoá
 số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
 kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
-Task B dùng thư mục `task_b_qwen3_4b_2507_lora_bilingual_fixed_soft`.
+Task B dùng thư mục `task_b_qwen3_4b_2507_lora_bilingual_selection_soft`.
 `ensemble_predictions.csv` lưu nhãn từng seed và xác suất trung bình dùng cho
-nhãn cuối. Mỗi seed có final adapter, lịch sử full-data và cache prediction;
-không có best holdout adapter. Chi tiết trong [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
+nhãn cuối. Mỗi seed có best holdout adapter và summary best epoch, final adapter sau retrain,
+lịch sử cả hai giai đoạn và cache prediction. Chi tiết trong [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
 
 Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
 tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức

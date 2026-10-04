@@ -6,9 +6,10 @@ Code được sửa từ checkout Nhotest, không dùng code Sarvam. Backbone đ
 dùng chat template chính thức và chỉ chấm điểm các nhãn hợp lệ. Giới hạn toàn bộ
 chat được tăng từ 256 lên 512 token cho cả Task A và Task B. Task A giữ cấu hình
 và luồng huấn luyện của Nhotest, 5 seed
-`42, 52, 62, 72, 82`. Task B được chuyển sang luồng của Khangtest: train đủ
-5 fold trong 5 epoch/seed, learning rate `1e-4`, class-weighted loss và soft
-ensemble; bỏ cap Gender. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
+`42, 52, 62, 72, 82`. Task B giữ learning rate `1e-4`, class-weighted loss và soft ensemble từ Khangtest;
+bỏ cap Gender. Chọn best epoch cho từng seed trên fold 1–4/validation fold 5
+(tối đa 5 epoch, patience 2), rồi khởi tạo model mới để retrain cả 5 fold
+theo best epoch riêng. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
 
 ## Dữ liệu
 
@@ -69,7 +70,7 @@ bản. Việc lược vẫn có thể mất chi tiết ở giữa câu. Mặc đ
 không khớp chữ ký resume của cấu hình 512, nên cần huấn luyện lại ở độ dài mới.
 
 Output/checkpoint dùng thư mục `task_a_qwen3_4b_2507_lora_bilingual` và
-`task_b_qwen3_4b_2507_lora_bilingual_fixed_soft` để giữ lại kết quả cũ. Resume kiểm tra
+`task_b_qwen3_4b_2507_lora_bilingual_selection_soft` để giữ lại kết quả cũ. Resume kiểm tra
 model, revision, input mode, cột nguồn, phiên bản prompt và dữ liệu; checkpoint English-only
 hoặc legacy thiếu thông tin tương thích không được dùng lại cho bilingual.
 
@@ -88,8 +89,9 @@ HASTIKA_CHECKPOINT_DIR=/absolute/path/checkpoints/bilingual \
 python Train_A_LLM.py --input-mode bilingual --no-auto-resume
 ```
 
-Task A dùng đầy đủ 1.317 câu fold 5. Task B train cả 3.155 câu của 5 fold;
-395 câu development được báo điểm riêng nếu có file nhãn gold. Không dùng quy tắc
+Task A dùng đầy đủ 1.317 câu fold 5. Task B chọn epoch trên 2.524 câu
+fold 1–4 và 631 câu validation fold 5, rồi retrain cả 3.155 câu của 5 fold;
+395 câu development chỉ được báo điểm riêng nếu có file nhãn gold. Không dùng quy tắc
 lọc xuống 1.302 câu của bản Task A repair trước. Các kiểm tra CPU và tokenizer
 xác nhận pipeline đúng dữ liệu, không xác nhận macro-F1 tốt hơn; cần chạy lại
 backbone trên GPU để đánh giá chất lượng.

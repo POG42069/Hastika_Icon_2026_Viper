@@ -1,17 +1,24 @@
 # Task B trên Nhotest theo Khangtest
 
-Đối chiếu nhánh `Khangtest` tại commit `e27514b`. Cấu hình đang hoạt động trên
-nhánh đó bỏ OOF và train trực tiếp toàn bộ dữ liệu, 5 epoch cho mỗi seed.
+Task B giữ prompt, class-weighted loss và soft ensemble đã đối chiếu với
+`Khangtest` tại commit `e27514b`. Theo yêu cầu mới, Nhotest thêm lại bước chọn
+best epoch trước khi retrain, giống hai giai đoạn của Task A:
 
-- Qwen3-4B-Instruct-2507, 5 seed `42, 52, 62, 72, 82`, LoRA rank 32/alpha 64.
-- Train đủ 3.155 câu original của 5 fold, không augmentation, không cap Gender.
-- Learning rate `1e-4`. Loss trên nhãn được nhân class weight:
-  `clip((N / (6 * n_class)) ** 0.5, 0.75, 1.50)`, rồi chuẩn hóa để trọng số
-  trung bình của các mẫu bằng 1. Giới hạn clip là trước bước chuẩn hóa.
-- Mỗi seed kết thúc đúng epoch 5; không early stopping và không chọn best epoch.
-- Chấm điểm sáu nhãn bằng mean token log-likelihood, softmax trong mỗi seed,
-  lấy trung bình xác suất của 5 seed rồi argmax. Số phiếu chỉ dùng để audit.
-- Task A giữ nguyên cấu hình và luồng huấn luyện hiện tại của Nhotest.
+1. Chạy từng seed `42, 52, 62, 72, 82` trên fold 1–4 (2.524 câu), dùng fold 5
+   (631 câu original) để chọn epoch. Tối đa 5 epoch; early stopping khi 2 epoch
+   liên tiếp không cải thiện. Macro-F1 cao hơn được ưu tiên; nếu bằng nhau thì
+   lấy validation loss thấp hơn, nếu cả hai bằng nhau giữ epoch sớm hơn.
+2. Hoàn tất chọn epoch của cả 5 seed, rồi khởi tạo lại backbone/LoRA và optimizer
+   cho từng seed. Retrain đủ 3.155 câu của cả 5 fold theo best epoch riêng của seed
+   đó. Không tiếp tục từ adapter holdout; không augmentation hay cap Gender.
+3. Chấm điểm sáu nhãn bằng mean token log-likelihood, softmax trong mỗi seed,
+   lấy trung bình xác suất của 5 model retrain rồi argmax. Số phiếu dùng để audit.
+
+Qwen3-4B-Instruct-2507, LoRA rank 32/alpha 64, learning rate `1e-4` giữ nguyên.
+Loss nhãn nhân class weight `clip((N / (6 * n_class)) ** 0.5, 0.75, 1.50)`,
+rồi chuẩn hóa để trọng số trung bình của mẫu bằng 1. Class weight ở bước chọn
+epoch chỉ tính trên fold 1–4; bước retrain tính lại trên cả 5 fold.
+Task A giữ nguyên cấu hình và luồng huấn luyện hiện tại.
 
 Các điều chỉnh để dùng dataset đã giao: `Comment` chứa tiếng Anh,
 `OriginalComment` chứa câu gốc. Không yêu cầu đổi cột sang `Comment_en` như
@@ -41,7 +48,7 @@ Lần đảo thứ tự dùng thư mục task có thêm hậu tố `_english_fir
 và không dùng checkpoint của thứ tự cũ. Cờ được áp dụng nhất quán khi train,
 validation và prediction. Các run đảo thứ tự bị timeout vẫn resume được với
 cùng cờ. Không truyền cờ, hoặc dùng `--prompt-order original-first`, giữ cách
-chạy ban đầu và checkpoint tương thích. So sánh macro-F1 trên cùng validation.
+chạy mặc định của pipeline mới. So sánh macro-F1 trên cùng validation.
 
 ## Chạy trên Kaggle
 
@@ -58,7 +65,7 @@ file train gộp. Code tự dùng hai GPU nếu có, như Task A.
 
 Nếu có `hastika_multiclass_validation.csv` trong thư mục dữ liệu, code ghép
 nhãn theo ID với `multiclass_validation_inputs.csv`, báo loss, macro-F1,
-precision/recall/F1 từng lớp và confusion matrix sau mỗi epoch và sau ensemble.
+precision/recall/F1 từng lớp và confusion matrix sau mỗi epoch full retrain và sau ensemble.
 Các mẫu này không nằm trong train, không dùng để chọn epoch hay cập nhật model.
 Gold có thể chứa câu code-mixed; prompt lấy đúng hai cột từ dataset song ngữ.
 `--prediction-file` đổi sang test vẫn giữ nguồn input development để báo điểm.
@@ -70,13 +77,14 @@ ZIP song ngữ đã giao không có file gold này. Nếu gold nằm ở dataset
 ```
 
 Khi không có gold mặc định, code báo rõ và vẫn train/xuất prediction; không
-tính metric validation. Nếu chỉ định file bằng cờ trên thì file phải tồn tại
-và nhãn/ID phải hợp lệ. Không tự tạo nhãn hay dùng nhãn dự đoán làm nhãn thật.
+tính metric development; vẫn tính metric fold 5 để chọn best epoch. Nếu chỉ định
+file bằng cờ trên thì file phải tồn tại và nhãn/ID phải hợp lệ. Không tự tạo nhãn hay dùng nhãn dự đoán làm nhãn thật.
 
 ## Checkpoint và kết quả
 
-Thư mục task mới: `task_b_qwen3_4b_2507_lora_bilingual_fixed_soft` dưới
-`checkpoints/` và `outputs/`. Mỗi epoch hoàn tất lưu adapter, optimizer,
+Thư mục task mới: `task_b_qwen3_4b_2507_lora_bilingual_selection_soft` dưới
+`checkpoints/` và `outputs/`, tách biệt với run train cố định 5 epoch trước đó.
+Mỗi epoch hoàn tất ở cả selection và full retrain lưu adapter, optimizer,
 scheduler, GradScaler và RNG bằng cơ chế resume của Nhotest. Epoch bị timeout
 giữa chừng được chạy lại; seed đã hoàn thành được tái sử dụng. Khi đổi input
 prediction, adapter đã train đủ vẫn được dùng để dự đoán lại.
@@ -84,12 +92,16 @@ prediction, adapter đã train đủ vẫn được dùng để dự đoán lạ
 Giữ cả `outputs/` và `checkpoints/` trong Notebook Output/Dataset, rồi gắn
 chúng bằng Add Input ở phiên sau. Code tự tìm dưới `/kaggle/input`, hoặc dùng
 `--resume-from /kaggle/input/your-previous-output`. Cấu hình train và số GPU
-phải khớp để resume. Checkpoint Task B theo pipeline cũ không được dùng lại.
+phải khớp để resume. Checkpoint Task B train cố định trước đây không được dùng lại cho pipeline mới.
+
+`split_manifest.csv` ghi rõ ID train/validation ở bước chọn epoch.
+`run_summary.json` ghi best epoch và metrics holdout của từng seed.
 
 Kết quả chính: `predictions.csv`, `task_b_submission.zip`,
 `ensemble_predictions.csv` và `run_summary.json`. Mỗi seed lưu
-`final_full_data_adapter`, `full_data_training_history.json`,
-`prediction_scores.npz`; nếu có gold thì thêm `official_validation/`.
+`best_holdout_adapter`, `selection_summary.json`, `selection_training_history.json`,
+`validation_predictions.csv`, `final_full_data_adapter`, `full_data_training_history.json`,
+`task_b_summary.json`, `prediction_scores.npz`; nếu có gold thì thêm `official_validation/`.
 
 Kiểm tra CPU và tokenizer không xác nhận chất lượng macro-F1 hay VRAM thực
 tế của Qwen3-4B trên GPU. Cần chạy thí nghiệm trên Kaggle để đánh giá.

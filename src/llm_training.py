@@ -2031,10 +2031,10 @@ def run_llm_task(
     """Select epochs, retrain configured seeds, then predict development."""
 
     validate_config(config)
-    if task.fixed_full_retrain_epochs is not None:
-        from src.task_b_training import run_fixed_task_b
+    if task.full_retrain_soft_ensemble or task.fixed_full_retrain_epochs is not None:
+        from src.task_b_training import run_task_b
 
-        run_fixed_task_b(task, config, resume_sources, auto_resume)
+        run_task_b(task, config, resume_sources, auto_resume)
         return
     selection_seeds = task.selection_seeds or (config.seed,)
     if len(set(selection_seeds)) != len(selection_seeds):
@@ -2957,7 +2957,7 @@ def run_llm_cli(
         action="store_true",
         help="Do not automatically scan /kaggle/input for earlier result artifacts.",
     )
-    if task.fixed_full_retrain_epochs is not None:
+    if task.epoch_validation_filename is not None:
         parser.add_argument(
             "--epoch-validation-file", default=None,
             help="Optional external gold CSV; an explicitly supplied path is required to exist.",

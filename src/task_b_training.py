@@ -1,4 +1,4 @@
-"""Khangtest Task B fixed-epoch training, adapted to Nhotest paired CSVs.
+"""Task B holdout epoch selection, fresh full-data retraining and soft ensemble.
 
 Reference: origin/Khangtest e27514b. Full-data class-weighted loss and soft
 ensemble follow that branch; epoch checkpoints use Nhotest's resume format.
@@ -37,7 +37,8 @@ from src.llm_training import (
     _restore_epoch_resume, _clear_phase_resume, _write_json,
 )
 from src.resume import ResumeCatalog, prepare_resume_catalogs, read_catalog_manifest, write_catalog_manifest
-from src.training import create_train_loader, log, set_global_seed, write_validation_confusion_matrix
+from src.training import (create_train_loader, log, set_global_seed, write_validation_confusion_matrix,
+                          predefined_fold_indices, is_better_checkpoint, write_split_manifest)
 from src.distributed import gather_python_objects
 from src.submission import write_submission
 
@@ -182,7 +183,7 @@ def _classification_metrics(
     probabilities: np.ndarray,
     loss: float,
 ) -> dict[str, object]:
-    """Compute the fixed-label metrics used for aggregated OOF predictions."""
+    """Compute metrics with the complete label set for validation ensembles."""
 
     labels = np.asarray(label_ids, dtype=np.int64)
     predictions = np.asarray(probabilities).argmax(axis=1)
@@ -406,19 +407,154 @@ class TaskBValidationMonitor:
         return public_validation_metrics(metrics)
 
 
-def _finished_seed(catalogs, seed, signature):
+def _seed_summary_filename(signature):
+    return ('task_b_summary.json' if signature.get('pipeline') == 'holdout-selection-soft-v1'
+            else 'fixed_task_b_summary.json')
+
+
+def _selection_progress(history):
+    best, stale = None, 0
+    for record in history:
+        if best is None or is_better_checkpoint(record['macro_f1'], record['loss'],
+                                               best['macro_f1'], best['loss']):
+            best, stale = record, 0
+        else:
+            stale += 1
+    return best, stale
+
+
+def _select_task_b_epochs(task, config, runtime, frame, encoder, collator, tokenizer,
+                          catalogs, signature, seeds, output_dir, checkpoint_dir):
+    """Finish selection for all seeds before initializing any full-data model."""
+    train_indices, val_indices = predefined_fold_indices(
+        frame['fold'].to_numpy(), task.selection_validation_fold,
+        frame['data_origin'].to_numpy(), task.selection_validation_data_origins)
+    train_frame, val_frame = frame.iloc[train_indices], frame.iloc[val_indices]
+    if set(train_frame['id']) & set(val_frame['id']):
+        raise ValueError('Holdout IDs must not occur in selection training data.')
+    training = WeightedDataset(prompt_inputs(train_frame, task), encoder, train_frame['label_id'].tolist())
+    validation = CompletionDataset(prompt_inputs(val_frame, task), encoder, val_frame['label_id'].tolist())
+    weights, weight_summary = _class_weight_state(task, train_frame['label_id'].to_numpy())
+    on_main(lambda: write_split_manifest(frame, train_indices, val_indices, output_dir), runtime)
+    log(f'PHASE 1/2: best-epoch selection | train={len(training)} | validation={len(validation)} '
+        f'| fold={task.selection_validation_fold} | max_epochs={config.max_epochs} '
+        f'| patience={config.early_stopping_patience}', runtime)
+    selections = {}
+    for seed in seeds:
+        seed_output, seed_checkpoint = output_dir / f'seed_{seed}', checkpoint_dir / f'seed_{seed}'
+        on_main(lambda: seed_output.mkdir(parents=True, exist_ok=True), runtime)
+        on_main(lambda: seed_checkpoint.mkdir(parents=True, exist_ok=True), runtime)
+        cached = None
+        for catalog in catalogs:
+            source = catalog.seed_output(seed)
+            if source is None:
+                continue
+            try:
+                value = json.loads((source / 'selection_summary.json').read_text())
+            except (OSError, ValueError):
+                continue
+            if (value.get('resume_signature') == signature and value.get('completed') is True
+                    and value.get('seed') == seed and isinstance(value.get('best_epoch'), int)
+                    and 1 <= value['best_epoch'] <= config.max_epochs):
+                cached = value
+                on_main(lambda: _copy_tree(source, seed_output), runtime)
+                source_checkpoint = catalog.seed_checkpoint(seed)
+                if source_checkpoint is not None and (source_checkpoint / 'best_holdout_adapter').is_dir():
+                    on_main(lambda: _copy_tree(source_checkpoint / 'best_holdout_adapter',
+                                              seed_checkpoint / 'best_holdout_adapter'), runtime)
+                break
+        if cached is not None:
+            selections[seed] = cached
+            log(f'Seed {seed}: completed selection reused | best_epoch={cached["best_epoch"]}.', runtime)
+            continue
+        set_global_seed(seed)
+        loader, sampler = create_train_loader(training, collator, config, runtime, seed)
+        loaded = load_lora_model(config, runtime)
+        model = _wrap_for_ddp(loaded, runtime)
+        optimizer, scheduler, scaler = _training_state(model, loader, config.max_epochs, config, runtime)
+        history, completed = [], 0
+        latest = _latest_phase_checkpoint(catalogs, seed, 'selection', signature, config.max_epochs, runtime.world_size)
+        if latest is not None:
+            completed, history = _restore_epoch_resume(
+                checkpoint=latest[0], expected_signature=signature, expected_total_epochs=config.max_epochs,
+                model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler, loader=loader, runtime=runtime)
+            log(f'Seed {seed}: selection resumes after epoch {completed}.', runtime)
+        best, stale = _selection_progress(history)
+        for epoch in range(completed + 1, config.max_epochs + 1):
+            if stale >= config.early_stopping_patience:
+                break
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            train_loss = train_weighted_epoch(model, loader, optimizer, scheduler, scaler, config, runtime,
+                                             epoch, f'Holdout train seed {seed}', class_weights=weights)
+            metrics = score_candidates(model, validation, collator, config, runtime,
+                                       f'Holdout validation seed {seed} epoch {epoch}')
+            log_classification_metrics(metrics, f'Holdout seed={seed} epoch={epoch}', runtime)
+            record = {'epoch': epoch, 'train_weighted_loss': train_loss, **public_validation_metrics(metrics)}
+            history.append(record)
+            if best is None or is_better_checkpoint(metrics['macro_f1'], metrics['loss'], best['macro_f1'], best['loss']):
+                best, stale = record, 0
+                def export_best():
+                    best_dir = seed_checkpoint / 'holdout_adapters' / f'epoch_{epoch:03d}'
+                    save_adapter(model, tokenizer, best_dir)
+                    _write_prediction_diagnostics(val_frame, task, metrics['probabilities'], best_dir / 'validation_predictions.csv')
+                    write_validation_confusion_matrix(metrics['confusion_matrix'], epoch, best_dir)
+                on_main(export_best, runtime)
+            else:
+                stale += 1
+            on_main(lambda: _write_json(seed_output / 'selection_training_history.json',
+                                       {'seed': seed, 'class_weighting': weight_summary, 'epochs': history}), runtime)
+            _save_epoch_resume(phase='selection', epoch=epoch, total_epochs=config.max_epochs,
+                model=model, tokenizer=tokenizer, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+                loader=loader, history=list(history), seed_checkpoint_dir=seed_checkpoint,
+                signature=signature, runtime=runtime)
+        if best is None:
+            raise RuntimeError('Epoch selection completed without validation metrics.')
+        # A better adapter may have been saved just before a timeout, while its
+        # epoch checkpoint was not committed. Select the version from restored history.
+        for catalog in catalogs:
+            source_checkpoint = catalog.seed_checkpoint(seed)
+            if source_checkpoint is None:
+                continue
+            best_dir = source_checkpoint / 'holdout_adapters' / f'epoch_{best["epoch"]:03d}'
+            if best_dir.is_dir():
+                on_main(lambda: _copy_tree(best_dir, seed_checkpoint / 'best_holdout_adapter'), runtime)
+                on_main(lambda: shutil.copy2(best_dir / 'validation_predictions.csv',
+                                             seed_output / 'validation_predictions.csv'), runtime)
+                break
+        else:
+            raise RuntimeError('The selected holdout adapter is missing from resume artifacts.')
+        summary = {'seed': seed, 'completed': True, 'best_epoch': best['epoch'],
+                   'best_macro_f1': best['macro_f1'], 'best_validation_loss': best['loss'],
+                   'selection_training_rows': len(training), 'validation_rows': len(validation),
+                   'validation_fold': task.selection_validation_fold, 'class_weighting': weight_summary,
+                   'epochs_run': len(history), 'history': history, 'resume_signature': signature}
+        on_main(lambda: _write_json(seed_output / 'selection_summary.json', summary), runtime)
+        _clear_phase_resume(seed_checkpoint, 'selection', runtime)
+        on_main(lambda: shutil.rmtree(seed_checkpoint / 'holdout_adapters', ignore_errors=True), runtime)
+        selections[seed] = summary
+        log(f'Seed {seed}: best_epoch={best["epoch"]} | holdout macro_f1={best["macro_f1"]:.5f}.', runtime)
+        del model, loaded, optimizer, scheduler, scaler, loader
+        gc.collect()
+        torch.cuda.empty_cache()
+    return selections
+
+
+def _finished_seed(catalogs, seed, signature, epochs=None):
     for catalog in catalogs:
         output, checkpoint = catalog.seed_output(seed), catalog.seed_checkpoint(seed)
         if output is None or checkpoint is None:
             continue
         try:
-            summary = json.loads((output / 'fixed_task_b_summary.json').read_text())
+            summary = json.loads((output / _seed_summary_filename(signature)).read_text())
         except (OSError, ValueError):
             continue
         adapter = checkpoint / 'final_full_data_adapter'
-        if summary.get('resume_signature') == signature and (adapter / 'adapter_config.json').is_file() and (
+        if (summary.get('resume_signature') == signature
+                and (epochs is None or summary.get('epochs') == epochs)
+                and (adapter / 'adapter_config.json').is_file() and (
             (adapter / 'adapter_model.safetensors').is_file() or (adapter / 'adapter_model.bin').is_file()
-        ):
+        )):
             return catalog, summary, adapter
     return None
 
@@ -451,16 +587,22 @@ def _copy_tree(source, destination):
         shutil.copytree(source, destination, dirs_exist_ok=True)
 
 
-def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
-    """Run Khangtest's current Task B strategy with epoch and completed-seed resume."""
+def run_task_b(task, config, resume_sources=(), auto_resume=True):
+    """Select epochs per seed, retrain from scratch, then average probabilities.
+
+    Explicit fixed_full_retrain_epochs retains the earlier fixed strategy.
+    """
     epochs = task.fixed_full_retrain_epochs
     seeds = task.selection_seeds or (config.seed,)
-    if epochs is None or epochs < 1 or not task.full_retrain_soft_ensemble:
-        raise ValueError('Fixed Task B requires positive epochs and a soft ensemble.')
+    selecting = epochs is None
+    if (not selecting and epochs < 1) or not task.full_retrain_soft_ensemble:
+        raise ValueError('Task B requires positive fixed epochs or holdout selection, and a soft ensemble.')
+    if selecting and task.selection_validation_fold is None:
+        raise ValueError('Task B epoch selection requires a validation fold.')
     if len(seeds) < 2 or len(set(seeds)) != len(seeds) or any(seed < 0 for seed in seeds):
         raise ValueError('Task B soft ensemble requires at least two unique nonnegative seeds.')
     if task.selection_train_label_caps or task.use_augmentation or task.class_weight_power is None:
-        raise ValueError('Fixed Task B uses original-only full data, class-weighted loss and no label caps.')
+        raise ValueError('Task B uses original-only data, class-weighted loss and no label caps.')
     runtime = initialize_runtime()
     os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
     try:
@@ -484,7 +626,7 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
         on_main(lambda: checkpoint_dir.mkdir(parents=True, exist_ok=True), runtime)
         training_hash, prediction_hash = _input_hashes(task)
         signature = _resume_signature(task, config, training_hash, runtime)
-        signature.update({'pipeline': 'khangtest-fixed-soft-v1', 'fixed_epochs': epochs,
+        signature.update({'pipeline': 'holdout-selection-soft-v1' if selecting else 'khangtest-fixed-soft-v1', 'fixed_epochs': epochs,
                           'prompt_style': task.prompt_style, 'class_weight_power': task.class_weight_power,
                           'class_weight_min': task.class_weight_min, 'class_weight_max': task.class_weight_max})
         sources = list(resume_sources)
@@ -504,15 +646,24 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
         catalogs = [ResumeCatalog('current run', output_dir, checkpoint_dir), *read_catalog_manifest(manifest)]
         diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(diagnostics, runtime)
-        log(f'{task.task_name} | {config.model_name} | Khangtest fixed full-data epochs={epochs} | seeds={seeds} | rows={len(frame)} | max_length={config.max_length} | world_size={runtime.world_size}', runtime)
+        log(f'{task.task_name} | {config.model_name} | holdout selection={selecting} | fixed epochs={epochs} | seeds={seeds} | rows={len(frame)} | max_length={config.max_length} | world_size={runtime.world_size}', runtime)
         log('Class weights: ' + ' | '.join(f'{label}={weight_summary["weights"][label]:.4f}' for label in task.labels), runtime)
+        selections = (_select_task_b_epochs(task, config, runtime, frame, encoder, collator, tokenizer,
+                      catalogs, signature, seeds, output_dir, checkpoint_dir) if selecting else {})
+        epoch_selection = ({'strategy': 'per_seed_holdout', 'validation_fold': task.selection_validation_fold,
+                            'max_epochs': config.max_epochs, 'patience': config.early_stopping_patience,
+                            'criterion': 'highest macro-F1; lower validation loss breaks ties',
+                            'seeds': [selections[seed] for seed in seeds]} if selecting else
+                           {'strategy': 'fixed_without_oof', 'oof_skipped': True, 'fixed_epoch': epochs})
+        log('PHASE 2/2: fresh full-data retraining and soft ensemble' if selecting else 'Fixed full-data training', runtime)
         results = []
         for seed in seeds:
+            epochs = selections[seed]['best_epoch'] if selecting else task.fixed_full_retrain_epochs
             seed_output, seed_checkpoint = output_dir / f'seed_{seed}', checkpoint_dir / f'seed_{seed}'
             adapter = seed_checkpoint / 'final_full_data_adapter'
             on_main(lambda: seed_output.mkdir(parents=True, exist_ok=True), runtime)
             on_main(lambda: seed_checkpoint.mkdir(parents=True, exist_ok=True), runtime)
-            finished = _finished_seed(catalogs, seed, signature)
+            finished = _finished_seed(catalogs, seed, signature, epochs)
             if finished is not None:
                 catalog, summary, source_adapter = finished
                 cached = _cached_predictions(catalog.seed_output(seed), summary, prediction_frame, task, prediction_hash, monitor)
@@ -520,12 +671,13 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
                     on_main(lambda: _copy_tree(catalog.seed_output(seed), seed_output), runtime)
                     on_main(lambda: _copy_tree(source_adapter, adapter), runtime)
                     cached['summary'] = {**cached['summary'], 'checkpoint': str(adapter)}
-                    on_main(lambda: _write_json(seed_output / 'fixed_task_b_summary.json', cached['summary']), runtime)
+                    on_main(lambda: _write_json(seed_output / _seed_summary_filename(signature), cached['summary']), runtime)
                     on_main(lambda: _write_json(seed_output / 'seed_summary.json', cached['summary']), runtime)
                     cached.update({'seed': seed, 'label_ids': cached['probabilities'].argmax(axis=1)})
                     results.append(cached)
                     log(f'Seed {seed}: completed full-data adapter and predictions reused; no training.', runtime)
                     continue
+            log(f'Full-data retrain | seed={seed} | rows={len(frame)} | epochs={epochs} | fresh model', runtime)
             set_global_seed(seed)
             loader, sampler = create_train_loader(training, collator, config, runtime, seed)
             loaded = load_lora_model(config, runtime)
@@ -548,12 +700,12 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
                     if sampler is not None:
                         sampler.set_epoch(epoch)
                     train_loss = train_weighted_epoch(model, loader, optimizer, scheduler, scaler, config, runtime, epoch,
-                                                      f'Fixed full-data train seed {seed}', class_weights=weights)
+                                                      f'Full-data retrain seed {seed}', class_weights=weights)
                     metrics = monitor.evaluate(model, seed, epoch, seed_output)
                     history.append({'epoch': epoch, 'train_weighted_loss': train_loss,
                                     'official_validation': None if metrics is None else public_validation_metrics(metrics)})
                     on_main(lambda: _write_json(seed_output / 'full_data_training_history.json',
-                        {'seed': seed, 'epoch_selection': 'fixed_without_oof', 'validation_dataset': monitor.summary,
+                        {'seed': seed, 'epoch_selection': 'per_seed_holdout' if selecting else 'fixed_without_oof', 'validation_dataset': monitor.summary,
                          'class_weighting': weight_summary, 'epochs': history}), runtime)
                     _save_epoch_resume(phase='full_retrain', epoch=epoch, total_epochs=epochs, model=model, tokenizer=tokenizer,
                         optimizer=optimizer, scheduler=scheduler, scaler=scaler, loader=loader, history=list(history),
@@ -566,6 +718,7 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
             label_ids = probabilities.argmax(axis=1)
             validation_probabilities = np.empty((0, len(task.labels))) if validation is None else validation['probabilities']
             summary = {'seed': seed, 'epochs': epochs, 'training_rows': len(frame), 'checkpoint': str(adapter),
+                       'selected_best_epoch': epochs if selecting else None,
                        'resume_signature': signature, 'prediction_sha256': prediction_hash, 'validation_dataset': monitor.summary,
                        'validation_metrics': None if validation is None else public_validation_metrics(validation)}
 
@@ -577,7 +730,7 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
                                     probabilities=probabilities, validation_probabilities=validation_probabilities)
                 temporary.replace(seed_output / 'prediction_scores.npz')
                 _write_json(seed_output / 'seed_summary.json', summary)
-                _write_json(seed_output / 'fixed_task_b_summary.json', summary)
+                _write_json(seed_output / _seed_summary_filename(signature), summary)
 
             on_main(export_seed, runtime)
             _clear_phase_resume(seed_checkpoint, 'full_retrain', runtime)
@@ -604,7 +757,7 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
             write_submission(prediction_frame['id'].tolist(), final_labels, task.labels, output_dir, task.submission_zip_name)
             summary = {'task': task.task_name, 'reference_branch': 'Khangtest', 'reference_commit': 'e27514b',
                        'model': config.model_name, 'training_config': asdict(config), 'world_size': runtime.world_size,
-                       'epoch_selection': {'strategy': 'fixed_without_oof', 'oof_skipped': True, 'fixed_epoch': epochs},
+                       'epoch_selection': epoch_selection,
                        'class_weighting': {'downsampling': None, 'full_data': weight_summary},
                        'ensemble': {'method': 'equal-weight mean of per-seed candidate probabilities', 'seeds': list(seeds)},
                        'full_data_retrains': [result['summary'] for result in results],
@@ -618,6 +771,6 @@ def run_fixed_task_b(task, config, resume_sources=(), auto_resume=True):
             _write_json(checkpoint_dir / 'metrics.json', summary)
 
         on_main(export_final, runtime)
-        log(f'Task B complete | fixed epochs={epochs} | soft ensemble seeds={seeds} | {output_dir}', runtime)
+        log(f"Task B complete | per-seed epochs={[result['summary']['epochs'] for result in results]} | soft ensemble seeds={seeds} | {output_dir}", runtime)
     finally:
         cleanup_runtime(runtime)
