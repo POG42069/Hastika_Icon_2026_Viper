@@ -88,7 +88,7 @@ class LLMTrainingConfig:
     model_revision: str = "cdbee75f17c01a7cc42f958dc650907174af0554"
     validation_size: float = 0.20
     seed: int = 42
-    max_length: int = 512  # Full chat, including instructions, answer and EOS.
+    max_length: int = 256  # Full chat, including instructions, answer and EOS.
     max_epochs: int = 5
     learning_rate: float = 2e-4
     weight_decay: float = 0.01
@@ -211,6 +211,6 @@ def with_prompt_order(task: TaskConfig, order: str) -> TaskConfig:
 
 LLM_TRAINING = LLMTrainingConfig()
 # Match Khangtest Task B optimization, retaining the pinned Qwen3 and 512 tokens.
-LLM_TRAINING_B = replace(LLM_TRAINING, learning_rate=1e-4, early_stopping_patience=2)
+LLM_TRAINING_B = replace(LLM_TRAINING, max_length=512, learning_rate=1e-4, early_stopping_patience=2)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B

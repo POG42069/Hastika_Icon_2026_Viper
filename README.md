@@ -67,7 +67,7 @@ Cấu hình mặc định trong `llm_config.py`:
 | Target modules | `all-linear` |
 | Max epochs để chọn | 5 |
 | Early-stopping patience | 4 |
-| Max chat length | 512 |
+| Max chat length | Task A `256`; Task B `512` |
 | Learning rate | Task A `2e-4`; Task B `1e-4` |
 | Batch/GPU | 4 |
 | Gradient accumulation | 2 |
@@ -220,7 +220,7 @@ seed đang chạy dở.
 ```bash
 !python Train_A_LLM.py --model Qwen/Qwen3-4B-Instruct-2507 \
   --revision cdbee75f17c01a7cc42f958dc650907174af0554
-!python Train_A_LLM.py --max-epochs 3 --batch-size 1 --max-length 512
+!python Train_A_LLM.py --max-epochs 3 --batch-size 1 --max-length 256
 !python Train_B_LLM.py --single-gpu --gradient-accumulation 16
 !python Train_A_LLM.py --prediction-file /path/to/official_inputs.csv
 ```
