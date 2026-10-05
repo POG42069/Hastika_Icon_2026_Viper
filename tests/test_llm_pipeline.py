@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -553,6 +554,8 @@ class LLMTests(unittest.TestCase):
                 test_seeds = (
                     (42, 52, 62) if original_task.ensemble_all_seeds else (42,)
                 )
+                if original_task == replace(TASK_A, input_mode="bilingual"):
+                    test_seeds = (42, 52, 62, 72, 82)
                 task = replace(llm_task(original_task), selection_seeds=test_seeds)
                 if task.original_fold_filenames:
                     task = replace(
@@ -921,6 +924,70 @@ class LLMTests(unittest.TestCase):
                     run_llm_task(task, config, auto_resume=False)
                 resumed = pd.read_csv(output / "predictions.csv", dtype={"id": str})
                 self.assertEqual(resumed.to_dict("records"), result.to_dict("records"))
+
+                if original_task == replace(TASK_A, input_mode="bilingual"):
+                    # Reproduce two extracted Kaggle inputs supplying different
+                    # seeds, followed by a private test with new IDs and size.
+                    inputs = root / "kaggle_input"
+                    for number, seeds in enumerate((test_seeds[:2], test_seeds[2:])):
+                        project = inputs / f"dataset_{number}" / "repo"
+                        for kind, subdir in (("outputs", task.output_subdir),
+                                             ("checkpoints", task.checkpoint_subdir)):
+                            for seed in seeds:
+                                shutil.copytree(root / kind / subdir / f"seed_{seed}",
+                                                project / kind / subdir / f"seed_{seed}")
+                    shutil.rmtree(root / "outputs")
+                    shutil.rmtree(root / "checkpoints")
+                    private = pd.DataFrame({
+                        "id": [f"private-{i}" for i in range(4)],
+                        "Comment": [f"new private comment {i}" for i in range(4)],
+                        "OriginalComment": [f"raw new private comment {i}" for i in range(4)],
+                    })
+                    private.to_csv(root / task.prediction_filename, index=False)
+                    with (
+                        patch("src.llm_training.require_cuda"),
+                        patch("src.llm_training.initialize_runtime", return_value=cpu_runtime()),
+                        patch("src.llm_training.AutoTokenizer.from_pretrained", return_value=self.tokenizer),
+                        patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                        patch("src.llm_training.resolve_data_file", side_effect=root.joinpath),
+                        patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                        patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                        patch("src.llm_training.load_lora_model", side_effect=model_factory) as loads,
+                        patch("src.llm_training.restore_adapter", wraps=restore_adapter) as restores,
+                        patch("src.llm_training.score_candidates", wraps=real_score) as predictions,
+                        patch("src.llm_training.train_llm_epoch", side_effect=AssertionError("new test retrained")),
+                        patch("src.llm_training._training_state", side_effect=AssertionError("new test created optimizer")),
+                    ):
+                        run_llm_task(task, config, resume_sources=(inputs,), auto_resume=False)
+                    self.assertEqual(loads.call_count, 5)
+                    self.assertEqual(restores.call_count, 5)
+                    self.assertEqual(predictions.call_count, 5)
+                    refreshed = pd.read_csv(output / "predictions.csv", dtype={"id": str})
+                    self.assertEqual(refreshed["id"].tolist(), private["id"].tolist())
+                    votes = pd.read_csv(output / "voting_predictions.csv")
+                    self.assertEqual((votes["votes_hate"] + votes["votes_non_hate"]).tolist(), [5] * 4)
+                    for seed in test_seeds:
+                        checkpoint = root / "checkpoints" / task.checkpoint_subdir / f"seed_{seed}" / "final_full_data_adapter"
+                        self.assertTrue((checkpoint / "adapter_config.json").is_file())
+                        self.assertTrue((checkpoint / "adapter_model.safetensors").is_file())
+                        seed_output = output / f"seed_{seed}"
+                        self.assertTrue((seed_output / "full_data_training_history.json").is_file())
+                        saved = json.loads((seed_output / "seed_summary.json").read_text())["full_data_retrain"]
+                        self.assertEqual(saved["checkpoint"], str(checkpoint))
+                    # Fresh prediction caches must then avoid even model loading.
+                    with (
+                        patch("src.llm_training.require_cuda"),
+                        patch("src.llm_training.initialize_runtime", return_value=cpu_runtime()),
+                        patch("src.llm_training.AutoTokenizer.from_pretrained", return_value=self.tokenizer),
+                        patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                        patch("src.llm_training.resolve_data_file", side_effect=root.joinpath),
+                        patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                        patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                        patch("src.llm_training.load_lora_model", side_effect=AssertionError("fresh cache loaded model")),
+                        patch("src.llm_training.train_llm_epoch", side_effect=AssertionError("fresh cache trained")),
+                        patch("src.llm_training.score_candidates", side_effect=AssertionError("fresh cache ran inference")),
+                    ):
+                        run_llm_task(task, config, auto_resume=False)
 
 
 if __name__ == "__main__":

@@ -1110,10 +1110,11 @@ def _completed_retrain_from_catalogs(
     task: TaskConfig,
     expected_signature: dict[str, object],
 ) -> dict | None:
-    """Find the richest completed phase-2 artifact for one seed."""
+    """Reuse trained adapters independently of the prediction input/cache."""
 
     prediction_ids = prediction_frame["id"].astype(str).tolist()
     candidates = []
+    completed_sources = []
     for catalog in catalogs:
         source_output = catalog.seed_output(seed)
         if source_output is None:
@@ -1133,25 +1134,35 @@ def _completed_retrain_from_catalogs(
                 and summary.get("resume_signature") != expected_signature
             ):
                 raise ValueError("data/model/training signature differs")
-            predictions_frame = pd.read_csv(
-                source_output / "predictions.csv", dtype={"id": str}
-            )
-            if predictions_frame["id"].tolist() != prediction_ids:
-                raise ValueError("prediction ids differ")
-            label_to_id = {label: index for index, label in enumerate(task.labels)}
-            label_ids = predictions_frame["label"].map(label_to_id)
-            if label_ids.isna().any():
-                raise ValueError("prediction labels differ")
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
 
+        completed_sources.append(str(source_output))
         score_path = source_output / "prediction_scores.npz"
         adapter = None
         source_checkpoint = catalog.seed_checkpoint(seed)
         if source_checkpoint is not None:
             candidate_adapter = source_checkpoint / "final_full_data_adapter"
-            if candidate_adapter.is_dir():
+            if (candidate_adapter / "adapter_config.json").is_file() and (
+                (candidate_adapter / "adapter_model.safetensors").is_file()
+                or (candidate_adapter / "adapter_model.bin").is_file()
+            ):
                 adapter = candidate_adapter
+        # A compatible full-data adapter remains valid when test IDs, text,
+        # order or row count change, or when the old prediction files are gone.
+        if adapter is not None:
+            candidates.append(
+                {
+                    "quality": 2,
+                    "mode": "adapter",
+                    "scores": None,
+                    "label_ids": None,
+                    "summary": summary,
+                    "source_output": source_output,
+                    "adapter": adapter,
+                    "source": catalog.source,
+                }
+            )
         try:
             scores = _load_prediction_scores(
                 score_path, prediction_ids, prediction_sha256
@@ -1166,35 +1177,61 @@ def _completed_retrain_from_catalogs(
                 raise ValueError("saved prediction score shape/values differ")
             quality = 3
             mode = "scores"
+            label_ids = scores["probabilities"].argmax(axis=1)
         except (OSError, KeyError, TypeError, ValueError):
-            scores = None
             if adapter is not None:
-                quality = 2
-                mode = "adapter"
-            else:
-                # Last-resort recovery: completed predictions still carry an
-                # equal seed vote. Scores are unavailable only for old outputs.
-                ids = label_ids.astype(int).to_numpy()
-                one_hot = np.eye(len(task.labels), dtype=np.float64)[ids]
-                scores = {
-                    "probabilities": one_hot,
-                    "mean_token_log_probs": one_hot,
-                }
-                quality = 1
-                mode = "labels"
+                continue
+            # A label-only cache is safe only with a verified input hash.
+            # Matching IDs alone does not detect changed text under those IDs.
+            if summary.get("prediction_sha256") != prediction_sha256:
+                continue
+            try:
+                predictions_frame = pd.read_csv(
+                    source_output / "predictions.csv", dtype={"id": str}
+                )
+                if predictions_frame["id"].tolist() != prediction_ids:
+                    continue
+                label_to_id = {label: index for index, label in enumerate(task.labels)}
+                labels = predictions_frame["label"].map(label_to_id)
+                if labels.isna().any():
+                    continue
+                label_ids = labels.astype(int).to_numpy()
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+            one_hot = np.eye(len(task.labels), dtype=np.float64)[label_ids]
+            scores = {
+                "probabilities": one_hot,
+                "mean_token_log_probs": one_hot,
+            }
+            quality = 1
+            mode = "labels"
         candidates.append(
             {
                 "quality": quality,
                 "mode": mode,
                 "scores": scores,
-                "label_ids": label_ids.astype(int).to_numpy(),
+                "label_ids": label_ids,
                 "summary": summary,
                 "source_output": source_output,
                 "adapter": adapter,
                 "source": catalog.source,
             }
         )
-    return max(candidates, key=lambda item: item["quality"]) if candidates else None
+    if candidates:
+        return max(
+            candidates,
+            key=lambda item: (item["quality"], item["adapter"] is not None),
+        )
+    if completed_sources:
+        raise RuntimeError(
+            f"Seed {seed}: compatible full-data training is already complete in "
+            f"{', '.join(dict.fromkeys(completed_sources))}, but no usable final "
+            "adapter or verified prediction cache was found for this input. "
+            "Attach the result containing final_full_data_adapter/adapter_config.json "
+            "and adapter_model.safetensors (or adapter_model.bin). "
+            "Refusing to retrain a completed seed automatically."
+        )
+    return None
 
 
 def _final_adapter_from_catalogs(
@@ -1523,7 +1560,7 @@ def _run_seed_ensemble(
 
         log(
             f"\n=== PHASE 2/2 | SEED {seed_number}/{len(seed_results)} "
-            f"| seed={seed} | FULL-DATA RETRAIN "
+            f"| seed={seed} | FULL-DATA ADAPTER / PREDICTION "
             f"({len(full_train_data)} rows / {best_epoch} epoch(s)) ===",
             runtime,
         )
@@ -1545,6 +1582,12 @@ def _run_seed_ensemble(
                 ),
                 runtime,
             )
+            cached_adapter = completed_retrain["adapter"]
+            if cached_adapter is not None and cached_adapter.resolve() != final_adapter_dir.resolve():
+                on_main(
+                    partial(shutil.copytree, cached_adapter, final_adapter_dir, dirs_exist_ok=True),
+                    runtime,
+                )
             scores = completed_retrain["scores"]
             label_ids = scores["probabilities"].argmax(axis=1)
             if completed_retrain["mode"] == "labels":
@@ -1588,6 +1631,22 @@ def _run_seed_ensemble(
         if reusable_final_adapter is not None:
             adapter, source = reusable_final_adapter
             restore_adapter(final_model, adapter)
+            # Export a self-contained checkpoint so the refreshed Kaggle output
+            # can itself be used for a later, different prediction input.
+            on_main(
+                partial(save_adapter, final_model, tokenizer, final_adapter_dir),
+                runtime,
+            )
+            source_history = (
+                completed_retrain["source_output"] / "full_data_training_history.json"
+                if completed_retrain is not None else None
+            )
+            target_history = seed_output_dir / "full_data_training_history.json"
+            if (
+                source_history is not None and source_history.is_file()
+                and source_history.resolve() != target_history.resolve()
+            ):
+                on_main(partial(shutil.copy2, source_history, target_history), runtime)
             log(
                 f"RESUME | seed={seed} | loaded completed phase-2 adapter from "
                 f"{source}; skipping full-data training and regenerating "
@@ -1721,13 +1780,10 @@ def _run_seed_ensemble(
             "label_distribution": full_train_frame[task.label_column]
             .value_counts()
             .to_dict(),
-            "checkpoint": str(
-                reusable_final_adapter[0]
-                if reusable_final_adapter is not None
-                else final_adapter_dir
-            ),
+            "checkpoint": str(final_adapter_dir),
             "prediction_source": "seed_specific_final_full_data_adapter",
             "resume_signature": resume_signature,
+            "prediction_sha256": prediction_sha256,
         }
 
         def export_seed_retrain_artifacts(

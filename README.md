@@ -198,13 +198,21 @@ Thứ tự tận dụng artifact cho từng seed:
   Nếu phase 1 còn dở nhưng có history và `best_holdout_adapter`, pipeline tiếp
   tục từ adapter đó với optimizer/scheduler mới và ghi cảnh báo trong log. Đây
   là phần tốt nhất có thể khôi phục vì optimizer state cũ không tồn tại.
-- Trường hợp output rất cũ chỉ còn `predictions.csv`, vote của seed vẫn được
-  dùng. Riêng Task B, nếu không còn adapter hoặc candidate scores để phá hòa,
-  log sẽ báo rõ rằng tie-break phải dùng one-hot vote khôi phục.
+- Với Task A, output chỉ còn `predictions.csv` được dùng làm one-hot vote khi
+  metadata xác nhận hash prediction hiện tại; ID giống nhau chưa đủ nếu nội
+  dung comment đã đổi.
 
-Artifact mới được kiểm tra bằng hash dữ liệu train, model revision, cấu hình
-LoRA/training, số GPU DDP, ID/thứ tự development và hash file prediction trước
-khi được dùng. Artifact kiểu cũ không có hash được kiểm tra bằng toàn bộ ID,
+Adapter full-data được kiểm tra bằng hash dữ liệu train, model revision, cấu
+hình LoRA/training, seed và số epoch. Cache prediction được kiểm tra riêng bằng
+ID/thứ tự và hash file prediction. Đổi test (kể cả đổi comment nhưng giữ ID)
+chỉ làm chạy inference lại từ adapter đã hoàn tất, không làm train full data
+lại. Pipeline tìm trong mọi input đã gắn để mỗi seed có thể lấy adapter từ một
+run khác nhau. Nếu metadata báo seed đã train xong nhưng mọi input đều thiếu
+weights và cache hiện tại không dùng được, code báo lỗi rõ thay vì tự train lại.
+Adapter được xuất lại vào checkpoint của run mới để có thể tiếp tục dùng
+Notebook Output đó khi đổi test lần sau.
+
+Artifact kiểu cũ không có hash được kiểm tra bằng toàn bộ ID,
 split assignment, số dòng, seed và số epoch có sẵn. Để exact-resume, lần chạy
 sau phải giữ cùng tham số CLI và cùng số GPU; nếu không khớp, checkpoint state
 sẽ bị từ chối an toàn và log nêu lý do.
