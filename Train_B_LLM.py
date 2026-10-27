@@ -1,4 +1,4 @@
-"""Train Task B on original English translations for five epochs per seed."""
+"""Select Task B best epochs per seed, retrain full data, then soft ensemble."""
 
 from llm_config import LLM_TRAINING_B, TASK_B_LLM
 from src.llm_training import run_llm_cli

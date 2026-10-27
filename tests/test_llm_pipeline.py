@@ -1,4 +1,4 @@
-"""Offline tests with a real, tiny random Qwen2 and trainable PEFT adapters.
+"""Offline tests with a real, tiny random Qwen3 and trainable PEFT adapters.
 
 No pretrained weights, competition data or GPU kernels are needed.
 The integration tests replace only the CUDA/model loading boundary; token loss,
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -21,17 +22,17 @@ import pandas as pd
 import torch
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen3Config, Qwen3ForCausalLM
 
-from llm_config import TASK_A, TASK_B, LLMTrainingConfig, llm_task
+from llm_config import LLMTrainingConfig, TASK_A, TASK_B, llm_task
 from src.distributed import RuntimeContext
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
 from src.llm_training import (
     binary_majority_vote,
-    completion_log_probs,
     completion_token_diagnostics,
-    compute_class_weights,
+    completion_log_probs,
     compute_dtype,
+    ensemble_plurality_vote,
     format_per_class_diagnostics,
     require_cuda,
     restore_adapter,
@@ -41,6 +42,13 @@ from src.llm_training import (
     train_llm_epoch,
 )
 from src.training import cap_training_labels, stratified_holdout_indices
+
+# Retain the original unit fixtures; the integration test also runs both tasks
+# with bilingual inputs explicitly below.
+TASK_A = replace(TASK_A, input_mode="english")
+TASK_B = replace(TASK_B, input_mode="english", include_english_translation=True, fixed_full_retrain_epochs=None,
+                 selection_validation_fold=5, ensemble_all_seeds=True, full_retrain_soft_ensemble=False,
+                 selection_train_label_caps=(("Gender", 870),), prompt_style="paired")
 
 
 class TestChatTokenizer:
@@ -56,18 +64,22 @@ class TestChatTokenizer:
         return [ord(character) + 10 for character in text]
 
     def decode(self, ids, skip_special_tokens=False):
-        pieces = []
-        for value in ids:
-            if value == self.eos_token_id:
-                if not skip_special_tokens:
-                    pieces.append(self.eos_token)
-            elif value >= 10:
-                pieces.append(chr(value - 10))
-            elif not skip_special_tokens:
-                pieces.append(f"<{value}>")
-        return "".join(pieces)
+        special = {0: "<pad>", 2: "<end>", 3: "<system>", 4: "<user>", 5: "<assistant>"}
+        return "".join(
+            ("" if skip_special_tokens else special[value])
+            if value in special else chr(value - 10)
+            for value in ids
+        )
 
-    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        **kwargs,
+    ):
+        self.template_kwargs = getattr(self, "template_kwargs", [])
+        self.template_kwargs.append(kwargs)
         role_ids = {"system": 3, "user": 4, "assistant": 5}
         ids = []
         for message in messages:
@@ -81,20 +93,21 @@ class TestChatTokenizer:
 
 
 def tiny_model():
-    config = Qwen2Config(
+    config = Qwen3Config(
         vocab_size=256,
         hidden_size=16,
         intermediate_size=32,
         num_hidden_layers=1,
         num_attention_heads=2,
         num_key_value_heads=1,
+        head_dim=8,
         max_position_embeddings=1024,
         pad_token_id=0,
         eos_token_id=2,
         use_cache=False,
         attention_dropout=0.0,
     )
-    model = Qwen2ForCausalLM(config)
+    model = Qwen3ForCausalLM(config)
     return get_peft_model(
         model,
         LoraConfig(
@@ -154,35 +167,40 @@ class LLMTests(unittest.TestCase):
             lora_dropout=0.0,
         )
 
-    def test_answer_mask_and_truncation_preserve_full_labels(self):
+    def test_answer_mask_and_truncation_preserve_configured_answers(self):
+        self.assertTrue(self.tokenizer.template_kwargs)
+        self.assertTrue(all(not kwargs for kwargs in self.tokenizer.template_kwargs))
         self.assertEqual(TASK_A.label_codes, TASK_A.labels)
-        self.assertIn("Allowed labels: Non-Hate; Hate", self.encoder.system_text)
+        self.assertIn(
+            "Allowed labels: Non-Hate; Hate", self.encoder.system_text
+        )
         self.assertNotIn("Code mapping", self.encoder.system_text)
+        task_b_prompt = ChatEncoder(self.tokenizer, TASK_B, 512).system_text
+        self.assertIn(
+            "Allowed labels: Gender; Political; Religion; Geo-political; Violence; Others",
+            task_b_prompt,
+        )
+        self.assertNotIn("Code mapping", task_b_prompt)
         for task in (TASK_A, TASK_B):
             encoder = ChatEncoder(self.tokenizer, task, 512)
-            self.assertEqual(task.label_codes, task.labels)
-            self.assertIn("Allowed labels: " + "; ".join(task.labels), encoder.system_text)
-            self.assertNotIn("Code mapping", encoder.system_text)
-            prompt, truncated = encoder.encode_prompt(
-                "long comment " * 300,
-                "long translation " * 300 if task.translation_column else None,
-            )
+            prompt, truncated = encoder.encode_prompt("long comment " * 300)
             self.assertTrue(truncated)
-            for label_id, code in enumerate(task.label_codes):
+            for label_id, answer in enumerate(task.label_codes):
                 feature = encoder.feature(prompt, label_id)
                 self.assertLessEqual(len(feature["input_ids"]), 512)
                 self.assertEqual(feature["labels"][: len(prompt)], [-100] * len(prompt))
                 self.assertEqual(
-                    feature["labels"][len(prompt) :], self.tokenizer.encode(code) + [2]
+                    feature["labels"][len(prompt) :],
+                    self.tokenizer.encode(answer) + [2],
                 )
                 self.assertEqual(feature["input_ids"][: len(prompt)], prompt)
 
     def test_encoding_matches_full_training_chat(self):
         prompt, _ = self.encoder.encode_prompt("hello")
-        for label_id, code in enumerate(TASK_A.label_codes):
+        for label_id, answer in enumerate(TASK_A.label_codes):
             expected = self.tokenizer.apply_chat_template(
                 self.encoder.messages("hello")
-                + [{"role": "assistant", "content": code}]
+                + [{"role": "assistant", "content": answer}]
             )
             self.assertEqual(
                 self.encoder.feature(prompt, label_id)["input_ids"], expected
@@ -295,51 +313,10 @@ class LLMTests(unittest.TestCase):
         for a, b in zip(first.parameters(), second.parameters(), strict=True):
             self.assertTrue(torch.allclose(a, b, atol=1e-7))
 
-    def test_mild_class_weights_preserve_scale_and_weight_rare_classes_more(self):
-        labels = np.asarray([0] * 12 + [1] * 4 + [2] * 3, dtype=np.int64)
-        weights, counts = compute_class_weights(labels, 3, 0.5, 0.75, 1.5)
-        self.assertEqual(counts.tolist(), [12, 4, 3])
-        self.assertAlmostEqual(
-            float(np.dot(counts, weights.numpy()) / len(labels)), 1.0, places=6
-        )
-        self.assertLess(weights[0], weights[1])
-        self.assertLess(weights[1], weights[2])
-
-    def test_class_weighted_partial_accumulation_matches_large_batch(self):
-        first = tiny_model()
-        second = copy.deepcopy(first)
-        dataset = CompletionDataset(["a", "b", "long"], self.encoder, [0, 1, 0])
-        class_weights = torch.tensor([0.8, 1.4])
-        for model, batch_size, accumulation in ((first, 1, 8), (second, 3, 1)):
-            loader = DataLoader(
-                dataset, batch_size=batch_size, collate_fn=self.collator
-            )
-            optimizer = torch.optim.SGD(
-                [p for p in model.parameters() if p.requires_grad], lr=0.01
-            )
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1)
-            train_llm_epoch(
-                model,
-                loader,
-                optimizer,
-                scheduler,
-                torch.amp.GradScaler("cuda", enabled=False),
-                replace(self.config, gradient_accumulation_steps=accumulation),
-                cpu_runtime(),
-                1,
-                class_weights=class_weights,
-            )
-        for a, b in zip(first.parameters(), second.parameters(), strict=True):
-            self.assertTrue(torch.allclose(a, b, atol=1e-7))
-
     def test_candidate_scores_independent_of_batching_and_gold_labels(self):
         model = tiny_model().eval()
-        diagnostic_task = replace(TASK_B, report_per_class_metrics=True)
-        encoder = ChatEncoder(self.tokenizer, diagnostic_task, 512)
-        data = CompletionDataset(
-            ["a", "some other text", "xyz"], encoder, [0, 1, 5],
-            translations=["one", "other English", "three"],
-        )
+        encoder = ChatEncoder(self.tokenizer, replace(TASK_B, report_per_class_metrics=True), 512)
+        data = CompletionDataset(["a", "some other text", "xyz"], encoder, [0, 1, 5])
         before = {name: p.detach().clone() for name, p in model.named_parameters()}
         scores = score_candidates(
             model, data, self.collator, self.config, cpu_runtime(), "test"
@@ -409,10 +386,7 @@ class LLMTests(unittest.TestCase):
 
     def test_completion_token_counts_are_reported_and_constant_per_label(self):
         encoder = ChatEncoder(self.tokenizer, TASK_B, 512)
-        data = CompletionDataset(
-            ["short", "a different comment"], encoder,
-            translations=["short English", "different English"],
-        )
+        data = CompletionDataset(["short", "a different comment"], encoder)
         result = score_candidates(
             tiny_model().eval(),
             data,
@@ -441,6 +415,11 @@ class LLMTests(unittest.TestCase):
     def test_task_a_direct_labels_use_length_normalized_candidate_scores(self):
         encoder = ChatEncoder(self.tokenizer, TASK_A, 512)
         self.assertNotEqual(len(encoder.completions[0]), len(encoder.completions[1]))
+        diagnostics = completion_token_diagnostics(encoder)
+        self.assertEqual([item["label"] for item in diagnostics], ["Non-Hate", "Hate"])
+        self.assertEqual(
+            [item["code"] for item in diagnostics], ["Non-Hate", "Hate"]
+        )
         data = CompletionDataset(["a direct-label example"], encoder)
         result = score_candidates(
             tiny_model().eval(),
@@ -480,27 +459,109 @@ class LLMTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "odd number of seeds"):
             binary_majority_vote(np.asarray([[0, 1], [1, 0]]), TASK_A.labels)
 
+    def test_ensemble_plurality_vote_uses_unique_plurality(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray(
+            [
+                [0, 2],
+                [0, 1],
+                [1, 2],
+                [0, 2],
+                [2, 0],
+            ]
+        )
+        scores = np.eye(len(labels), dtype=np.float64)[label_ids]
+        final_ids, votes, _, _, ties, methods = ensemble_plurality_vote(
+            label_ids, scores, labels
+        )
+        np.testing.assert_array_equal(final_ids, [0, 2])
+        np.testing.assert_array_equal(votes, [[3, 1, 1], [1, 1, 3]])
+        np.testing.assert_array_equal(ties, [False, False])
+        self.assertEqual(methods.tolist(), ["plurality", "plurality"])
+
+    def test_ensemble_plurality_vote_breaks_tie_with_borda(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray([[0], [0], [1], [1], [2]])
+        scores = np.asarray(
+            [
+                [[3.0, 2.0, 1.0]],
+                [[3.0, 2.0, 1.0]],
+                [[1.0, 3.0, 2.0]],
+                [[1.0, 3.0, 2.0]],
+                [[2.0, 1.0, 3.0]],
+            ]
+        )
+        final_ids, votes, borda, _, ties, methods = ensemble_plurality_vote(
+            label_ids, scores, labels
+        )
+        np.testing.assert_array_equal(votes[0], [2, 2, 1])
+        np.testing.assert_array_equal(borda[0], [5, 6, 4])
+        np.testing.assert_array_equal(final_ids, [1])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["borda"])
+
+    def test_ensemble_plurality_vote_breaks_borda_tie_with_normalized_score(self):
+        labels = ("A", "B", "C")
+        label_ids = np.asarray([[0], [0], [1], [1], [2]])
+        scores = np.asarray(
+            [
+                [[1.0, 0.9, 0.0]],
+                [[0.1, -10.0, 0.0]],
+                [[0.0, 10.0, 0.1]],
+                [[0.0, 10.0, 0.1]],
+                [[0.1, 0.0, 10.0]],
+            ]
+        )
+        final_ids, votes, borda, normalized, ties, methods = (
+            ensemble_plurality_vote(label_ids, scores, labels)
+        )
+        np.testing.assert_array_equal(votes[0], [2, 2, 1])
+        np.testing.assert_array_equal(borda[0, :2], [5, 5])
+        self.assertGreater(normalized[0, 1], normalized[0, 0])
+        np.testing.assert_array_equal(final_ids, [1])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["normalized_score"])
+
+    def test_ensemble_plurality_vote_uses_label_order_for_exact_tie(self):
+        labels = ("A", "B")
+        label_ids = np.asarray([[0], [1]])
+        scores = np.asarray([[[1.0, 0.0]], [[0.0, 1.0]]])
+        final_ids, votes, borda, normalized, ties, methods = (
+            ensemble_plurality_vote(label_ids, scores, labels)
+        )
+        np.testing.assert_array_equal(votes[0], [1, 1])
+        np.testing.assert_array_equal(borda[0], [1, 1])
+        np.testing.assert_allclose(normalized[0], [0.0, 0.0])
+        np.testing.assert_array_equal(final_ids, [0])
+        np.testing.assert_array_equal(ties, [True])
+        self.assertEqual(methods.tolist(), ["label_order"])
+
     def test_cpu_production_run_fails_clearly(self):
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
             require_cuda(cpu_runtime())
 
-    def test_task_a_selects_then_retrains_every_seed_before_voting(self):
-        for original_task in (TASK_A,):
+    def test_both_pipelines_select_then_retrain_retained_data_before_prediction(self):
+        for original_task in (
+            TASK_A, TASK_B,
+            replace(TASK_A, input_mode="bilingual"),
+            replace(TASK_B, input_mode="bilingual"),
+        ):
             with (
-                self.subTest(task=original_task.task_name),
+                self.subTest(task=original_task.task_name, input_mode=original_task.input_mode),
                 tempfile.TemporaryDirectory() as directory,
             ):
                 root = Path(directory)
                 test_seeds = (
                     (42, 52, 62) if original_task.ensemble_all_seeds else (42,)
                 )
+                if original_task == replace(TASK_A, input_mode="bilingual"):
+                    test_seeds = (42, 52, 62, 72, 82)
                 task = replace(llm_task(original_task), selection_seeds=test_seeds)
                 if task.original_fold_filenames:
                     task = replace(
                         task, selection_train_label_caps=(("Gender", 4),)
                     )
-                    original_frames = []
-                    augment_frames = []
+                    fold_frames = []
                     for fold, (original_name, augment_name) in enumerate(
                         zip(
                             task.original_fold_filenames,
@@ -544,6 +605,8 @@ class LLMTests(unittest.TestCase):
                                 "fold": fold,
                             }
                         )
+                        original["OriginalComment"] = "raw " + original["Comment"]
+                        augment["OriginalComment"] = "raw " + augment["Comment"]
                         original.to_csv(root / original_name, index=False)
                         if task.use_augmentation:
                             augment.to_csv(root / augment_name, index=False)
@@ -551,14 +614,10 @@ class LLMTests(unittest.TestCase):
                         original["data_origin"] = "original"
                         augment["fold"] = fold
                         augment["data_origin"] = "augmentation"
-                        original_frames.append(original)
+                        fold_frames.append(original)
                         if task.use_augmentation:
-                            augment_frames.append(augment)
-                    frame = pd.concat(
-                        original_frames + augment_frames,
-                        ignore_index=True,
-                        sort=False,
-                    )
+                            fold_frames.append(augment)
+                    frame = pd.concat(fold_frames, ignore_index=True, sort=False)
                     raw_train = np.flatnonzero(
                         frame["fold"].to_numpy() != task.selection_validation_fold
                     )
@@ -594,6 +653,7 @@ class LLMTests(unittest.TestCase):
                 prediction_frame = pd.DataFrame(
                     {"id": ["0100", "0101", "0102"], "Comment": ["one", "two", "three"]}
                 )
+                prediction_frame["OriginalComment"] = "raw " + prediction_frame["Comment"]
                 prediction_frame.to_csv(root / task.prediction_filename, index=False)
                 config = replace(
                     self.config,
@@ -607,18 +667,26 @@ class LLMTests(unittest.TestCase):
                 loaded_models = []
                 train_sizes = []
 
-                def model_factory(
-                    *_args, loaded_models=loaded_models, **_kwargs
-                ):
+                def model_factory(*_args, **_kwargs):
                     model = tiny_model()
                     loaded_models.append(model)
                     return model
 
-                def tracked_train(*args, train_sizes=train_sizes, **kwargs):
+                def tracked_train(*args, **kwargs):
                     train_sizes.append(len(args[1].dataset))
+                    if task.input_mode == "bilingual":
+                        for prompt in args[1].dataset.prompts:
+                            decoded = self.tokenizer.decode(prompt, skip_special_tokens=True)
+                            self.assertIn("English translation:\noriginal comment", decoded)
+                            self.assertIn("Original code-mixed comment:\nraw original comment", decoded)
                     return train_llm_epoch(*args, **kwargs)
 
                 def controlled_score(*args, real_score=real_score, calls=calls):
+                    if task.input_mode == "bilingual":
+                        for prompt in args[1].prompts:
+                            decoded = self.tokenizer.decode(prompt, skip_special_tokens=True)
+                            self.assertIn("English translation:\n", decoded)
+                            self.assertIn("Original code-mixed comment:\nraw ", decoded)
                     result = real_score(*args)
                     calls.append(args[-1])
                     # Force epoch 1 to win; full-data replay must use one epoch.
@@ -697,9 +765,18 @@ class LLMTests(unittest.TestCase):
                     self.assertEqual(
                         voting["final_label"].tolist(), result["label"].tolist()
                     )
+                    vote_columns = [
+                        "votes_"
+                        + label.lower().replace("-", "_").replace(" ", "_")
+                        for label in task.labels
+                    ]
                     self.assertEqual(
-                        (voting["hate_votes"] + voting["nonhate_votes"]).tolist(),
+                        voting[vote_columns].sum(axis=1).tolist(),
                         [len(test_seeds)] * len(voting),
+                    )
+                    self.assertEqual(
+                        summary["ensemble"]["fixed_label_order"],
+                        list(task.labels),
                     )
                 else:
                     self.assertEqual(summary["best_checkpoint"]["best_epoch"], 1)
@@ -721,7 +798,9 @@ class LLMTests(unittest.TestCase):
                     len(test_seeds) if task.ensemble_all_seeds else 1
                 )
                 self.assertEqual(train_sizes, expected_train_sizes)
-                manifest = pd.read_csv(output / "split_manifest.csv", dtype={"id": str})
+                # Label-cap sampling differs per seed; inspect seed 42 itself.
+                manifest_path = output / "seed_42" / "split_manifest.csv" if task.ensemble_all_seeds else output / "split_manifest.csv"
+                manifest = pd.read_csv(manifest_path, dtype={"id": str})
                 self.assertEqual(
                     manifest.loc[val, "split"].tolist(),
                     ["selection_validation"] * len(val),
@@ -749,9 +828,14 @@ class LLMTests(unittest.TestCase):
                     len(test_seeds) if task.ensemble_all_seeds else 1,
                 )
                 encoder = ChatEncoder(self.tokenizer, task, config.max_length)
-                data = CompletionDataset(prediction_frame["Comment"].tolist(), encoder)
+                prediction_inputs = (
+                    list(zip(prediction_frame["Comment"], prediction_frame["OriginalComment"], strict=True))
+                    if task.input_mode == "bilingual" else prediction_frame["Comment"].tolist()
+                )
+                data = CompletionDataset(prediction_inputs, encoder)
                 if task.ensemble_all_seeds:
                     seed_label_ids = []
+                    seed_mean_token_log_probs = []
                     for index, seed in enumerate(test_seeds):
                         final_model = loaded_models[len(test_seeds) + index]
                         restore_adapter(
@@ -773,8 +857,13 @@ class LLMTests(unittest.TestCase):
                         seed_label_ids.append(
                             scores["probabilities"].argmax(axis=1)
                         )
-                    expected_ids, _, _ = binary_majority_vote(
-                        np.stack(seed_label_ids), task.labels
+                        seed_mean_token_log_probs.append(
+                            scores["mean_token_log_probs"]
+                        )
+                    expected_ids, *_ = ensemble_plurality_vote(
+                        np.stack(seed_label_ids),
+                        np.stack(seed_mean_token_log_probs),
+                        task.labels,
                     )
                     expected = [task.labels[index] for index in expected_ids]
                 else:
@@ -800,229 +889,105 @@ class LLMTests(unittest.TestCase):
                     ]
                 self.assertEqual(result["label"].tolist(), expected)
 
-    def test_task_b_skips_oof_and_soft_ensembles_fixed_epoch_full_models(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            retrain_seeds = TASK_B.selection_seeds
-            task = replace(
-                TASK_B,
-                selection_seeds=retrain_seeds,
-                enable_augmentation_audit=False,
-            )
-            rows_per_fold = len(task.labels) * 2
-            for fold, (original_name, augment_name) in enumerate(
-                zip(
-                    task.original_fold_filenames,
-                    task.augmentation_fold_filenames,
-                    strict=True,
-                ),
-                start=1,
-            ):
-                original_labels = list(task.labels) * 2
-                original = pd.DataFrame(
-                    {
-                        "id": [f"original-{fold}-{i}" for i in range(rows_per_fold)],
-                        "Comment": [
-                            f"original comment {fold}-{i}" for i in range(rows_per_fold)
-                        ],
-                        "Comment_en": [
-                            f"translated original {fold}-{i}" for i in range(rows_per_fold)
-                        ],
-                        task.label_column: original_labels,
-                    }
-                )
-                original.to_csv(root / original_name, index=False)
-                # Deliberately unreadable: original-only training must not touch it.
-                (root / augment_name).write_text("invalid augmentation CSV", encoding="utf-8")
+                # A second invocation over the completed local artifacts must
+                # rebuild only the ensemble reports: no model load, inference,
+                # or training is allowed.
+                with (
+                    patch("src.llm_training.require_cuda"),
+                    patch(
+                        "src.llm_training.initialize_runtime",
+                        return_value=cpu_runtime(),
+                    ),
+                    patch(
+                        "src.llm_training.AutoTokenizer.from_pretrained",
+                        return_value=self.tokenizer,
+                    ),
+                    patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                    patch(
+                        "src.llm_training.resolve_data_file", side_effect=root.joinpath
+                    ),
+                    patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                    patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                    patch(
+                        "src.llm_training.load_lora_model",
+                        side_effect=AssertionError("completed resume loaded a model"),
+                    ),
+                    patch(
+                        "src.llm_training.train_llm_epoch",
+                        side_effect=AssertionError("completed resume trained"),
+                    ),
+                    patch(
+                        "src.llm_training.score_candidates",
+                        side_effect=AssertionError("completed resume ran inference"),
+                    ),
+                ):
+                    run_llm_task(task, config, auto_resume=False)
+                resumed = pd.read_csv(output / "predictions.csv", dtype={"id": str})
+                self.assertEqual(resumed.to_dict("records"), result.to_dict("records"))
 
-            prediction_frame = pd.DataFrame(
-                {
-                    "id": ["0100", "0101", "0102"],
-                    "Comment": ["raw development one", "raw development two", "raw development three"],
-                    "Comment_en": ["English one", "English two", "English three"],
-                }
-            )
-            prediction_frame.to_csv(root / task.prediction_filename, index=False)
-            gold_frame = pd.DataFrame(
-                {
-                    "id": prediction_frame["id"],
-                    "Comment": prediction_frame["Comment"],
-                    task.label_column: list(task.labels[:len(prediction_frame)]),
-                }
-            )
-            gold_frame.to_csv(root / task.epoch_validation_filename, index=False)
-            config = replace(
-                self.config,
-                max_epochs=2,
-                train_batch_size_per_gpu=6,
-                gradient_accumulation_steps=1,
-                eval_batch_size_per_gpu=6,
-            )
-            real_score = score_candidates
-            loaded_models = []
-            train_calls = []
-            score_calls = []
-
-            def model_factory(*_args, **_kwargs):
-                model = tiny_model()
-                loaded_models.append(model)
-                return model
-
-            def tracked_train(*args, **kwargs):
-                train_calls.append(
-                    {
-                        "rows": len(args[1].dataset),
-                        "prompt": self.tokenizer.decode(args[1].dataset.prompts[0]),
-                        "class_weights": kwargs.get("class_weights"),
-                    }
-                )
-                return train_llm_epoch(*args, **kwargs)
-
-            def tracked_score(*args):
-                score_calls.append(args[-1])
-                for prompt in args[1].prompts:
-                    decoded = self.tokenizer.decode(prompt)
-                    self.assertIn("English translation:\nEnglish", decoded)
-                    self.assertNotIn("raw development", decoded)
-                    self.assertNotIn("Comment (raw code-mixed):", decoded)
-                return real_score(*args)
-
-            with (
-                patch("src.llm_training.require_cuda"),
-                patch(
-                    "src.llm_training.initialize_runtime", return_value=cpu_runtime()
-                ),
-                patch(
-                    "src.llm_training.load_lora_model", side_effect=model_factory
-                ),
-                patch(
-                    "src.llm_training.AutoTokenizer.from_pretrained",
-                    return_value=self.tokenizer,
-                ),
-                patch("src.data.resolve_data_file", side_effect=root.joinpath),
-                patch(
-                    "src.llm_training.resolve_data_file", side_effect=root.joinpath
-                ),
-                patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
-                patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
-                patch(
-                    "src.llm_training.score_candidates", side_effect=tracked_score
-                ),
-                patch(
-                    "src.llm_training.train_llm_epoch", side_effect=tracked_train
-                ),
-                patch("src.llm_training.log") as logged,
-            ):
-                run_llm_task(task, config)
-
-            output = root / "outputs" / task.output_subdir
-            summary = json.loads((output / "run_summary.json").read_text())
-            self.assertEqual(summary["epoch_selection"]["fixed_epoch"], 5)
-            self.assertTrue(summary["epoch_selection"]["oof_skipped"])
-            self.assertEqual(
-                summary["epoch_selection"]["strategy"], "fixed_without_oof"
-            )
-            self.assertEqual(summary["class_weighting"]["downsampling"], None)
-            self.assertEqual(len(summary["full_data_retrains"]), len(retrain_seeds))
-            self.assertEqual(summary["ensemble"]["method"], (
-                "equal-weight mean of per-seed candidate probabilities"
-            ))
-
-            self.assertFalse((output / "oof_predictions.csv").exists())
-            self.assertFalse((output / "oof_selection_summary.json").exists())
-
-            log_lines = [call.args[0] for call in logged.call_args_list]
-            for seed in retrain_seeds:
-                for epoch in range(1, task.fixed_full_retrain_epochs + 1):
-                    heading = f"Official validation | seed={seed} | epoch={epoch}:"
-                    self.assertEqual(
-                        sum(line.startswith(heading) for line in log_lines), 1
-                    )
-            self.assertEqual(
-                sum(line.startswith("Confusion matrix |") for line in log_lines),
-                len(retrain_seeds) * task.fixed_full_retrain_epochs + 1,
-            )
-            for label in task.labels:
-                self.assertTrue(any(
-                    line.startswith(f"  {label}: precision=")
-                    and "recall=" in line and "f1=" in line and "support=" in line
-                    for line in log_lines
-                ))
-            for seed in retrain_seeds:
-                history = json.loads(
-                    (output / f"seed_{seed}" / "full_data_training_history.json").read_text()
-                )
-                self.assertEqual(len(history["epochs"]), 5)
-                for record in history["epochs"]:
-                    metrics = record["official_validation"]
-                    self.assertEqual(set(metrics["per_class"]), set(task.labels))
-                    self.assertEqual(sum(
-                        value["support"] for value in metrics["per_class"].values()
-                    ), len(gold_frame))
-                    predictions_path = (
-                        output / f"seed_{seed}" / "official_validation"
-                        / f"predictions_epoch_{record['epoch']:02d}.csv"
-                    )
-                    saved = pd.read_csv(predictions_path, dtype={"id": str})
-                    self.assertEqual(saved["id"].tolist(), gold_frame["id"].tolist())
-            self.assertEqual(summary["official_validation"]["dataset"]["rows"], len(gold_frame))
-            self.assertTrue((output / "official_validation_metrics.json").is_file())
-            self.assertTrue((output / "official_validation_predictions.csv").is_file())
-
-            result = pd.read_csv(output / "predictions.csv", dtype={"id": str})
-            ensemble = pd.read_csv(
-                output / "ensemble_predictions.csv", dtype={"id": str}
-            )
-            self.assertEqual(result["id"].tolist(), prediction_frame["id"].tolist())
-            self.assertEqual(result["label"].tolist(), ensemble["final_label"].tolist())
-            probability_columns = [
-                f"mean_prob_{label.lower().replace('-', '_').replace(' ', '_')}"
-                for label in task.labels
-            ]
-            expected_ids = ensemble[probability_columns].to_numpy().argmax(axis=1)
-            self.assertEqual(
-                result["label"].tolist(),
-                [task.labels[index] for index in expected_ids],
-            )
-            with zipfile.ZipFile(output / task.submission_zip_name) as archive:
-                self.assertEqual(archive.namelist(), ["predictions.csv"])
-
-            self.assertEqual(len(loaded_models), len(retrain_seeds))
-            self.assertEqual(
-                [call["rows"] for call in train_calls],
-                [rows_per_fold * 5]
-                * (len(retrain_seeds) * task.fixed_full_retrain_epochs),
-            )
-            self.assertTrue(all(
-                "original comment 1-0" not in call["prompt"]
-                and "English translation:\ntranslated original 1-0" in call["prompt"]
-                for call in train_calls
-            ))
-            self.assertEqual(sum(
-                name.startswith("Official validation | seed=") for name in score_calls
-            ), len(retrain_seeds) * 5)
-            self.assertEqual(sum(
-                name.startswith("Development prediction seed ") for name in score_calls
-            ), len(retrain_seeds))
-            self.assertEqual(summary["prompt_input"]["translation_column"], "Comment_en")
-            self.assertIsNone(summary["prompt_input"]["raw_column"])
-            self.assertTrue(summary["prompt_input"]["english_only_prompt"])
-            self.assertFalse(summary["prompt_input"]["use_augmentation"])
-            self.assertFalse(any(name.startswith("augment") for name in summary["input_sha256"]))
-            self.assertTrue(
-                all(call["class_weights"] is not None for call in train_calls)
-            )
-            self.assertFalse((output / "downsampled_rows.csv").exists())
-            for seed in retrain_seeds:
-                self.assertTrue(
-                    (
-                        root
-                        / "checkpoints"
-                        / task.checkpoint_subdir
-                        / f"seed_{seed}"
-                        / "final_full_data_adapter"
-                    ).is_dir()
-                )
+                if original_task == replace(TASK_A, input_mode="bilingual"):
+                    # Reproduce two extracted Kaggle inputs supplying different
+                    # seeds, followed by a private test with new IDs and size.
+                    inputs = root / "kaggle_input"
+                    for number, seeds in enumerate((test_seeds[:2], test_seeds[2:])):
+                        project = inputs / f"dataset_{number}" / "repo"
+                        for kind, subdir in (("outputs", task.output_subdir),
+                                             ("checkpoints", task.checkpoint_subdir)):
+                            for seed in seeds:
+                                shutil.copytree(root / kind / subdir / f"seed_{seed}",
+                                                project / kind / subdir / f"seed_{seed}")
+                    shutil.rmtree(root / "outputs")
+                    shutil.rmtree(root / "checkpoints")
+                    private = pd.DataFrame({
+                        "id": [f"private-{i}" for i in range(4)],
+                        "Comment": [f"new private comment {i}" for i in range(4)],
+                        "OriginalComment": [f"raw new private comment {i}" for i in range(4)],
+                    })
+                    private.to_csv(root / task.prediction_filename, index=False)
+                    with (
+                        patch("src.llm_training.require_cuda"),
+                        patch("src.llm_training.initialize_runtime", return_value=cpu_runtime()),
+                        patch("src.llm_training.AutoTokenizer.from_pretrained", return_value=self.tokenizer),
+                        patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                        patch("src.llm_training.resolve_data_file", side_effect=root.joinpath),
+                        patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                        patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                        patch("src.llm_training.load_lora_model", side_effect=model_factory) as loads,
+                        patch("src.llm_training.restore_adapter", wraps=restore_adapter) as restores,
+                        patch("src.llm_training.score_candidates", wraps=real_score) as predictions,
+                        patch("src.llm_training.train_llm_epoch", side_effect=AssertionError("new test retrained")),
+                        patch("src.llm_training._training_state", side_effect=AssertionError("new test created optimizer")),
+                    ):
+                        run_llm_task(task, config, resume_sources=(inputs,), auto_resume=False)
+                    self.assertEqual(loads.call_count, 5)
+                    self.assertEqual(restores.call_count, 5)
+                    self.assertEqual(predictions.call_count, 5)
+                    refreshed = pd.read_csv(output / "predictions.csv", dtype={"id": str})
+                    self.assertEqual(refreshed["id"].tolist(), private["id"].tolist())
+                    votes = pd.read_csv(output / "voting_predictions.csv")
+                    self.assertEqual((votes["votes_hate"] + votes["votes_non_hate"]).tolist(), [5] * 4)
+                    for seed in test_seeds:
+                        checkpoint = root / "checkpoints" / task.checkpoint_subdir / f"seed_{seed}" / "final_full_data_adapter"
+                        self.assertTrue((checkpoint / "adapter_config.json").is_file())
+                        self.assertTrue((checkpoint / "adapter_model.safetensors").is_file())
+                        seed_output = output / f"seed_{seed}"
+                        self.assertTrue((seed_output / "full_data_training_history.json").is_file())
+                        saved = json.loads((seed_output / "seed_summary.json").read_text())["full_data_retrain"]
+                        self.assertEqual(saved["checkpoint"], str(checkpoint))
+                    # Fresh prediction caches must then avoid even model loading.
+                    with (
+                        patch("src.llm_training.require_cuda"),
+                        patch("src.llm_training.initialize_runtime", return_value=cpu_runtime()),
+                        patch("src.llm_training.AutoTokenizer.from_pretrained", return_value=self.tokenizer),
+                        patch("src.data.resolve_data_file", side_effect=root.joinpath),
+                        patch("src.llm_training.resolve_data_file", side_effect=root.joinpath),
+                        patch("src.llm_training.OUTPUT_ROOT", root / "outputs"),
+                        patch("src.llm_training.CHECKPOINT_ROOT", root / "checkpoints"),
+                        patch("src.llm_training.load_lora_model", side_effect=AssertionError("fresh cache loaded model")),
+                        patch("src.llm_training.train_llm_epoch", side_effect=AssertionError("fresh cache trained")),
+                        patch("src.llm_training.score_candidates", side_effect=AssertionError("fresh cache ran inference")),
+                    ):
+                        run_llm_task(task, config, auto_resume=False)
 
 
 if __name__ == "__main__":

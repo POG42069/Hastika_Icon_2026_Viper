@@ -9,6 +9,8 @@ import inspect
 import json
 import math
 import os
+import random
+import shutil
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -38,21 +40,30 @@ from transformers import (
 
 from llm_config import (
     CHECKPOINT_ROOT,
-    LLM_TRAINING,
     OUTPUT_ROOT,
+    LLM_TRAINING,
     LLMTrainingConfig,
     TaskConfig,
+    with_prompt_order,
 )
-from src.data import load_epoch_validation_frame, load_task_frames, resolve_data_file
+from src.data import labeled_input_filenames, load_task_frames, prompt_inputs, resolve_data_file
 from src.distributed import (
     RuntimeContext,
     cleanup_runtime,
     gather_python_objects,
     initialize_runtime,
     relaunch_with_torchrun_if_needed,
+    synchronize,
 )
-from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
+from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset, effective_prompt_order
 from src.submission import write_submission
+from src.resume import (
+    ResumeCatalog,
+    copy_seed_outputs,
+    prepare_resume_catalogs,
+    read_catalog_manifest,
+    write_catalog_manifest,
+)
 from src.training import (
     build_optimizer,
     cap_training_labels,
@@ -64,11 +75,11 @@ from src.training import (
     stratified_holdout_indices,
     unwrap_model,
     write_downsampled_rows,
-    write_seed_selection_results,
     write_split_manifest,
     write_validation_confusion_history,
     write_validation_confusion_matrix,
     write_validation_predictions,
+    write_seed_selection_results,
 )
 
 
@@ -98,36 +109,6 @@ def validate_config(config: LLMTrainingConfig) -> None:
         raise ValueError("initial_loss_scale must be positive")
     if not 0 <= config.warmup_ratio < 1 or not 0 <= config.lora_dropout < 1:
         raise ValueError("warmup_ratio and lora_dropout must be in [0, 1)")
-
-
-def compute_class_weights(
-    label_ids: np.ndarray,
-    n_classes: int,
-    power: float,
-    minimum: float,
-    maximum: float,
-) -> tuple[torch.Tensor, np.ndarray]:
-    """Return mild inverse-frequency weights with mean sample weight one."""
-
-    labels = np.asarray(label_ids, dtype=np.int64)
-    if labels.ndim != 1 or labels.size == 0:
-        raise ValueError("Class weighting requires a non-empty one-dimensional label array.")
-    if np.any((labels < 0) | (labels >= n_classes)):
-        raise ValueError("Class weighting received an invalid label index.")
-    if not 0 < power <= 1:
-        raise ValueError("class_weight_power must be in (0, 1].")
-    if not 0 < minimum <= maximum:
-        raise ValueError("Class-weight bounds must satisfy 0 < minimum <= maximum.")
-    counts = np.bincount(labels, minlength=n_classes).astype(np.int64)
-    if np.any(counts == 0):
-        raise ValueError("Every class must occur in a class-weighted training split.")
-
-    balanced = labels.size / (n_classes * counts.astype(np.float64))
-    weights = np.power(balanced, power)
-    weights = np.clip(weights, minimum, maximum)
-    sample_mean = float(np.dot(counts, weights) / labels.size)
-    weights /= sample_mean
-    return torch.tensor(weights, dtype=torch.float32), counts
 
 
 def compute_dtype(config: LLMTrainingConfig, runtime: RuntimeContext) -> torch.dtype:
@@ -192,7 +173,10 @@ def completion_token_diagnostics(encoder: ChatEncoder) -> list[dict[str, object]
     convert_ids_to_tokens = getattr(tokenizer, "convert_ids_to_tokens", None)
     diagnostics = []
     for label, code, token_ids in zip(
-        encoder.task.labels, encoder.task.label_codes, encoder.completions, strict=True
+        encoder.task.labels,
+        encoder.task.label_codes,
+        encoder.completions,
+        strict=True,
     ):
         ids = list(token_ids)
         token_pieces = (
@@ -334,7 +318,7 @@ def completion_log_probs(
 
     Supervision is shifted exactly once: logits BEFORE each answer token predict
     that token. Project only the short suffix to the large vocabulary where the
-    architecture supports logits_to_keep (Qwen2.5); preserve the full attention
+    architecture supports logits_to_keep; preserve the full attention
     context. Left padding lets different prompt lengths share a short suffix.
     """
     labels = batch["labels"]
@@ -346,11 +330,7 @@ def completion_log_probs(
     keep = labels.shape[1] - int(positions[:, 1].min()) + 1
     base = unwrap_model(model)
     base = base.get_base_model() if hasattr(base, "get_base_model") else base
-    kwargs = {
-        key: value
-        for key, value in batch.items()
-        if key not in {"labels", "class_ids"}
-    }
+    kwargs = {key: value for key, value in batch.items() if key != "labels"}
     if "logits_to_keep" in inspect.signature(base.forward).parameters:
         kwargs["logits_to_keep"] = keep
     logits = model(**kwargs).logits
@@ -373,25 +353,11 @@ def completion_log_probs(
 
 
 def train_llm_epoch(
-    model,
-    loader,
-    optimizer,
-    scheduler,
-    scaler,
-    config,
-    runtime,
-    epoch,
-    phase="LLM",
-    class_weights: torch.Tensor | None = None,
+    model, loader, optimizer, scheduler, scaler, config, runtime, epoch, phase="LLM"
 ):
     """Mean answer-token NLL per example; correctly scale even a partial group."""
     model.train()
     dtype = compute_dtype(config, runtime)
-    device_class_weights = (
-        class_weights.to(runtime.device, dtype=torch.float32)
-        if class_weights is not None
-        else None
-    )
     total_loss, total_examples, successful_updates, skipped_updates = 0.0, 0, 0, 0
     iterator = iter(loader)
     progress = LineProgress(
@@ -415,19 +381,9 @@ def train_llm_epoch(
                 with _autocast(runtime, dtype):
                     log_probs, counts = completion_log_probs(model, batch)
                     example_losses = -log_probs / counts
-                    if device_class_weights is None:
-                        optimized_losses = example_losses
-                    else:
-                        if "class_ids" not in batch:
-                            raise ValueError(
-                                "Class-weighted training requires class IDs in every batch."
-                            )
-                        optimized_losses = example_losses * device_class_weights[
-                            batch["class_ids"]
-                        ]
-                    loss = optimized_losses.sum() / group_size
+                    loss = example_losses.sum() / group_size
                 scaler.scale(loss).backward()
-            total_loss += float(optimized_losses.detach().sum())
+            total_loss += float(example_losses.detach().sum())
             total_examples += len(example_losses)
             progress.update(
                 1, details=f"mean_loss={total_loss / total_examples:.4f}"
@@ -678,6 +634,631 @@ def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _input_hashes(task: TaskConfig) -> tuple[str, str]:
+    """Hash training and prediction inputs separately for safe artifact reuse."""
+
+    training = hashlib.sha256()
+    for name in labeled_input_filenames(task):
+        training.update(name.encode())
+        training.update(resolve_data_file(name).read_bytes())
+    prediction = hashlib.sha256(
+        resolve_data_file(task.prediction_filename).read_bytes()
+    )
+    return training.hexdigest(), prediction.hexdigest()
+
+
+def _resume_signature(
+    task: TaskConfig,
+    config: LLMTrainingConfig,
+    training_sha256: str,
+    runtime: RuntimeContext,
+) -> dict[str, object]:
+    """Fields that must match before training state can be continued exactly."""
+
+    signature = {
+        "format_version": 2,
+        "input_mode": task.input_mode,
+        "original_comment_column": task.original_comment_column,
+        "prompt_policy": "bilingual-balanced-head-tail-v1" if task.input_mode == "bilingual" else "english-comment-tail-v1",
+        "task": task.task_name,
+        "training_sha256": training_sha256,
+        "model": config.model_name,
+        "model_revision": config.model_revision,
+        "labels": list(task.labels),
+        "labeled_filenames": list(labeled_input_filenames(task)),
+        "split_seed": config.seed,
+        "selection_validation_fold": task.selection_validation_fold,
+        "selection_validation_data_origins": list(
+            task.selection_validation_data_origins
+        ),
+        "selection_train_label_caps": [
+            list(value) for value in task.selection_train_label_caps
+        ],
+        "max_length": config.max_length,
+        "max_epochs": config.max_epochs,
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "warmup_ratio": config.warmup_ratio,
+        "train_batch_size_per_gpu": config.train_batch_size_per_gpu,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "early_stopping_patience": config.early_stopping_patience,
+        "lora_rank": config.lora_rank,
+        "lora_alpha": config.lora_alpha,
+        "lora_dropout": config.lora_dropout,
+        "target_modules": config.target_modules,
+        "compute_dtype": str(compute_dtype(config, runtime)),
+    }
+    if task.input_mode == "bilingual" and not task.include_english_translation:
+        signature["include_english_translation"] = False
+        signature["prompt_policy"] = "original-only-head-tail-v1"
+    default_order = "original-first" if task.prompt_style == "khangtest" else "english-first"
+    if task.input_mode == "bilingual" and effective_prompt_order(task) != default_order:
+        signature["prompt_order"] = effective_prompt_order(task)
+    return signature
+
+
+def _capture_rng_state() -> dict[str, object]:
+    numpy_state = np.random.get_state()
+    state: dict[str, object] = {
+        "python": random.getstate(),
+        "numpy": {
+            "bit_generator": numpy_state[0],
+            "keys": numpy_state[1].tolist(),
+            "position": numpy_state[2],
+            "has_gauss": numpy_state[3],
+            "cached_gaussian": numpy_state[4],
+        },
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict[str, object]) -> None:
+    random.setstate(state["python"])
+    numpy_state = state["numpy"]
+    np.random.set_state(
+        (
+            numpy_state["bit_generator"],
+            np.asarray(numpy_state["keys"], dtype=np.uint32),
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        )
+    )
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _save_epoch_resume(
+    *,
+    phase: str,
+    epoch: int,
+    total_epochs: int,
+    model,
+    tokenizer,
+    optimizer,
+    scheduler,
+    scaler,
+    loader,
+    history: list[dict],
+    seed_checkpoint_dir: Path,
+    signature: dict[str, object],
+    runtime: RuntimeContext,
+) -> None:
+    """Atomically publish a complete end-of-epoch training checkpoint."""
+
+    rng_states = gather_python_objects(_capture_rng_state(), runtime)
+    resume_root = seed_checkpoint_dir / "resume_state" / phase
+    epoch_name = f"epoch_{epoch:03d}"
+    epoch_dir = resume_root / epoch_name
+
+    def save() -> None:
+        temporary = resume_root / f".{epoch_name}.tmp"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir(parents=True)
+        save_adapter(model, tokenizer, temporary / "adapter")
+        torch.save(
+            {
+                "epoch": epoch,
+                "total_epochs": total_epochs,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "loader_generator": loader.generator.get_state()
+                if getattr(loader, "generator", None) is not None
+                else None,
+                "rng_by_rank": rng_states,
+                "world_size": runtime.world_size,
+                "history": history,
+                "signature": signature,
+            },
+            temporary / "training_state.pt",
+        )
+        _write_json(
+            temporary / "metadata.json",
+            {
+                "phase": phase,
+                "completed_epoch": epoch,
+                "total_epochs": total_epochs,
+                "world_size": runtime.world_size,
+                "signature": signature,
+            },
+        )
+        if epoch_dir.exists():
+            shutil.rmtree(epoch_dir)
+        temporary.replace(epoch_dir)
+        latest_tmp = resume_root / ".latest.json.tmp"
+        _write_json(
+            latest_tmp,
+            {"checkpoint": epoch_name, "completed_epoch": epoch},
+        )
+        latest_tmp.replace(resume_root / "latest.json")
+        for old in resume_root.glob("epoch_*"):
+            if old != epoch_dir:
+                shutil.rmtree(old)
+
+    on_main(save, runtime)
+
+
+def _latest_phase_checkpoint(
+    catalogs: list[ResumeCatalog],
+    seed: int,
+    phase: str,
+    expected_signature: dict[str, object],
+    expected_total_epochs: int,
+    expected_world_size: int,
+) -> tuple[Path, str] | None:
+    candidates: list[tuple[int, Path, str]] = []
+    for catalog in catalogs:
+        seed_checkpoint = catalog.seed_checkpoint(seed)
+        if seed_checkpoint is None:
+            continue
+        latest = seed_checkpoint / "resume_state" / phase / "latest.json"
+        try:
+            value = json.loads(latest.read_text(encoding="utf-8"))
+            checkpoint = latest.parent / value["checkpoint"]
+            epoch = int(value["completed_epoch"])
+            metadata = json.loads(
+                (checkpoint / "metadata.json").read_text(encoding="utf-8")
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            metadata.get("signature") != expected_signature
+            or int(metadata.get("total_epochs", -1)) != expected_total_epochs
+            or int(metadata.get("world_size", -1)) != expected_world_size
+        ):
+            continue
+        if (checkpoint / "adapter").is_dir() and (
+            checkpoint / "training_state.pt"
+        ).is_file():
+            candidates.append((epoch, checkpoint, catalog.source))
+    if not candidates:
+        return None
+    _, checkpoint, source = max(candidates, key=lambda item: item[0])
+    return checkpoint, source
+
+
+def _restore_epoch_resume(
+    *,
+    checkpoint: Path,
+    expected_signature: dict[str, object],
+    expected_total_epochs: int,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    loader,
+    runtime: RuntimeContext,
+) -> tuple[int, list[dict]]:
+    state = torch.load(
+        checkpoint / "training_state.pt", map_location="cpu", weights_only=True
+    )
+    if state.get("signature") != expected_signature:
+        raise ValueError(
+            "resume checkpoint uses different data/model/training settings"
+        )
+    if int(state.get("total_epochs", -1)) != expected_total_epochs:
+        raise ValueError("resume checkpoint uses a different total epoch count")
+    if int(state.get("world_size", -1)) != runtime.world_size:
+        raise ValueError("resume checkpoint uses a different GPU/DDP world size")
+    restore_adapter(model, checkpoint / "adapter")
+    optimizer.load_state_dict(state["optimizer"])
+    scheduler.load_state_dict(state["scheduler"])
+    scaler.load_state_dict(state["scaler"])
+    if state.get("loader_generator") is not None and getattr(
+        loader, "generator", None
+    ) is not None:
+        loader.generator.set_state(state["loader_generator"])
+    rng_states = state["rng_by_rank"]
+    _restore_rng_state(rng_states[runtime.rank])
+    return int(state["epoch"]), list(state["history"])
+
+
+def _clear_phase_resume(
+    seed_checkpoint_dir: Path, phase: str, runtime: RuntimeContext
+) -> None:
+    path = seed_checkpoint_dir / "resume_state" / phase
+    on_main(lambda: shutil.rmtree(path) if path.exists() else None, runtime)
+
+
+def _probabilities_from_validation_csv(
+    path: Path, val_frame: pd.DataFrame, task: TaskConfig
+) -> np.ndarray:
+    frame = pd.read_csv(path, dtype={"id": str})
+    if frame["id"].tolist() != val_frame["id"].astype(str).tolist():
+        raise ValueError("validation prediction ids do not match current data")
+    columns = [
+        "prob_" + label.lower().replace("-", "_").replace(" ", "_")
+        for label in task.labels
+    ]
+    if all(column in frame for column in columns):
+        values = frame[columns].to_numpy(dtype=np.float64)
+    else:
+        label_to_id = {label: index for index, label in enumerate(task.labels)}
+        ids = frame["predicted_label"].map(label_to_id)
+        if ids.isna().any():
+            raise ValueError("validation predictions contain unknown labels")
+        values = np.eye(len(task.labels), dtype=np.float64)[ids.astype(int)]
+    return values
+
+
+def _completed_selection_from_catalogs(
+    *,
+    catalogs: list[ResumeCatalog],
+    seed: int,
+    frame: pd.DataFrame,
+    val_frame: pd.DataFrame,
+    task: TaskConfig,
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    downsampled_indices: np.ndarray,
+    full_train_indices: np.ndarray,
+    train_frame: pd.DataFrame,
+    selection_train_truncated: int,
+    seed_output_dir: Path,
+    seed_checkpoint_dir: Path,
+    expected_signature: dict[str, object],
+) -> tuple[dict, str, Path] | None:
+    expected_split = np.full(len(frame), "selection_excluded", dtype=object)
+    expected_split[downsampled_indices] = "selection_downsampled"
+    expected_split[train_indices] = "selection_train"
+    expected_split[val_indices] = "selection_validation"
+    candidates = []
+    for catalog in catalogs:
+        source_output = catalog.seed_output(seed)
+        if source_output is None:
+            continue
+        try:
+            summary = json.loads(
+                (source_output / "seed_summary.json").read_text(encoding="utf-8")
+            )
+            history_value = json.loads(
+                (source_output / "selection_training_history.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            history = list(history_value["epochs"])
+            manifest = pd.read_csv(
+                source_output / "split_manifest.csv", dtype={"id": str}
+            )
+            if int(summary["seed"]) != seed or int(summary["best_epoch"]) < 1:
+                raise ValueError("invalid seed summary")
+            if not history:
+                raise ValueError("selection history is empty")
+            history_best = history[0]
+            for record in history[1:]:
+                if is_better_checkpoint(
+                    record["macro_f1"],
+                    record["loss"],
+                    history_best["macro_f1"],
+                    history_best["loss"],
+                ):
+                    history_best = record
+            if int(summary["best_epoch"]) != int(history_best["epoch"]):
+                raise ValueError("best_epoch differs from selection history")
+            if (
+                (task.input_mode == "bilingual" or "resume_signature" in summary)
+                and summary.get("resume_signature") != expected_signature
+            ):
+                raise ValueError("data/model/training signature differs")
+            if int(summary["selection_train_rows"]) != len(train_indices):
+                raise ValueError("selection row count differs")
+            if int(summary["full_retrain_rows"]) != len(full_train_indices):
+                raise ValueError("full retrain row count differs")
+            if manifest["id"].tolist() != frame["id"].astype(str).tolist():
+                raise ValueError("training ids differ")
+            if manifest["split"].tolist() != expected_split.tolist():
+                raise ValueError("selection split differs")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            candidates.append(
+                ((-1, -1), None, f"{catalog.source}: rejected ({exc})")
+            )
+            continue
+        try:
+            probabilities = _probabilities_from_validation_csv(
+                source_output / "validation_predictions.csv", val_frame, task
+            )
+            validation_recovery = "exact"
+        except (OSError, KeyError, TypeError, ValueError):
+            probabilities = np.full(
+                (len(val_frame), len(task.labels)),
+                1.0 / len(task.labels),
+                dtype=np.float64,
+            )
+            validation_recovery = "unavailable_uniform_placeholder"
+            summary = {
+                **summary,
+                "resume_validation_predictions": validation_recovery,
+            }
+        result = {
+            "summary": summary,
+            "train_indices": train_indices,
+            "downsampled_indices": downsampled_indices,
+            "full_train_indices": full_train_indices,
+            "train_frame": train_frame,
+            "selection_train_truncated": selection_train_truncated,
+            "selection_history": history,
+            "validation_probabilities": probabilities,
+            "validation_indices": val_indices,
+            "seed_output_dir": seed_output_dir,
+            "seed_checkpoint_dir": seed_checkpoint_dir,
+            "validation_recovery": validation_recovery,
+        }
+        quality = 2 if "resume_signature" in summary else 1
+        candidates.append(
+            ((quality, len(history)), (result, source_output), catalog.source)
+        )
+    valid = [item for item in candidates if item[0][0] >= 0]
+    if not valid:
+        return None
+    _, (result, source_output), source = max(valid, key=lambda item: item[0])
+    return result, source, source_output
+
+
+def _legacy_partial_selection(
+    *,
+    catalogs: list[ResumeCatalog],
+    seed: int,
+    frame: pd.DataFrame,
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    downsampled_indices: np.ndarray,
+) -> tuple[list[dict], Path, Path, str] | None:
+    """Use pre-resume-format history and its best adapter as a warm restart."""
+
+    expected_split = np.full(len(frame), "selection_excluded", dtype=object)
+    expected_split[downsampled_indices] = "selection_downsampled"
+    expected_split[train_indices] = "selection_train"
+    expected_split[val_indices] = "selection_validation"
+    candidates = []
+    for catalog in catalogs:
+        source_output = catalog.seed_output(seed)
+        source_checkpoint = catalog.seed_checkpoint(seed)
+        if source_output is None or source_checkpoint is None:
+            continue
+        adapter = source_checkpoint / "best_holdout_adapter"
+        if not adapter.is_dir() or (source_output / "seed_summary.json").is_file():
+            continue
+        try:
+            history = json.loads(
+                (source_output / "selection_training_history.json").read_text(
+                    encoding="utf-8"
+                )
+            )["epochs"]
+            manifest = pd.read_csv(
+                source_output / "split_manifest.csv", dtype={"id": str}
+            )
+            if (
+                not history
+                or manifest["id"].tolist() != frame["id"].astype(str).tolist()
+            ):
+                raise ValueError("training ids/history differ")
+            if manifest["split"].tolist() != expected_split.tolist():
+                raise ValueError("selection split differs")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        candidates.append(
+            (len(history), history, adapter, source_output, catalog.source)
+        )
+    if not candidates:
+        return None
+    _, history, adapter, source_output, source = max(
+        candidates, key=lambda item: item[0]
+    )
+    return list(history), adapter, source_output, source
+
+
+def _save_prediction_scores(
+    path: Path,
+    prediction_ids: list[str],
+    prediction_sha256: str,
+    predictions: dict,
+) -> None:
+    np.savez_compressed(
+        path,
+        ids=np.asarray(prediction_ids),
+        prediction_sha256=np.asarray(prediction_sha256),
+        probabilities=predictions["probabilities"],
+        mean_token_log_probs=predictions["mean_token_log_probs"],
+    )
+
+
+def _load_prediction_scores(
+    path: Path,
+    prediction_ids: list[str],
+    prediction_sha256: str,
+) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as values:
+        if values["ids"].astype(str).tolist() != prediction_ids:
+            raise ValueError("prediction ids differ")
+        if str(values["prediction_sha256"].item()) != prediction_sha256:
+            raise ValueError("prediction input hash differs")
+        probabilities = values["probabilities"]
+        scores = values["mean_token_log_probs"]
+    return {"probabilities": probabilities, "mean_token_log_probs": scores}
+
+
+def _completed_retrain_from_catalogs(
+    *,
+    catalogs: list[ResumeCatalog],
+    seed: int,
+    expected_epochs: int,
+    prediction_frame: pd.DataFrame,
+    prediction_sha256: str,
+    task: TaskConfig,
+    expected_signature: dict[str, object],
+) -> dict | None:
+    """Reuse trained adapters independently of the prediction input/cache."""
+
+    prediction_ids = prediction_frame["id"].astype(str).tolist()
+    candidates = []
+    completed_sources = []
+    for catalog in catalogs:
+        source_output = catalog.seed_output(seed)
+        if source_output is None:
+            continue
+        try:
+            summary_value = json.loads(
+                (source_output / "seed_summary.json").read_text(encoding="utf-8")
+            )
+            summary = summary_value["full_data_retrain"]
+            if (
+                int(summary["seed"]) != seed
+                or int(summary["epochs"]) != expected_epochs
+            ):
+                raise ValueError("seed/epoch count differs")
+            if (
+                (task.input_mode == "bilingual" or "resume_signature" in summary)
+                and summary.get("resume_signature") != expected_signature
+            ):
+                raise ValueError("data/model/training signature differs")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+
+        completed_sources.append(str(source_output))
+        score_path = source_output / "prediction_scores.npz"
+        adapter = None
+        source_checkpoint = catalog.seed_checkpoint(seed)
+        if source_checkpoint is not None:
+            candidate_adapter = source_checkpoint / "final_full_data_adapter"
+            if (candidate_adapter / "adapter_config.json").is_file() and (
+                (candidate_adapter / "adapter_model.safetensors").is_file()
+                or (candidate_adapter / "adapter_model.bin").is_file()
+            ):
+                adapter = candidate_adapter
+        # A compatible full-data adapter remains valid when test IDs, text,
+        # order or row count change, or when the old prediction files are gone.
+        if adapter is not None:
+            candidates.append(
+                {
+                    "quality": 2,
+                    "mode": "adapter",
+                    "scores": None,
+                    "label_ids": None,
+                    "summary": summary,
+                    "source_output": source_output,
+                    "adapter": adapter,
+                    "source": catalog.source,
+                }
+            )
+        try:
+            scores = _load_prediction_scores(
+                score_path, prediction_ids, prediction_sha256
+            )
+            expected_shape = (len(prediction_ids), len(task.labels))
+            if (
+                scores["probabilities"].shape != expected_shape
+                or scores["mean_token_log_probs"].shape != expected_shape
+                or not np.all(np.isfinite(scores["probabilities"]))
+                or not np.all(np.isfinite(scores["mean_token_log_probs"]))
+            ):
+                raise ValueError("saved prediction score shape/values differ")
+            quality = 3
+            mode = "scores"
+            label_ids = scores["probabilities"].argmax(axis=1)
+        except (OSError, KeyError, TypeError, ValueError):
+            if adapter is not None:
+                continue
+            # A label-only cache is safe only with a verified input hash.
+            # Matching IDs alone does not detect changed text under those IDs.
+            if summary.get("prediction_sha256") != prediction_sha256:
+                continue
+            try:
+                predictions_frame = pd.read_csv(
+                    source_output / "predictions.csv", dtype={"id": str}
+                )
+                if predictions_frame["id"].tolist() != prediction_ids:
+                    continue
+                label_to_id = {label: index for index, label in enumerate(task.labels)}
+                labels = predictions_frame["label"].map(label_to_id)
+                if labels.isna().any():
+                    continue
+                label_ids = labels.astype(int).to_numpy()
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+            one_hot = np.eye(len(task.labels), dtype=np.float64)[label_ids]
+            scores = {
+                "probabilities": one_hot,
+                "mean_token_log_probs": one_hot,
+            }
+            quality = 1
+            mode = "labels"
+        candidates.append(
+            {
+                "quality": quality,
+                "mode": mode,
+                "scores": scores,
+                "label_ids": label_ids,
+                "summary": summary,
+                "source_output": source_output,
+                "adapter": adapter,
+                "source": catalog.source,
+            }
+        )
+    if candidates:
+        return max(
+            candidates,
+            key=lambda item: (item["quality"], item["adapter"] is not None),
+        )
+    if completed_sources:
+        raise RuntimeError(
+            f"Seed {seed}: compatible full-data training is already complete in "
+            f"{', '.join(dict.fromkeys(completed_sources))}, but no usable final "
+            "adapter or verified prediction cache was found for this input. "
+            "Attach the result containing final_full_data_adapter/adapter_config.json "
+            "and adapter_model.safetensors (or adapter_model.bin). "
+            "Refusing to retrain a completed seed automatically."
+        )
+    return None
+
+
+def _final_adapter_from_catalogs(
+    catalogs: list[ResumeCatalog], seed: int, expected_epochs: int
+) -> tuple[Path, str] | None:
+    for catalog in catalogs:
+        checkpoint = catalog.seed_checkpoint(seed)
+        output = catalog.seed_output(seed)
+        if checkpoint is None or output is None:
+            continue
+        adapter = checkpoint / "final_full_data_adapter"
+        try:
+            history = json.loads(
+                (output / "full_data_training_history.json").read_text(
+                    encoding="utf-8"
+                )
+            )["epochs"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+        if adapter.is_dir() and len(history) == expected_epochs:
+            return adapter, catalog.source
+    return None
+
+
 def _wrap_for_ddp(model, runtime: RuntimeContext):
     if not runtime.distributed:
         return model
@@ -732,6 +1313,103 @@ def binary_majority_vote(
     return final_ids, hate_votes, nonhate_votes
 
 
+def ensemble_plurality_vote(
+    seed_label_ids: np.ndarray,
+    seed_mean_token_log_probs: np.ndarray,
+    labels: tuple[str, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Vote equally across seeds and resolve multiclass ties deterministically.
+
+    Ties in the plurality vote are resolved by summed, tie-aware Borda points,
+    then by summed per-seed z-normalized mean token log probabilities. An exact
+    tie after all score-based rules falls back to the configured label order.
+    """
+
+    label_ids = np.asarray(seed_label_ids, dtype=np.int64)
+    scores = np.asarray(seed_mean_token_log_probs, dtype=np.float64)
+    if label_ids.ndim != 2 or label_ids.shape[0] < 1:
+        raise ValueError("seed_label_ids must have shape (seeds, prediction rows)")
+    if len(labels) < 2:
+        raise ValueError("Ensemble voting requires at least two labels")
+    expected_score_shape = (*label_ids.shape, len(labels))
+    if scores.shape != expected_score_shape:
+        raise ValueError(
+            "seed_mean_token_log_probs must have shape "
+            f"{expected_score_shape}, received {scores.shape}"
+        )
+    if np.any((label_ids < 0) | (label_ids >= len(labels))):
+        raise ValueError("seed_label_ids contains an invalid label index")
+    if not np.all(np.isfinite(scores)):
+        raise ValueError("seed_mean_token_log_probs must contain finite values")
+
+    seed_count, row_count = label_ids.shape
+    vote_counts = np.zeros((row_count, len(labels)), dtype=np.int64)
+    for label_index in range(len(labels)):
+        vote_counts[:, label_index] = np.sum(label_ids == label_index, axis=0)
+
+    # A candidate receives one Borda point for every candidate it outscores.
+    # Equal candidate scores therefore receive equal points and do not silently
+    # inherit a preference from array order.
+    borda_points = np.sum(
+        scores[:, :, :, np.newaxis] > scores[:, :, np.newaxis, :], axis=-1
+    )
+    borda_scores = np.sum(borda_points, axis=0, dtype=np.int64)
+
+    score_means = np.mean(scores, axis=2, keepdims=True)
+    score_stds = np.std(scores, axis=2, keepdims=True)
+    normalized_scores = np.divide(
+        scores - score_means,
+        score_stds,
+        out=np.zeros_like(scores),
+        where=score_stds > 0,
+    )
+    normalized_score_sums = np.sum(normalized_scores, axis=0)
+
+    final_ids = np.empty(row_count, dtype=np.int64)
+    tie_detected = np.zeros(row_count, dtype=bool)
+    tie_break_methods = np.empty(row_count, dtype=object)
+    for row_index in range(row_count):
+        candidates = np.flatnonzero(
+            vote_counts[row_index] == vote_counts[row_index].max()
+        )
+        if len(candidates) == 1:
+            final_ids[row_index] = candidates[0]
+            tie_break_methods[row_index] = "plurality"
+            continue
+
+        tie_detected[row_index] = True
+        candidate_borda = borda_scores[row_index, candidates]
+        candidates = candidates[candidate_borda == candidate_borda.max()]
+        if len(candidates) == 1:
+            final_ids[row_index] = candidates[0]
+            tie_break_methods[row_index] = "borda"
+            continue
+
+        candidate_scores = normalized_score_sums[row_index, candidates]
+        best_score = candidate_scores.max()
+        candidates = candidates[
+            np.isclose(candidate_scores, best_score, rtol=1e-12, atol=1e-12)
+        ]
+        if len(candidates) == 1:
+            final_ids[row_index] = candidates[0]
+            tie_break_methods[row_index] = "normalized_score"
+            continue
+
+        final_ids[row_index] = candidates[0]
+        tie_break_methods[row_index] = "label_order"
+
+    if np.any(vote_counts.sum(axis=1) != seed_count):
+        raise RuntimeError("Every prediction row must receive one vote per seed")
+    return (
+        final_ids,
+        vote_counts,
+        borda_scores,
+        normalized_score_sums,
+        tie_detected,
+        tie_break_methods,
+    )
+
+
 def _best_validation_result(seed_results: list[dict]) -> dict:
     """Return the best holdout result for reporting, not final prediction."""
 
@@ -770,13 +1448,18 @@ def _run_seed_ensemble(
     resolved_revision: str | None,
     parameter_counts: dict[str, int] | None,
     token_diagnostics: list[dict[str, object]],
+    resume_catalogs: list[ResumeCatalog],
+    resume_signature: dict[str, object],
+    prediction_sha256: str,
 ) -> None:
-    """Retrain every selected seed, predict, and hard-vote Task A outputs."""
+    """Retrain every selected seed, predict, and ensemble their outputs."""
 
     if len(seed_results) != len(selection_seeds):
         raise RuntimeError("Every configured seed must finish before ensembling")
-    if len(selection_seeds) % 2 == 0:
-        raise ValueError("ensemble_all_seeds requires an odd number of seeds")
+    if len(selection_seeds) < 2:
+        raise ValueError("ensemble_all_seeds requires at least two seeds")
+    if len(task.labels) == 2 and len(selection_seeds) % 2 == 0:
+        raise ValueError("Binary seed ensembling requires an odd number of seeds")
 
     reporting_best = _best_validation_result(seed_results)
     reporting_summary = reporting_best["summary"]
@@ -869,61 +1552,218 @@ def _run_seed_ensemble(
         best_epoch = int(summary["best_epoch"])
         full_train_indices = result["full_train_indices"]
         full_train_frame = frame.iloc[full_train_indices]
-        full_train_data = CompletionDataset.from_frame(full_train_frame, encoder)
+        full_train_data = CompletionDataset(
+            prompt_inputs(full_train_frame, task),
+            encoder,
+            full_train_frame["label_id"].tolist(),
+        )
         seed_output_dir = result["seed_output_dir"]
         seed_checkpoint_dir = result["seed_checkpoint_dir"]
         final_adapter_dir = seed_checkpoint_dir / "final_full_data_adapter"
 
         log(
             f"\n=== PHASE 2/2 | SEED {seed_number}/{len(seed_results)} "
-            f"| seed={seed} | FULL-DATA RETRAIN "
+            f"| seed={seed} | FULL-DATA ADAPTER / PREDICTION "
             f"({len(full_train_data)} rows / {best_epoch} epoch(s)) ===",
             runtime,
         )
+        completed_retrain = _completed_retrain_from_catalogs(
+            catalogs=resume_catalogs,
+            seed=seed,
+            expected_epochs=best_epoch,
+            prediction_frame=prediction_frame,
+            prediction_sha256=prediction_sha256,
+            task=task,
+            expected_signature=resume_signature,
+        )
+        if completed_retrain is not None and completed_retrain["mode"] != "adapter":
+            on_main(
+                partial(
+                    copy_seed_outputs,
+                    completed_retrain["source_output"],
+                    seed_output_dir,
+                ),
+                runtime,
+            )
+            cached_adapter = completed_retrain["adapter"]
+            if cached_adapter is not None and cached_adapter.resolve() != final_adapter_dir.resolve():
+                on_main(
+                    partial(shutil.copytree, cached_adapter, final_adapter_dir, dirs_exist_ok=True),
+                    runtime,
+                )
+            scores = completed_retrain["scores"]
+            label_ids = scores["probabilities"].argmax(axis=1)
+            if completed_retrain["mode"] == "labels":
+                log(
+                    f"RESUME | seed={seed} | reused completed predictions from "
+                    f"{completed_retrain['source']}; old output has no candidate "
+                    "scores, so score-based tie breaks use recovered one-hot votes.",
+                    runtime,
+                )
+            else:
+                log(
+                    f"RESUME | seed={seed} | phase 2 and prediction already "
+                    f"complete in {completed_retrain['source']} "
+                    "(no training/inference).",
+                    runtime,
+                )
+            retrained_results.append(
+                {
+                    "seed": seed,
+                    "label_ids": label_ids,
+                    "probabilities": scores["probabilities"],
+                    "mean_token_log_probs": scores["mean_token_log_probs"],
+                    "summary": completed_retrain["summary"],
+                    "full_train_truncated": full_train_data.truncated_count,
+                    "recovery_mode": completed_retrain["mode"],
+                }
+            )
+            del full_train_data
+            continue
+
         set_global_seed(seed)
         full_loader, full_sampler = create_train_loader(
             full_train_data, collator, config, runtime, seed
         )
         final_model = _wrap_for_ddp(load_lora_model(config, runtime), runtime)
-        optimizer, scheduler, scaler = _training_state(
-            final_model, full_loader, best_epoch, config, runtime
-        )
-        full_history = []
-        for epoch in range(1, best_epoch + 1):
-            if full_sampler is not None:
-                full_sampler.set_epoch(epoch)
-            train_loss = train_llm_epoch(
-                final_model,
-                full_loader,
-                optimizer,
-                scheduler,
-                scaler,
-                config,
-                runtime,
-                epoch,
-                f"Full-data retrain seed {seed}",
-            )
-            full_history.append({"epoch": epoch, "train_loss": train_loss})
-            log(
-                f"Seed {seed} full-data epoch {epoch}/{best_epoch}: "
-                f"train_loss={train_loss:.5f}",
-                runtime,
-            )
+        reusable_final_adapter = None
+        if completed_retrain is not None and completed_retrain["mode"] == "adapter":
+            reusable_final_adapter = (completed_retrain["adapter"], completed_retrain["source"])
+        elif task.input_mode != "bilingual":
+            reusable_final_adapter = _final_adapter_from_catalogs(resume_catalogs, seed, best_epoch)
+        if reusable_final_adapter is not None:
+            adapter, source = reusable_final_adapter
+            restore_adapter(final_model, adapter)
+            # Export a self-contained checkpoint so the refreshed Kaggle output
+            # can itself be used for a later, different prediction input.
             on_main(
-                lambda seed_output_dir=seed_output_dir,
-                seed=seed,
-                full_history=list(full_history): _write_json(
-                    seed_output_dir / "full_data_training_history.json",
-                    {"seed": seed, "epochs": full_history},
-                ),
+                partial(save_adapter, final_model, tokenizer, final_adapter_dir),
                 runtime,
             )
+            source_history = (
+                completed_retrain["source_output"] / "full_data_training_history.json"
+                if completed_retrain is not None else None
+            )
+            target_history = seed_output_dir / "full_data_training_history.json"
+            if (
+                source_history is not None and source_history.is_file()
+                and source_history.resolve() != target_history.resolve()
+            ):
+                on_main(partial(shutil.copy2, source_history, target_history), runtime)
+            log(
+                f"RESUME | seed={seed} | loaded completed phase-2 adapter from "
+                f"{source}; skipping full-data training and regenerating "
+                "prediction scores.",
+                runtime,
+            )
+            full_history = []
+            optimizer = scheduler = scaler = None
+            recovery_mode = "adapter_inference"
+        else:
+            optimizer, scheduler, scaler = _training_state(
+                final_model, full_loader, best_epoch, config, runtime
+            )
+            full_history: list[dict] = []
+            completed_epoch = 0
+            exact_checkpoint = _latest_phase_checkpoint(
+                resume_catalogs,
+                seed,
+                "full_retrain",
+                resume_signature,
+                best_epoch,
+                runtime.world_size,
+            )
+            if exact_checkpoint is not None:
+                checkpoint, source = exact_checkpoint
+                try:
+                    completed_epoch, full_history = _restore_epoch_resume(
+                        checkpoint=checkpoint,
+                        expected_signature=resume_signature,
+                        expected_total_epochs=best_epoch,
+                        model=final_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        loader=full_loader,
+                        runtime=runtime,
+                    )
+                    log(
+                        f"RESUME | seed={seed} | exact phase-2 state after epoch "
+                        f"{completed_epoch} from {source}.",
+                        runtime,
+                    )
+                except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                    log(
+                        f"Full-retrain checkpoint rejected for seed {seed}: {exc}. "
+                        "Starting phase 2 normally.",
+                        runtime,
+                    )
+                    del final_model, optimizer, scheduler, scaler
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    set_global_seed(seed)
+                    final_model = _wrap_for_ddp(
+                        load_lora_model(config, runtime), runtime
+                    )
+                    optimizer, scheduler, scaler = _training_state(
+                        final_model, full_loader, best_epoch, config, runtime
+                    )
+                    completed_epoch, full_history = 0, []
 
-        del optimizer, scheduler, scaler
-        on_main(
-            partial(save_adapter, final_model, tokenizer, final_adapter_dir), runtime
-        )
-        restore_adapter(final_model, final_adapter_dir)
+            for epoch in range(completed_epoch + 1, best_epoch + 1):
+                if full_sampler is not None:
+                    full_sampler.set_epoch(epoch)
+                train_loss = train_llm_epoch(
+                    final_model,
+                    full_loader,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    config,
+                    runtime,
+                    epoch,
+                    f"Full-data retrain seed {seed}",
+                )
+                full_history.append({"epoch": epoch, "train_loss": train_loss})
+                log(
+                    f"Seed {seed} full-data epoch {epoch}/{best_epoch}: "
+                    f"train_loss={train_loss:.5f}",
+                    runtime,
+                )
+                on_main(
+                    lambda seed_output_dir=seed_output_dir,
+                    seed=seed,
+                    full_history=list(full_history): _write_json(
+                        seed_output_dir / "full_data_training_history.json",
+                        {"seed": seed, "epochs": full_history},
+                    ),
+                    runtime,
+                )
+                _save_epoch_resume(
+                    phase="full_retrain",
+                    epoch=epoch,
+                    total_epochs=best_epoch,
+                    model=final_model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    loader=full_loader,
+                    history=list(full_history),
+                    seed_checkpoint_dir=seed_checkpoint_dir,
+                    signature=resume_signature,
+                    runtime=runtime,
+                )
+
+            del optimizer, scheduler, scaler
+            on_main(
+                partial(save_adapter, final_model, tokenizer, final_adapter_dir),
+                runtime,
+            )
+            _clear_phase_resume(seed_checkpoint_dir, "full_retrain", runtime)
+            recovery_mode = "trained_or_exact_resume"
+        if reusable_final_adapter is None:
+            restore_adapter(final_model, final_adapter_dir)
         predictions = score_candidates(
             final_model,
             prediction_data,
@@ -945,6 +1785,8 @@ def _run_seed_ensemble(
             .to_dict(),
             "checkpoint": str(final_adapter_dir),
             "prediction_source": "seed_specific_final_full_data_adapter",
+            "resume_signature": resume_signature,
+            "prediction_sha256": prediction_sha256,
         }
 
         def export_seed_retrain_artifacts(
@@ -953,6 +1795,12 @@ def _run_seed_ensemble(
             summary=summary,
             final_summary=final_summary,
         ) -> None:
+            _save_prediction_scores(
+                seed_output_dir / "prediction_scores.npz",
+                prediction_frame["id"].astype(str).tolist(),
+                prediction_sha256,
+                predictions,
+            )
             write_submission(
                 prediction_frame["id"].tolist(),
                 predicted_labels,
@@ -971,8 +1819,10 @@ def _run_seed_ensemble(
                 "seed": seed,
                 "label_ids": label_ids,
                 "probabilities": predictions["probabilities"],
+                "mean_token_log_probs": predictions["mean_token_log_probs"],
                 "summary": final_summary,
                 "full_train_truncated": full_train_data.truncated_count,
+                "recovery_mode": recovery_mode,
             }
         )
         del final_model, full_loader, full_train_data
@@ -984,8 +1834,18 @@ def _run_seed_ensemble(
     stacked_label_ids = np.stack(
         [result["label_ids"] for result in retrained_results], axis=0
     )
-    final_ids, hate_votes, nonhate_votes = binary_majority_vote(
-        stacked_label_ids, task.labels
+    stacked_scores = np.stack(
+        [result["mean_token_log_probs"] for result in retrained_results], axis=0
+    )
+    (
+        final_ids,
+        vote_counts,
+        borda_scores,
+        normalized_score_sums,
+        tie_detected,
+        tie_break_methods,
+    ) = ensemble_plurality_vote(
+        stacked_label_ids, stacked_scores, task.labels
     )
     final_labels = [task.labels[index] for index in final_ids]
     mean_probabilities = np.mean(
@@ -998,17 +1858,37 @@ def _run_seed_ensemble(
     voting_data: dict[str, object] = {
         "id": prediction_frame["id"].astype(str).tolist()
     }
-    for row, seed_result in zip(
-        stacked_label_ids, retrained_results, strict=True
+    for seed_index, (row, seed_result) in enumerate(
+        zip(stacked_label_ids, retrained_results, strict=True)
     ):
-        voting_data[f"seed_{seed_result['seed']}"] = [
+        seed_prefix = f"seed_{seed_result['seed']}"
+        voting_data[seed_prefix] = [
             task.labels[index] for index in row
         ]
-    voting_data["hate_votes"] = hate_votes
-    voting_data["nonhate_votes"] = nonhate_votes
+        for label_index, label in enumerate(task.labels):
+            safe_label = label.lower().replace("-", "_").replace(" ", "_")
+            voting_data[
+                f"{seed_prefix}_mean_token_log_prob_{safe_label}"
+            ] = stacked_scores[seed_index, :, label_index]
+            voting_data[f"{seed_prefix}_prob_{safe_label}"] = seed_result[
+                "probabilities"
+            ][:, label_index]
     for label_index, label in enumerate(task.labels):
         safe_label = label.lower().replace("-", "_").replace(" ", "_")
+        voting_data[f"votes_{safe_label}"] = vote_counts[:, label_index]
+        voting_data[f"borda_{safe_label}"] = borda_scores[:, label_index]
+        voting_data[f"normalized_score_{safe_label}"] = normalized_score_sums[
+            :, label_index
+        ]
         voting_data[f"mean_prob_{safe_label}"] = mean_probabilities[:, label_index]
+    if set(task.labels) == {"Non-Hate", "Hate"} and len(task.labels) == 2:
+        voting_data["hate_votes"] = vote_counts[:, task.labels.index("Hate")]
+        voting_data["nonhate_votes"] = vote_counts[
+            :, task.labels.index("Non-Hate")
+        ]
+    voting_data["max_votes"] = vote_counts.max(axis=1)
+    voting_data["tie_detected"] = tie_detected
+    voting_data["tie_break_method"] = tie_break_methods
     voting_data["final_label"] = final_labels
     voting_frame = pd.DataFrame(voting_data)
 
@@ -1026,12 +1906,33 @@ def _run_seed_ensemble(
             output_dir,
             task.submission_zip_name,
         )
+        method_counts = {
+            method: int(np.sum(tie_break_methods == method))
+            for method in (
+                "plurality",
+                "borda",
+                "normalized_score",
+                "label_order",
+            )
+        }
         ensemble_summary = {
-            "method": "hard majority vote",
+            "method": (
+                "equal-weight plurality vote with Borda and normalized-score "
+                "tie-breaks"
+            ),
             "seeds": list(selection_seeds),
-            "required_votes": len(selection_seeds) // 2 + 1,
-            "tie_possible": False,
-            "vote_rule": "Hate if hate_votes > nonhate_votes; otherwise Non-Hate",
+            "tie_break_order": [
+                "summed tie-aware Borda points",
+                "summed per-seed z-normalized mean token log probabilities",
+                "configured label order",
+            ],
+            "fixed_label_order": list(task.labels),
+            "seed_recovery_modes": {
+                str(result["seed"]): result["recovery_mode"]
+                for result in retrained_results
+            },
+            "rows_by_resolution_method": method_counts,
+            "rows_with_plurality_tie": int(np.sum(tie_detected)),
             "prediction_file": str(csv_path),
             "voting_audit_file": str(output_dir / "voting_predictions.csv"),
             "submission": str(zip_path),
@@ -1051,7 +1952,9 @@ def _run_seed_ensemble(
             output_dir / "run_summary.json",
             {
                 "task": task.task_name,
-                "method": "LoRA answer-only causal LM with hard-vote seed ensemble",
+                "method": (
+                    "LoRA answer-only causal LM with equal-weight seed ensemble"
+                ),
                 "model": config.model_name,
                 "resolved_model_revision": resolved_revision,
                 "world_size": runtime.world_size,
@@ -1065,6 +1968,16 @@ def _run_seed_ensemble(
                 * config.gradient_accumulation_steps
                 * runtime.world_size,
                 "selection_seeds": list(selection_seeds),
+                "resume": {
+                    "artifact_catalogs": [
+                        item.source for item in resume_catalogs[1:]
+                    ],
+                    "training_signature": resume_signature,
+                    "prediction_sha256": prediction_sha256,
+                    "seed_recovery_modes": ensemble_summary[
+                        "seed_recovery_modes"
+                    ],
+                },
                 "reporting_best_seed": reporting_seed,
                 "reporting_best_seed_used_only_for_validation_summary": True,
                 "selection_split": {
@@ -1104,6 +2017,9 @@ def _run_seed_ensemble(
                 "training_config": asdict(config),
                 "parameters": parameter_counts,
                 "system_prompt": encoder.system_text,
+                "input_mode": task.input_mode,
+                "comment_columns": ["Comment", task.original_comment_column] if task.input_mode == "bilingual" else ["Comment"],
+                "truncation_policy": "balanced_head_tail_per_view" if task.input_mode == "bilingual" else "comment_tail",
                 "label_order": list(task.labels),
                 "completion_token_ids": encoder.completions,
                 "completion_token_diagnostics": token_diagnostics,
@@ -1113,11 +2029,13 @@ def _run_seed_ensemble(
                 == 1,
                 "inference": (
                     "per-seed argmax mean token log P(answer including chat end | "
-                    "prompt), followed by hard majority vote"
+                    "prompt), followed by equal-weight plurality voting with "
+                    "Borda, normalized-score, and fixed-label-order tie-breaks"
                 ),
                 "probabilities": (
                     "softmax over mean token log likelihoods; mean probabilities "
-                    "are diagnostic only and do not determine the final vote"
+                    "are diagnostic only; tie score uses z-normalized raw mean "
+                    "token log likelihoods"
                 ),
                 "loss": "mean per-example answer-token NLL; not class cross-entropy",
                 "truncated_comments": {
@@ -1136,7 +2054,7 @@ def _run_seed_ensemble(
                 },
                 "input_sha256": {
                     name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
-                    for name in (*task.labeled_filenames(), task.prediction_filename)
+                    for name in (*labeled_input_filenames(task), task.prediction_filename)
                 },
                 "packages": {
                     name: version(name)
@@ -1153,7 +2071,8 @@ def _run_seed_ensemble(
         log(
             f"\n=== COMPLETE | {task.task_name} ===\n"
             f"Retrained seeds: {list(selection_seeds)}\n"
-            f"Voting rule: at least {len(selection_seeds) // 2 + 1} votes.\n"
+            "Voting rule: equal-weight plurality; ties use Borda, normalized "
+            "candidate score, then fixed label order.\n"
             f"Voting audit: {output_dir / 'voting_predictions.csv'}\n"
             f"Predictions: {csv_path}\nSubmission: {zip_path}",
             runtime,
@@ -1162,1197 +2081,30 @@ def _run_seed_ensemble(
     on_main(export_ensemble_artifacts, runtime)
 
 
-def _classification_metrics(
-    task: TaskConfig,
-    label_ids: np.ndarray,
-    probabilities: np.ndarray,
-    loss: float,
-) -> dict[str, object]:
-    """Compute the fixed-label metrics used for aggregated OOF predictions."""
-
-    labels = np.asarray(label_ids, dtype=np.int64)
-    predictions = np.asarray(probabilities).argmax(axis=1)
-    label_indices = list(range(len(task.labels)))
-    per_class_scores = f1_score(
-        labels,
-        predictions,
-        labels=label_indices,
-        average=None,
-        zero_division=0,
-    )
-    matrix = confusion_matrix(labels, predictions, labels=label_indices)
-    result: dict[str, object] = {
-        "loss": float(loss),
-        "macro_f1": float(
-            f1_score(
-                labels,
-                predictions,
-                labels=label_indices,
-                average="macro",
-                zero_division=0,
-            )
-        ),
-        "accuracy": float(accuracy_score(labels, predictions)),
-        "per_class_f1": {
-            label: float(score)
-            for label, score in zip(task.labels, per_class_scores, strict=True)
-        },
-        "confusion_matrix": {
-            "rows": "actual labels",
-            "columns": "predicted labels",
-            "label_order": list(task.labels),
-            "values": matrix.astype(int).tolist(),
-        },
-    }
-    if task.report_per_class_metrics:
-        precision, recall, class_f1, support = precision_recall_fscore_support(
-            labels,
-            predictions,
-            labels=label_indices,
-            zero_division=0,
-        )
-        result["per_class"] = {
-            label: {
-                "precision": float(precision[index]),
-                "recall": float(recall[index]),
-                "f1": float(class_f1[index]),
-                "support": int(support[index]),
-            }
-            for index, label in enumerate(task.labels)
-        }
-    return result
-
-
-def _class_weight_state(
-    task: TaskConfig, label_ids: np.ndarray
-) -> tuple[torch.Tensor | None, dict[str, object] | None]:
-    """Compute task-configured class weights and a JSON-safe audit summary."""
-
-    if task.class_weight_power is None:
-        return None, None
-    weights, counts = compute_class_weights(
-        label_ids,
-        len(task.labels),
-        task.class_weight_power,
-        task.class_weight_min,
-        task.class_weight_max,
-    )
-    summary: dict[str, object] = {
-        "formula": "clip((N / (K * n_c)) ** power, minimum, maximum), then normalize mean sample weight to 1",
-        "power": task.class_weight_power,
-        "pre_normalization_clip": [task.class_weight_min, task.class_weight_max],
-        "counts": {
-            label: int(count) for label, count in zip(task.labels, counts, strict=True)
-        },
-        "weights": {
-            label: float(weight)
-            for label, weight in zip(task.labels, weights.tolist(), strict=True)
-        },
-    }
-    return weights, summary
-
-
-def _write_prediction_diagnostics(
-    frame: pd.DataFrame,
-    task: TaskConfig,
-    probabilities: np.ndarray,
-    path: Path,
-) -> None:
-    """Write labels, folds and probabilities for OOF or ensemble auditing."""
-
-    label_ids = np.asarray(probabilities).argmax(axis=1)
-    data: dict[str, object] = {
-        "id": frame["id"].astype(str).tolist(),
-    }
-    if task.label_column in frame:
-        data["true_label"] = frame[task.label_column].tolist()
-    if "fold" in frame:
-        data["fold"] = frame["fold"].astype(int).tolist()
-    data["predicted_label"] = [task.labels[index] for index in label_ids]
-    for label_index, label in enumerate(task.labels):
-        safe_label = label.lower().replace("-", "_").replace(" ", "_")
-        data[f"prob_{safe_label}"] = probabilities[:, label_index]
-    pd.DataFrame(data).to_csv(
-        path,
-        index=False,
-        encoding="utf-8",
-        lineterminator="\n",
-    )
-
-
-def format_confusion_matrix(metrics: dict) -> list[str]:
-    """Render actual-label rows and predicted-label columns in Kaggle text logs."""
-
-    confusion = metrics["confusion_matrix"]
-    labels = confusion["label_order"]
-    matrix = np.asarray(confusion["values"], dtype=np.int64)
-    if matrix.shape != (len(labels), len(labels)):
-        raise ValueError("Confusion matrix shape does not match its label order.")
-    width = max(len("actual / predicted"), *(len(label) for label in labels)) + 2
-    lines = [
-        "Confusion matrix | rows=actual labels | columns=predicted labels",
-        "actual / predicted".ljust(width)
-        + "".join(label.rjust(width) for label in labels),
-    ]
-    lines.extend(
-        label.ljust(width) + "".join(str(int(value)).rjust(width) for value in row)
-        for label, row in zip(labels, matrix, strict=True)
-    )
-    return lines
-
-
-def log_classification_metrics(metrics: dict, heading: str, runtime: RuntimeContext) -> None:
-    """Print aggregate metrics, class metrics and both directions of confusion."""
-
-    log(
-        f"{heading}: val_loss={metrics['loss']:.5f}, "
-        f"macro_f1={metrics['macro_f1']:.5f}, accuracy={metrics['accuracy']:.5f}",
-        runtime,
-    )
-    for line in format_confusion_matrix(metrics) + format_per_class_diagnostics(metrics):
-        log(line, runtime)
-
-
-def public_validation_metrics(metrics: dict) -> dict:
-    """Exclude per-example score arrays from JSON training history."""
-
-    return {
-        key: metrics[key]
-        for key in (
-            "loss", "macro_f1", "accuracy", "per_class_f1", "per_class",
-            "confusion_matrix",
-        )
-        if key in metrics
-    }
-
-
-class TaskBValidationMonitor:
-    """Report external validation every epoch without affecting epoch selection."""
-
-    def __init__(
-        self, task, config, runtime, training_frame, encoder, collator,
-        prediction_frame=None,
-    ):
-        self.task = task
-        self.config = config
-        self.runtime = runtime
-        self.collator = collator
-        self.frame = load_epoch_validation_frame(task, prediction_frame)
-        overlap = set(training_frame["id"]) & set(self.frame["id"])
-        if overlap:
-            raise ValueError(
-                "Official validation IDs must not occur in training data: "
-                f"{sorted(overlap)[:10]}"
-            )
-        self.data = CompletionDataset.from_frame(self.frame, encoder)
-        path = resolve_data_file(task.epoch_validation_filename)
-        self.summary = {
-            "filename": task.epoch_validation_filename,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            "rows": len(self.frame),
-            "label_distribution": self.frame[task.label_column].value_counts().to_dict(),
-            "truncated_comments": self.data.truncated_count,
-            "purpose": "reporting only; never used for training or epoch selection",
-        }
-        log(
-            f"Task B per-epoch validation | file={task.epoch_validation_filename} "
-            f"| rows={len(self.data)} | reporting only",
-            runtime,
-        )
-
-    def evaluate(self, model, seed: int, epoch: int, output_dir: Path) -> dict:
-        heading = f"Official validation | seed={seed} | epoch={epoch}"
-        devices = (
-            [self.runtime.device.index] if self.runtime.device.type == "cuda" else []
-        )
-        was_training = model.training
-        # Diagnostic forwards must not advance the RNG used by subsequent training.
-        try:
-            with torch.random.fork_rng(devices=devices):
-                metrics = score_candidates(
-                    model, self.data, self.collator, self.config, self.runtime, heading
-                )
-        finally:
-            model.train(was_training)
-        log_classification_metrics(metrics, heading, self.runtime)
-
-        def export() -> None:
-            directory = output_dir / "official_validation"
-            directory.mkdir(parents=True, exist_ok=True)
-            write_validation_confusion_matrix(metrics["confusion_matrix"], epoch, directory)
-            _write_prediction_diagnostics(
-                self.frame, self.task, metrics["probabilities"],
-                directory / f"predictions_epoch_{epoch:02d}.csv",
-            )
-            _write_json(
-                directory / f"metrics_epoch_{epoch:02d}.json",
-                {"seed": seed, "epoch": epoch, **public_validation_metrics(metrics)},
-            )
-
-        on_main(export, self.runtime)
-        return metrics
-
-    def evaluate_ensemble(self, results: list[dict], output_dir: Path) -> dict:
-        probabilities = np.mean(
-            np.stack([row["validation_probabilities"] for row in results]), axis=0
-        )
-        # Ensemble loss here is mean gold-answer NLL of the component models.
-        metrics = _classification_metrics(
-            self.task, self.frame["label_id"].to_numpy(), probabilities,
-            float(np.mean([row["validation_loss"] for row in results])),
-        )
-        log_classification_metrics(metrics, "Official validation | FINAL SOFT ENSEMBLE", self.runtime)
-
-        def export() -> None:
-            _write_json(
-                output_dir / "official_validation_metrics.json",
-                {"dataset": self.summary, **public_validation_metrics(metrics)},
-            )
-            _write_prediction_diagnostics(
-                self.frame, self.task, probabilities,
-                output_dir / "official_validation_predictions.csv",
-            )
-
-        on_main(export, self.runtime)
-        return public_validation_metrics(metrics)
-
-
-def _run_fixed_epoch_full_retrain_ensemble(
-    *,
+def run_llm_task(
     task: TaskConfig,
     config: LLMTrainingConfig,
-    runtime: RuntimeContext,
-    frame: pd.DataFrame,
-    prediction_frame: pd.DataFrame,
-    prediction_data: CompletionDataset,
-    collator: CompletionCollator,
-    encoder: ChatEncoder,
-    tokenizer: object,
-    output_dir: Path,
-    checkpoint_dir: Path,
-    retrain_seeds: tuple[int, ...],
-    token_diagnostics: list[dict[str, object]],
-    fixed_epochs: int,
+    resume_sources: tuple[Path, ...] = (),
+    auto_resume: bool = True,
 ) -> None:
-    """Skip epoch selection and soft-ensemble fixed-epoch full-data models."""
-
-    if fixed_epochs < 1:
-        raise ValueError("fixed_full_retrain_epochs must be positive.")
-    if not task.full_retrain_soft_ensemble:
-        raise ValueError("Fixed full-data training requires soft ensembling.")
-    if len(retrain_seeds) < 2:
-        raise ValueError("A full-data soft ensemble requires at least two seeds.")
-    if task.selection_train_label_caps:
-        raise ValueError("Fixed class-weighted training cannot downsample labels.")
-    if task.class_weight_power is None:
-        raise ValueError("Fixed Task B training requires class-weighted loss.")
-
-    validation_monitor = TaskBValidationMonitor(
-        task, config, runtime, frame, encoder, collator, prediction_frame
-    )
-
-    full_train_data = CompletionDataset.from_frame(frame, encoder)
-    full_class_weights, full_class_weight_summary = _class_weight_state(
-        task, frame["label_id"].to_numpy()
-    )
-    log(
-        f"\n=== FIXED-EPOCH FULL-DATA EXPERIMENT | OOF SKIPPED "
-        f"| epochs={fixed_epochs} | models={len(retrain_seeds)} ===",
-        runtime,
-    )
-    log(
-        "Full-data class weights: "
-        + " | ".join(
-            f"{label}={full_class_weight_summary['weights'][label]:.4f}"
-            for label in task.labels
-        ),
-        runtime,
-    )
-
-    retrained_results = []
-    resolved_revision = None
-    parameter_counts = None
-    for seed_number, seed in enumerate(retrain_seeds, start=1):
-        seed_output_dir = output_dir / f"seed_{seed}"
-        seed_checkpoint_dir = checkpoint_dir / f"seed_{seed}"
-        final_adapter_dir = seed_checkpoint_dir / "final_full_data_adapter"
-        on_main(
-            partial(seed_output_dir.mkdir, parents=True, exist_ok=True), runtime
-        )
-        on_main(
-            partial(seed_checkpoint_dir.mkdir, parents=True, exist_ok=True), runtime
-        )
-        log(
-            f"\n=== FULL-DATA MODEL {seed_number}/{len(retrain_seeds)} "
-            f"| seed={seed} | rows={len(full_train_data)} "
-            f"| epochs={fixed_epochs} ===",
-            runtime,
-        )
-        set_global_seed(seed)
-        full_loader, full_sampler = create_train_loader(
-            full_train_data, collator, config, runtime, seed
-        )
-        loaded_model = load_lora_model(config, runtime)
-        if parameter_counts is None:
-            base = loaded_model.get_base_model()
-            resolved_revision = getattr(base.config, "_commit_hash", None)
-            parameter_counts = {
-                "trainable": sum(
-                    parameter.numel()
-                    for parameter in loaded_model.parameters()
-                    if parameter.requires_grad
-                ),
-                "reported_total": loaded_model.num_parameters(),
-            }
-            del base
-        model = _wrap_for_ddp(loaded_model, runtime)
-        optimizer, scheduler, scaler = _training_state(
-            model, full_loader, fixed_epochs, config, runtime
-        )
-        full_history = []
-        for epoch in range(1, fixed_epochs + 1):
-            if full_sampler is not None:
-                full_sampler.set_epoch(epoch)
-            train_loss = train_llm_epoch(
-                model,
-                full_loader,
-                optimizer,
-                scheduler,
-                scaler,
-                config,
-                runtime,
-                epoch,
-                f"Fixed full-data train seed {seed}",
-                class_weights=full_class_weights,
-            )
-            validation_metrics = validation_monitor.evaluate(
-                model, seed, epoch, seed_output_dir
-            )
-            full_history.append(
-                {
-                    "epoch": epoch, "train_weighted_loss": train_loss,
-                    "official_validation": public_validation_metrics(validation_metrics),
-                }
-            )
-            log(
-                f"Seed {seed} full-data epoch {epoch}/{fixed_epochs}: "
-                f"train_weighted_loss={train_loss:.5f}",
-                runtime,
-            )
-            on_main(
-                lambda seed_output_dir=seed_output_dir,
-                seed=seed,
-                full_history=list(full_history): _write_json(
-                    seed_output_dir / "full_data_training_history.json",
-                    {
-                        "seed": seed,
-                        "epoch_selection": "fixed_without_oof",
-                        "validation_dataset": validation_monitor.summary,
-                        "class_weighting": full_class_weight_summary,
-                        "epochs": full_history,
-                    },
-                ),
-                runtime,
-            )
-
-        del optimizer, scheduler, scaler
-        on_main(partial(save_adapter, model, tokenizer, final_adapter_dir), runtime)
-        restore_adapter(model, final_adapter_dir)
-        predictions = score_candidates(
-            model,
-            prediction_data,
-            collator,
-            config,
-            runtime,
-            f"Development prediction seed {seed}",
-        )
-        probabilities = predictions["probabilities"]
-        label_ids = probabilities.argmax(axis=1)
-        summary = {
-            "seed": seed,
-            "epochs": fixed_epochs,
-            "training_rows": len(full_train_data),
-            "checkpoint": str(final_adapter_dir),
-            "prediction_source": "seed_specific_full_data_adapter",
-        }
-
-        def export_seed_predictions(
-            seed_output_dir=seed_output_dir,
-            label_ids=label_ids,
-            summary=summary,
-        ) -> None:
-            write_submission(
-                prediction_frame["id"].tolist(),
-                [task.labels[index] for index in label_ids],
-                task.labels,
-                seed_output_dir,
-                task.submission_zip_name,
-            )
-            _write_json(seed_output_dir / "seed_summary.json", summary)
-
-        on_main(export_seed_predictions, runtime)
-        retrained_results.append(
-            {
-                "seed": seed,
-                "probabilities": probabilities,
-                "label_ids": label_ids,
-                "summary": summary,
-                "validation_probabilities": validation_metrics["probabilities"],
-                "validation_loss": validation_metrics["loss"],
-            }
-        )
-        del model, full_loader
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    ensemble_validation = validation_monitor.evaluate_ensemble(retrained_results, output_dir)
-    stacked_probabilities = np.stack(
-        [result["probabilities"] for result in retrained_results], axis=0
-    )
-    mean_probabilities = stacked_probabilities.mean(axis=0)
-    final_ids = mean_probabilities.argmax(axis=1)
-    final_labels = [task.labels[index] for index in final_ids]
-
-    def export_final_ensemble() -> None:
-        ensemble_data: dict[str, object] = {
-            "id": prediction_frame["id"].astype(str).tolist()
-        }
-        for result in retrained_results:
-            ensemble_data[f"seed_{result['seed']}"] = [
-                task.labels[index] for index in result["label_ids"]
-            ]
-        for label_index, label in enumerate(task.labels):
-            safe_label = label.lower().replace("-", "_").replace(" ", "_")
-            ensemble_data[f"mean_prob_{safe_label}"] = mean_probabilities[
-                :, label_index
-            ]
-            ensemble_data[f"votes_{safe_label}"] = np.sum(
-                np.stack(
-                    [result["label_ids"] for result in retrained_results], axis=0
-                )
-                == label_index,
-                axis=0,
-            )
-        ensemble_data["final_label"] = final_labels
-        pd.DataFrame(ensemble_data).to_csv(
-            output_dir / "ensemble_predictions.csv",
-            index=False,
-            encoding="utf-8",
-            lineterminator="\n",
-        )
-        csv_path, zip_path = write_submission(
-            prediction_frame["id"].tolist(),
-            final_labels,
-            task.labels,
-            output_dir,
-            task.submission_zip_name,
-        )
-        ensemble_summary = {
-            "method": "equal-weight mean of per-seed candidate probabilities",
-            "seeds": list(retrain_seeds),
-            "models": len(retrained_results),
-            "prediction_file": str(csv_path),
-            "audit_file": str(output_dir / "ensemble_predictions.csv"),
-            "submission": str(zip_path),
-        }
-        epoch_selection = {
-            "strategy": "fixed_without_oof",
-            "oof_skipped": True,
-            "fixed_epoch": fixed_epochs,
-        }
-        retrain_summaries = [result["summary"] for result in retrained_results]
-        _write_json(
-            checkpoint_dir / "metrics.json",
-            {
-                "epoch_selection": epoch_selection,
-                "full_data_retrains": retrain_summaries,
-                "ensemble": ensemble_summary,
-            },
-        )
-        _write_json(
-            output_dir / "run_summary.json",
-            {
-                "task": task.task_name,
-                "method": (
-                    "LoRA answer-only causal LM with fixed "
-                    f"{fixed_epochs}-epoch full-data soft seed ensemble"
-                ),
-                "model": config.model_name,
-                "resolved_model_revision": resolved_revision,
-                "world_size": runtime.world_size,
-                "compute_dtype": str(compute_dtype(config, runtime)),
-                "quantization": None,
-                "effective_train_batch_size": config.train_batch_size_per_gpu
-                * config.gradient_accumulation_steps
-                * runtime.world_size,
-                "epoch_selection": epoch_selection,
-                "official_validation": {
-                    "dataset": validation_monitor.summary,
-                    "ensemble_metrics": ensemble_validation,
-                },
-                "class_weighting": {
-                    "downsampling": None,
-                    "full_data": full_class_weight_summary,
-                },
-                "full_data_retrains": retrain_summaries,
-                "ensemble": ensemble_summary,
-                "development_rows": len(prediction_data),
-                "training_config": asdict(config),
-                "parameters": parameter_counts,
-                "system_prompt": encoder.system_text,
-                "prompt_input": {
-                    "raw_column": None if task.english_only_prompt else "Comment",
-                    "translation_column": task.translation_column,
-                    "english_only_prompt": task.english_only_prompt,
-                    "use_augmentation": task.use_augmentation,
-                    "truncation": (
-                        "truncate English comment; preserve chat and labels"
-                        if task.english_only_prompt else
-                        "share content budget between raw and English; preserve chat and labels"
-                    ),
-                },
-                "label_order": list(task.labels),
-                "completion_token_ids": encoder.completions,
-                "completion_token_diagnostics": token_diagnostics,
-                "inference": (
-                    "mean token log likelihood per allowed label, softmax per "
-                    "model, then equal-weight mean probabilities across seeds"
-                ),
-                "truncated_comments": {
-                    "full_train": full_train_data.truncated_count,
-                    "development": prediction_data.truncated_count,
-                },
-                "input_sha256": {
-                    name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
-                    for name in (*task.labeled_filenames(), task.prediction_filename)
-                },
-                "packages": {
-                    name: version(name)
-                    for name in (
-                        "torch",
-                        "transformers",
-                        "peft",
-                        "accelerate",
-                        "scikit-learn",
-                    )
-                },
-            },
-        )
-        log(
-            f"\n=== COMPLETE | {task.task_name} ===\n"
-            f"OOF selection skipped; fixed full-data epochs: {fixed_epochs}\n"
-            f"Full-data seeds: {list(retrain_seeds)}\n"
-            f"Ensemble: equal-weight soft probability mean\n"
-            f"Predictions: {csv_path}\nSubmission: {zip_path}",
-            runtime,
-        )
-
-    on_main(export_final_ensemble, runtime)
-
-
-def _run_oof_full_retrain_ensemble(
-    *,
-    task: TaskConfig,
-    config: LLMTrainingConfig,
-    runtime: RuntimeContext,
-    frame: pd.DataFrame,
-    prediction_frame: pd.DataFrame,
-    prediction_data: CompletionDataset,
-    collator: CompletionCollator,
-    encoder: ChatEncoder,
-    tokenizer: object,
-    output_dir: Path,
-    checkpoint_dir: Path,
-    retrain_seeds: tuple[int, ...],
-    token_diagnostics: list[dict[str, object]],
-) -> None:
-    """Select one epoch with five-fold OOF, then soft-ensemble full-data seeds."""
-
-    folds = task.oof_validation_folds
-    configured_folds = tuple(range(1, len(task.original_fold_filenames) + 1))
-    if tuple(sorted(folds)) != configured_folds or len(set(folds)) != len(folds):
-        raise ValueError("OOF validation folds must contain every configured fold once.")
-    if not task.full_retrain_soft_ensemble:
-        raise ValueError("OOF Task B requires full_retrain_soft_ensemble=True.")
-    if len(retrain_seeds) < 2:
-        raise ValueError("A full-data soft ensemble requires at least two seeds.")
-    if task.selection_train_label_caps:
-        raise ValueError("OOF class-weighted training cannot also downsample labels.")
-    if task.class_weight_power is None:
-        raise ValueError("OOF Task B requires class-weighted loss.")
-
-    n_labels = len(task.labels)
-    fold_epoch_outputs: list[dict[str, object]] = []
-    fold_summaries: list[dict[str, object]] = []
-    resolved_revision = None
-    parameter_counts = None
-
-    log(
-        f"\n=== PHASE 1/2 | {len(folds)}-FOLD OOF EPOCH SELECTION "
-        f"| fixed selection seed={config.seed} ===",
-        runtime,
-    )
-    for fold_number, validation_fold in enumerate(folds, start=1):
-        train_indices, validation_indices = predefined_fold_indices(
-            frame["fold"].to_numpy(),
-            validation_fold,
-            frame["data_origin"].to_numpy(),
-            task.selection_validation_data_origins,
-        )
-        train_frame = frame.iloc[train_indices]
-        validation_frame = frame.iloc[validation_indices]
-        train_data = CompletionDataset.from_frame(train_frame, encoder)
-        validation_data = CompletionDataset.from_frame(validation_frame, encoder)
-        class_weights, class_weight_summary = _class_weight_state(
-            task, train_frame["label_id"].to_numpy()
-        )
-        if class_weight_summary is not None:
-            log(
-                f"OOF fold {validation_fold} class weights: "
-                + " | ".join(
-                    f"{label}={class_weight_summary['weights'][label]:.4f}"
-                    for label in task.labels
-                ),
-                runtime,
-            )
-
-        set_global_seed(config.seed)
-        train_loader, train_sampler = create_train_loader(
-            train_data, collator, config, runtime, config.seed
-        )
-        model = load_lora_model(config, runtime)
-        if parameter_counts is None:
-            base = model.get_base_model()
-            resolved_revision = getattr(base.config, "_commit_hash", None)
-            parameter_counts = {
-                "trainable": sum(
-                    parameter.numel()
-                    for parameter in model.parameters()
-                    if parameter.requires_grad
-                ),
-                "reported_total": model.num_parameters(),
-            }
-            del base
-        model = _wrap_for_ddp(model, runtime)
-        optimizer, scheduler, scaler = _training_state(
-            model, train_loader, config.max_epochs, config, runtime
-        )
-        fold_history = []
-        epoch_outputs = []
-        log(
-            f"\n--- OOF fold {fold_number}/{len(folds)} | validation fold="
-            f"{validation_fold} | train={len(train_data)} | "
-            f"validation={len(validation_data)} ---",
-            runtime,
-        )
-        for epoch in range(1, config.max_epochs + 1):
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch)
-            train_loss = train_llm_epoch(
-                model,
-                train_loader,
-                optimizer,
-                scheduler,
-                scaler,
-                config,
-                runtime,
-                epoch,
-                f"OOF fold {validation_fold}",
-                class_weights=class_weights,
-            )
-            metrics = score_candidates(
-                model,
-                validation_data,
-                collator,
-                config,
-                runtime,
-                f"OOF fold {validation_fold} epoch {epoch} validation",
-            )
-            public_record = {
-                "epoch": epoch,
-                "train_weighted_loss": train_loss,
-                **{
-                    key: metrics[key]
-                    for key in (
-                        "loss",
-                        "macro_f1",
-                        "accuracy",
-                        "per_class_f1",
-                        "confusion_matrix",
-                    )
-                },
-            }
-            if "per_class" in metrics:
-                public_record["per_class"] = metrics["per_class"]
-            fold_history.append(public_record)
-            epoch_outputs.append(
-                {
-                    "epoch": epoch,
-                    "validation_indices": validation_indices,
-                    "probabilities": metrics["probabilities"],
-                    "loss": metrics["loss"],
-                }
-            )
-            log(
-                f"OOF fold {validation_fold} epoch {epoch}: "
-                f"train_weighted_loss={train_loss:.5f}, "
-                f"val_loss={metrics['loss']:.5f}, "
-                f"macro_f1={metrics['macro_f1']:.5f}, "
-                f"accuracy={metrics['accuracy']:.5f}",
-                runtime,
-            )
-
-        fold_output_dir = output_dir / f"oof_fold_{validation_fold}"
-
-        def export_fold_history(
-            fold_output_dir=fold_output_dir,
-            validation_fold=validation_fold,
-            fold_history=fold_history,
-            class_weight_summary=class_weight_summary,
-        ) -> None:
-            fold_output_dir.mkdir(parents=True, exist_ok=True)
-            _write_json(
-                fold_output_dir / "selection_training_history.json",
-                {
-                    "validation_fold": validation_fold,
-                    "selection_seed": config.seed,
-                    "class_weighting": class_weight_summary,
-                    "epochs": fold_history,
-                },
-            )
-
-        on_main(export_fold_history, runtime)
-        fold_epoch_outputs.extend(epoch_outputs)
-        fold_summaries.append(
-            {
-                "validation_fold": validation_fold,
-                "selection_seed": config.seed,
-                "train_rows": len(train_data),
-                "validation_rows": len(validation_data),
-                "train_label_distribution": train_frame[task.label_column]
-                .value_counts()
-                .to_dict(),
-                "validation_label_distribution": validation_frame[task.label_column]
-                .value_counts()
-                .to_dict(),
-                "class_weighting": class_weight_summary,
-                "truncated_train_comments": train_data.truncated_count,
-                "truncated_validation_comments": validation_data.truncated_count,
-            }
-        )
-        del model, optimizer, scheduler, scaler, train_loader, train_data, validation_data
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    original_indices = np.flatnonzero(
-        frame["data_origin"].to_numpy() == "original"
-    ).astype(np.int64)
-    original_labels = frame.iloc[original_indices]["label_id"].to_numpy()
-    oof_history = []
-    oof_probabilities_by_epoch: dict[int, np.ndarray] = {}
-    best_epoch, best_metric, best_loss = 0, -math.inf, math.inf
-    for epoch in range(1, config.max_epochs + 1):
-        probabilities_by_row = np.full((len(frame), n_labels), np.nan, dtype=np.float64)
-        seen = np.zeros(len(frame), dtype=bool)
-        loss_sum = 0.0
-        validation_rows = 0
-        for output in fold_epoch_outputs:
-            if output["epoch"] != epoch:
-                continue
-            indices = output["validation_indices"]
-            if seen[indices].any():
-                raise RuntimeError("An original row received duplicate OOF predictions.")
-            probabilities_by_row[indices] = output["probabilities"]
-            seen[indices] = True
-            loss_sum += float(output["loss"]) * len(indices)
-            validation_rows += len(indices)
-        if validation_rows != len(original_indices) or not seen[original_indices].all():
-            raise RuntimeError("OOF predictions do not cover every original row exactly once.")
-        probabilities = probabilities_by_row[original_indices]
-        metrics = _classification_metrics(
-            task,
-            original_labels,
-            probabilities,
-            loss_sum / validation_rows,
-        )
-        record = {"epoch": epoch, **metrics}
-        oof_history.append(record)
-        oof_probabilities_by_epoch[epoch] = probabilities
-        log(
-            f"OOF aggregate epoch {epoch}: loss={metrics['loss']:.5f}, "
-            f"macro_f1={metrics['macro_f1']:.5f}, "
-            f"accuracy={metrics['accuracy']:.5f}",
-            runtime,
-        )
-        if is_better_checkpoint(
-            metrics["macro_f1"], metrics["loss"], best_metric, best_loss
-        ):
-            best_epoch = epoch
-            best_metric = metrics["macro_f1"]
-            best_loss = metrics["loss"]
-
-    best_oof_record = oof_history[best_epoch - 1]
-    original_frame = frame.iloc[original_indices]
-
-    def export_oof_artifacts() -> None:
-        scalar_rows = [
-            {
-                "epoch": record["epoch"],
-                "loss": record["loss"],
-                "macro_f1": record["macro_f1"],
-                "accuracy": record["accuracy"],
-                "selected": record["epoch"] == best_epoch,
-            }
-            for record in oof_history
-        ]
-        pd.DataFrame(scalar_rows).to_csv(
-            output_dir / "oof_epoch_results.csv", index=False, encoding="utf-8"
-        )
-        _write_json(
-            output_dir / "oof_selection_summary.json",
-            {
-                "selection_rule": (
-                    "highest aggregate OOF macro_f1; lowest aggregate OOF loss "
-                    "breaks exact ties"
-                ),
-                "selection_seed": config.seed,
-                "validation_folds": list(folds),
-                "best_epoch": best_epoch,
-                "best_macro_f1": best_metric,
-                "best_loss": best_loss,
-                "folds": fold_summaries,
-                "epochs": oof_history,
-            },
-        )
-        write_validation_confusion_history(oof_history, output_dir)
-        for record in oof_history:
-            write_validation_confusion_matrix(
-                record["confusion_matrix"], record["epoch"], output_dir
-            )
-            _write_prediction_diagnostics(
-                original_frame,
-                task,
-                oof_probabilities_by_epoch[record["epoch"]],
-                output_dir / f"oof_predictions_epoch_{record['epoch']}.csv",
-            )
-        _write_prediction_diagnostics(
-            original_frame,
-            task,
-            oof_probabilities_by_epoch[best_epoch],
-            output_dir / "oof_predictions.csv",
-        )
-        for validation_fold in folds:
-            fold_indices = np.flatnonzero(
-                original_frame["fold"].to_numpy() == validation_fold
-            )
-            _write_prediction_diagnostics(
-                original_frame.iloc[fold_indices],
-                task,
-                oof_probabilities_by_epoch[best_epoch][fold_indices],
-                output_dir
-                / f"oof_fold_{validation_fold}"
-                / "validation_predictions.csv",
-            )
-
-    on_main(export_oof_artifacts, runtime)
-    log(
-        f"\nOOF selected global epoch={best_epoch}, "
-        f"Macro-F1={best_metric:.5f}, loss={best_loss:.5f}.",
-        runtime,
-    )
-
-    full_train_data = CompletionDataset.from_frame(frame, encoder)
-    full_class_weights, full_class_weight_summary = _class_weight_state(
-        task, frame["label_id"].to_numpy()
-    )
-    log(
-        "Full-data class weights: "
-        + " | ".join(
-            f"{label}={full_class_weight_summary['weights'][label]:.4f}"
-            for label in task.labels
-        ),
-        runtime,
-    )
-    retrained_results = []
-    for seed_number, seed in enumerate(retrain_seeds, start=1):
-        seed_output_dir = output_dir / f"seed_{seed}"
-        seed_checkpoint_dir = checkpoint_dir / f"seed_{seed}"
-        final_adapter_dir = seed_checkpoint_dir / "final_full_data_adapter"
-        on_main(
-            partial(seed_output_dir.mkdir, parents=True, exist_ok=True), runtime
-        )
-        on_main(
-            partial(seed_checkpoint_dir.mkdir, parents=True, exist_ok=True), runtime
-        )
-        log(
-            f"\n=== PHASE 2/2 | FULL-DATA MODEL {seed_number}/{len(retrain_seeds)} "
-            f"| seed={seed} | rows={len(full_train_data)} | epochs={best_epoch} ===",
-            runtime,
-        )
-        set_global_seed(seed)
-        full_loader, full_sampler = create_train_loader(
-            full_train_data, collator, config, runtime, seed
-        )
-        model = _wrap_for_ddp(load_lora_model(config, runtime), runtime)
-        optimizer, scheduler, scaler = _training_state(
-            model, full_loader, best_epoch, config, runtime
-        )
-        full_history = []
-        for epoch in range(1, best_epoch + 1):
-            if full_sampler is not None:
-                full_sampler.set_epoch(epoch)
-            train_loss = train_llm_epoch(
-                model,
-                full_loader,
-                optimizer,
-                scheduler,
-                scaler,
-                config,
-                runtime,
-                epoch,
-                f"Full-data retrain seed {seed}",
-                class_weights=full_class_weights,
-            )
-            full_history.append(
-                {"epoch": epoch, "train_weighted_loss": train_loss}
-            )
-            log(
-                f"Seed {seed} full-data epoch {epoch}/{best_epoch}: "
-                f"train_weighted_loss={train_loss:.5f}",
-                runtime,
-            )
-            on_main(
-                lambda seed_output_dir=seed_output_dir,
-                seed=seed,
-                full_history=list(full_history): _write_json(
-                    seed_output_dir / "full_data_training_history.json",
-                    {
-                        "seed": seed,
-                        "class_weighting": full_class_weight_summary,
-                        "epochs": full_history,
-                    },
-                ),
-                runtime,
-            )
-
-        del optimizer, scheduler, scaler
-        on_main(partial(save_adapter, model, tokenizer, final_adapter_dir), runtime)
-        restore_adapter(model, final_adapter_dir)
-        predictions = score_candidates(
-            model,
-            prediction_data,
-            collator,
-            config,
-            runtime,
-            f"Development prediction seed {seed}",
-        )
-        probabilities = predictions["probabilities"]
-        label_ids = probabilities.argmax(axis=1)
-        summary = {
-            "seed": seed,
-            "epochs": best_epoch,
-            "training_rows": len(full_train_data),
-            "checkpoint": str(final_adapter_dir),
-            "prediction_source": "seed_specific_full_data_adapter",
-        }
-
-        def export_seed_predictions(
-            seed_output_dir=seed_output_dir,
-            label_ids=label_ids,
-            summary=summary,
-        ) -> None:
-            write_submission(
-                prediction_frame["id"].tolist(),
-                [task.labels[index] for index in label_ids],
-                task.labels,
-                seed_output_dir,
-                task.submission_zip_name,
-            )
-            _write_json(seed_output_dir / "seed_summary.json", summary)
-
-        on_main(export_seed_predictions, runtime)
-        retrained_results.append(
-            {
-                "seed": seed,
-                "probabilities": probabilities,
-                "label_ids": label_ids,
-                "summary": summary,
-            }
-        )
-        del model, full_loader
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    stacked_probabilities = np.stack(
-        [result["probabilities"] for result in retrained_results], axis=0
-    )
-    mean_probabilities = stacked_probabilities.mean(axis=0)
-    final_ids = mean_probabilities.argmax(axis=1)
-    final_labels = [task.labels[index] for index in final_ids]
-
-    def export_final_ensemble() -> None:
-        ensemble_data: dict[str, object] = {
-            "id": prediction_frame["id"].astype(str).tolist()
-        }
-        for result in retrained_results:
-            ensemble_data[f"seed_{result['seed']}"] = [
-                task.labels[index] for index in result["label_ids"]
-            ]
-        for label_index, label in enumerate(task.labels):
-            safe_label = label.lower().replace("-", "_").replace(" ", "_")
-            ensemble_data[f"mean_prob_{safe_label}"] = mean_probabilities[
-                :, label_index
-            ]
-            ensemble_data[f"votes_{safe_label}"] = np.sum(
-                np.stack(
-                    [result["label_ids"] for result in retrained_results], axis=0
-                )
-                == label_index,
-                axis=0,
-            )
-        ensemble_data["final_label"] = final_labels
-        pd.DataFrame(ensemble_data).to_csv(
-            output_dir / "ensemble_predictions.csv",
-            index=False,
-            encoding="utf-8",
-            lineterminator="\n",
-        )
-        csv_path, zip_path = write_submission(
-            prediction_frame["id"].tolist(),
-            final_labels,
-            task.labels,
-            output_dir,
-            task.submission_zip_name,
-        )
-        ensemble_summary = {
-            "method": "equal-weight mean of per-seed candidate probabilities",
-            "seeds": list(retrain_seeds),
-            "models": len(retrained_results),
-            "prediction_file": str(csv_path),
-            "audit_file": str(output_dir / "ensemble_predictions.csv"),
-            "submission": str(zip_path),
-        }
-        retrain_summaries = [result["summary"] for result in retrained_results]
-        _write_json(
-            checkpoint_dir / "metrics.json",
-            {
-                "oof_selection": best_oof_record,
-                "full_data_retrains": retrain_summaries,
-                "ensemble": ensemble_summary,
-            },
-        )
-        _write_json(
-            output_dir / "run_summary.json",
-            {
-                "task": task.task_name,
-                "method": (
-                    "LoRA answer-only causal LM with five-fold OOF epoch "
-                    "selection and full-data soft seed ensemble"
-                ),
-                "model": config.model_name,
-                "resolved_model_revision": resolved_revision,
-                "world_size": runtime.world_size,
-                "compute_dtype": str(compute_dtype(config, runtime)),
-                "quantization": None,
-                "effective_train_batch_size": config.train_batch_size_per_gpu
-                * config.gradient_accumulation_steps
-                * runtime.world_size,
-                "oof": {
-                    "selection_seed": config.seed,
-                    "validation_folds": list(folds),
-                    "validation_origins": list(
-                        task.selection_validation_data_origins
-                    ),
-                    "best_epoch": best_epoch,
-                    "best_macro_f1": best_metric,
-                    "best_loss": best_loss,
-                    "original_rows": len(original_indices),
-                    "folds": fold_summaries,
-                    "epochs": oof_history,
-                },
-                "class_weighting": {
-                    "downsampling": None,
-                    "full_data": full_class_weight_summary,
-                },
-                "full_data_retrains": retrain_summaries,
-                "ensemble": ensemble_summary,
-                "development_rows": len(prediction_data),
-                "training_config": asdict(config),
-                "parameters": parameter_counts,
-                "system_prompt": encoder.system_text,
-                "label_order": list(task.labels),
-                "completion_token_ids": encoder.completions,
-                "completion_token_diagnostics": token_diagnostics,
-                "inference": (
-                    "mean token log likelihood per allowed code, softmax per model, "
-                    "then equal-weight mean probabilities across full-data seeds"
-                ),
-                "truncated_comments": {
-                    "full_train": full_train_data.truncated_count,
-                    "development": prediction_data.truncated_count,
-                },
-                "input_sha256": {
-                    name: hashlib.sha256(resolve_data_file(name).read_bytes()).hexdigest()
-                    for name in (*task.labeled_filenames(), task.prediction_filename)
-                },
-                "packages": {
-                    name: version(name)
-                    for name in (
-                        "torch",
-                        "transformers",
-                        "peft",
-                        "accelerate",
-                        "scikit-learn",
-                    )
-                },
-            },
-        )
-        log(
-            f"\n=== COMPLETE | {task.task_name} ===\n"
-            f"OOF best epoch: {best_epoch} | Macro-F1={best_metric:.5f}\n"
-            f"Full-data seeds: {list(retrain_seeds)}\n"
-            f"Ensemble: equal-weight soft probability mean\n"
-            f"Predictions: {csv_path}\nSubmission: {zip_path}",
-            runtime,
-        )
-
-    on_main(export_final_ensemble, runtime)
-
-
-def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
     """Select epochs, retrain configured seeds, then predict development."""
 
     validate_config(config)
+    if task.full_retrain_soft_ensemble or task.fixed_full_retrain_epochs is not None:
+        from src.task_b_training import run_task_b
+
+        run_task_b(task, config, resume_sources, auto_resume)
+        return
     selection_seeds = task.selection_seeds or (config.seed,)
     if len(set(selection_seeds)) != len(selection_seeds):
         raise ValueError("selection_seeds must not contain duplicates")
     if any(seed < 0 for seed in selection_seeds):
         raise ValueError("selection_seeds must contain non-negative integers")
     if task.ensemble_all_seeds:
-        if len(selection_seeds) % 2 == 0:
-            raise ValueError("ensemble_all_seeds requires an odd number of seeds")
-        if set(task.labels) != {"Non-Hate", "Hate"} or len(task.labels) != 2:
-            raise ValueError(
-                "ensemble_all_seeds currently supports binary Non-Hate/Hate only"
-            )
-    if task.fixed_full_retrain_epochs is not None:
-        if task.fixed_full_retrain_epochs < 1:
-            raise ValueError("fixed_full_retrain_epochs must be positive")
-        if task.ensemble_all_seeds:
-            raise ValueError(
-                "Fixed full-data soft ensembling and binary hard voting are exclusive."
-            )
-        if not task.original_fold_filenames:
-            raise ValueError("Fixed full-data training requires predefined fold files.")
-        if not task.full_retrain_soft_ensemble:
-            raise ValueError("Fixed full-data training requires a soft ensemble.")
-    if task.oof_validation_folds:
-        if task.ensemble_all_seeds:
-            raise ValueError("OOF soft ensembling and binary hard voting are exclusive.")
-        if not task.original_fold_filenames:
-            raise ValueError("OOF selection requires predefined fold files.")
-        if not task.full_retrain_soft_ensemble:
-            raise ValueError("OOF selection requires a full-data soft ensemble.")
+        if len(selection_seeds) < 2:
+            raise ValueError("ensemble_all_seeds requires at least two seeds")
+        if len(task.labels) == 2 and len(selection_seeds) % 2 == 0:
+            raise ValueError("Binary seed ensembling requires an odd number of seeds")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     runtime = initialize_runtime()
     try:
@@ -2373,30 +2125,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         for name, data in (("train", frame), ("development", prediction_frame)):
             if data.empty:
                 raise ValueError(f"{name} input must contain at least one row.")
-        if task.translation_column:
-            prompt_description = (
-                f"English {task.translation_column} only"
-                if task.english_only_prompt else
-                f"raw Comment + English {task.translation_column}"
-            )
-            log(
-                f"Task B inputs | original-only={not task.use_augmentation} "
-                f"| train={len(frame)} | development={len(prediction_frame)} "
-                f"| prompt={prompt_description}",
-                runtime,
-            )
-        if task.fixed_full_retrain_epochs is not None:
-            base_train_indices = val_indices = None
-            split_strategy = "fixed_epoch_full_data"
-            split_heading = (
-                f"OOF skipped / full-data retrain for "
-                f"{task.fixed_full_retrain_epochs} fixed epoch(s)"
-            )
-        elif task.oof_validation_folds:
-            base_train_indices = val_indices = None
-            split_strategy = "five_fold_oof"
-            split_heading = "five-fold OOF epoch selection"
-        elif task.selection_validation_fold is None:
+        if task.selection_validation_fold is None:
             base_train_indices, val_indices = stratified_holdout_indices(
                 frame["label_id"].to_numpy(), config.validation_size, config.seed
             )
@@ -2432,7 +2161,11 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         encoder = ChatEncoder(tokenizer, task, config.max_length)
         token_diagnostics = completion_token_diagnostics(encoder)
         log_completion_token_diagnostics(token_diagnostics, runtime)
-        prediction_data = CompletionDataset.from_frame(prediction_frame, encoder, labeled=False)
+        val_frame = frame.iloc[val_indices]
+        val_data = CompletionDataset(
+            prompt_inputs(val_frame, task), encoder, val_frame["label_id"].tolist()
+        )
+        prediction_data = CompletionDataset(prompt_inputs(prediction_frame, task), encoder)
         collator = CompletionCollator(tokenizer.pad_token_id)
 
         output_dir = OUTPUT_ROOT / task.output_subdir
@@ -2441,45 +2174,46 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         on_main(lambda: output_dir.mkdir(parents=True, exist_ok=True), runtime)
         on_main(lambda: checkpoint_dir.mkdir(parents=True, exist_ok=True), runtime)
 
-        if task.fixed_full_retrain_epochs is not None:
-            _run_fixed_epoch_full_retrain_ensemble(
-                task=task,
-                config=config,
-                runtime=runtime,
-                frame=frame,
-                prediction_frame=prediction_frame,
-                prediction_data=prediction_data,
-                collator=collator,
-                encoder=encoder,
-                tokenizer=tokenizer,
-                output_dir=output_dir,
-                checkpoint_dir=checkpoint_dir,
-                retrain_seeds=selection_seeds,
-                token_diagnostics=token_diagnostics,
-                fixed_epochs=task.fixed_full_retrain_epochs,
-            )
-            return
+        training_sha256, prediction_sha256 = _input_hashes(task)
+        resume_signature = _resume_signature(
+            task, config, training_sha256, runtime
+        )
+        discovered_sources = list(resume_sources)
+        kaggle_input = Path("/kaggle/input")
+        if auto_resume and kaggle_input.is_dir():
+            discovered_sources.append(kaggle_input)
+        # Preserve order while avoiding an expensive duplicate recursive scan.
+        discovered_sources = list(dict.fromkeys(discovered_sources))
+        catalog_manifest = checkpoint_dir / "resume_catalog.json"
 
-        if task.oof_validation_folds:
-            _run_oof_full_retrain_ensemble(
-                task=task,
-                config=config,
-                runtime=runtime,
-                frame=frame,
-                prediction_frame=prediction_frame,
-                prediction_data=prediction_data,
-                collator=collator,
-                encoder=encoder,
-                tokenizer=tokenizer,
-                output_dir=output_dir,
-                checkpoint_dir=checkpoint_dir,
-                retrain_seeds=selection_seeds,
-                token_diagnostics=token_diagnostics,
+        def prepare_catalog() -> None:
+            scratch = Path(
+                os.getenv(
+                    "HASTIKA_RESUME_CACHE_DIR",
+                    f"/tmp/hastika_resume_cache/{task.checkpoint_subdir}",
+                )
             )
-            return
+            if scratch.exists():
+                shutil.rmtree(scratch)
+            catalogs = prepare_resume_catalogs(
+                discovered_sources,
+                scratch,
+                task.output_subdir,
+                task.checkpoint_subdir,
+            )
+            write_catalog_manifest(catalog_manifest, catalogs)
 
-        val_frame = frame.iloc[val_indices]
-        val_data = CompletionDataset.from_frame(val_frame, encoder)
+        on_main(prepare_catalog, runtime)
+        synchronize(runtime)
+        resume_catalogs = [
+            ResumeCatalog("current run", output_dir, checkpoint_dir),
+            *read_catalog_manifest(catalog_manifest),
+        ]
+        log(
+            f"Resume scan: {len(resume_catalogs) - 1} reusable result tree(s) "
+            f"from {len(discovered_sources)} source(s).",
+            runtime,
+        )
 
         seed_results = []
         resolved_revision = None
@@ -2501,7 +2235,11 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 assume_unique=True,
             )
             train_frame = frame.iloc[train_indices]
-            selection_train_data = CompletionDataset.from_frame(train_frame, encoder)
+            selection_train_data = CompletionDataset(
+                prompt_inputs(train_frame, task),
+                encoder,
+                train_frame["label_id"].tolist(),
+            )
             multiple_seeds = len(selection_seeds) > 1
             seed_output_dir = (
                 output_dir / f"seed_{selection_seed}"
@@ -2554,6 +2292,44 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     runtime,
                 )
 
+            completed_selection = _completed_selection_from_catalogs(
+                catalogs=resume_catalogs,
+                seed=selection_seed,
+                frame=frame,
+                val_frame=val_frame,
+                task=task,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                downsampled_indices=downsampled_indices,
+                full_train_indices=full_train_indices,
+                train_frame=train_frame,
+                selection_train_truncated=selection_train_data.truncated_count,
+                seed_output_dir=seed_output_dir,
+                seed_checkpoint_dir=seed_checkpoint_dir,
+                expected_signature=resume_signature,
+            )
+            if completed_selection is not None:
+                resumed_result, source, source_output = completed_selection
+                on_main(
+                    partial(copy_seed_outputs, source_output, seed_output_dir), runtime
+                )
+                seed_results.append(resumed_result)
+                log(
+                    f"RESUME | seed={selection_seed} | phase 1 already complete; "
+                    f"reused from {source} (no selection training).",
+                    runtime,
+                )
+                if resumed_result["validation_recovery"] != "exact":
+                    log(
+                        f"RESUME | seed={selection_seed} | per-row validation "
+                        "predictions were absent; scalar holdout metrics and "
+                        "best_epoch remain exact, while the reporting-only CSV "
+                        "uses a uniform placeholder.",
+                        runtime,
+                    )
+                del selection_train_data
+                continue
+
             selection_loader, selection_sampler = create_train_loader(
                 selection_train_data, collator, config, runtime, selection_seed
             )
@@ -2574,9 +2350,104 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
             optimizer, scheduler, scaler = _training_state(
                 selection_model, selection_loader, config.max_epochs, config, runtime
             )
+            selection_history: list[dict] = []
+            completed_epoch = 0
+            best_adapter_load_dir = selection_adapter_dir
+            exact_checkpoint = _latest_phase_checkpoint(
+                resume_catalogs,
+                selection_seed,
+                "selection",
+                resume_signature,
+                config.max_epochs,
+                runtime.world_size,
+            )
+            if exact_checkpoint is not None:
+                checkpoint, source = exact_checkpoint
+                try:
+                    completed_epoch, selection_history = _restore_epoch_resume(
+                        checkpoint=checkpoint,
+                        expected_signature=resume_signature,
+                        expected_total_epochs=config.max_epochs,
+                        model=selection_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        loader=selection_loader,
+                        runtime=runtime,
+                    )
+                    source_best = checkpoint.parents[2] / "best_holdout_adapter"
+                    if source_best.is_dir():
+                        best_adapter_load_dir = source_best
+                    log(
+                        f"RESUME | seed={selection_seed} | exact phase-1 state "
+                        f"after epoch {completed_epoch} from {source}.",
+                        runtime,
+                    )
+                except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                    log(
+                        f"Resume checkpoint rejected for seed {selection_seed}: {exc}. "
+                        "Starting phase 1 normally.",
+                        runtime,
+                    )
+                    del selection_model, optimizer, scheduler, scaler
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    set_global_seed(selection_seed)
+                    selection_model = _wrap_for_ddp(
+                        load_lora_model(config, runtime), runtime
+                    )
+                    optimizer, scheduler, scaler = _training_state(
+                        selection_model,
+                        selection_loader,
+                        config.max_epochs,
+                        config,
+                        runtime,
+                    )
+                    selection_history = []
+                    completed_epoch = 0
+            elif task.input_mode != "bilingual" and (legacy := _legacy_partial_selection(
+                catalogs=resume_catalogs,
+                seed=selection_seed,
+                frame=frame,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                downsampled_indices=downsampled_indices,
+            )) is not None:
+                legacy_history, legacy_adapter, legacy_output, source = legacy
+                restore_adapter(selection_model, legacy_adapter)
+                selection_history = legacy_history[: config.max_epochs]
+                completed_epoch = min(len(selection_history), config.max_epochs)
+                best_adapter_load_dir = legacy_adapter
+                on_main(
+                    partial(copy_seed_outputs, legacy_output, seed_output_dir),
+                    runtime,
+                )
+                log(
+                    f"RESUME | seed={selection_seed} | legacy phase-1 artifacts "
+                    f"through epoch {completed_epoch} from {source}. Adapter weights "
+                    "were reused; optimizer/scheduler state was unavailable.",
+                    runtime,
+                )
+
             best_metric, best_loss, best_epoch, stale = -math.inf, math.inf, 0, 0
-            selection_history = []
-            for epoch in range(1, config.max_epochs + 1):
+            for record in selection_history:
+                if is_better_checkpoint(
+                    record["macro_f1"], record["loss"], best_metric, best_loss
+                ):
+                    best_metric, best_loss, best_epoch, stale = (
+                        record["macro_f1"],
+                        record["loss"],
+                        int(record["epoch"]),
+                        0,
+                    )
+                else:
+                    stale += 1
+            last_epoch = (
+                completed_epoch
+                if stale >= config.early_stopping_patience
+                else config.max_epochs
+            )
+            for epoch in range(completed_epoch + 1, last_epoch + 1):
                 if selection_sampler is not None:
                     selection_sampler.set_epoch(epoch)
                 train_loss = train_llm_epoch(
@@ -2663,16 +2534,31 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         ),
                         runtime,
                     )
+                    best_adapter_load_dir = selection_adapter_dir
                 else:
                     stale += 1
                 on_main(
                     lambda seed_output_dir=seed_output_dir,
-                    selection_history=selection_history,
-                    selection_seed=selection_seed: _write_json(
+                    selection_history=selection_history: _write_json(
                         seed_output_dir / "selection_training_history.json",
                         {"seed": selection_seed, "epochs": selection_history},
                     ),
                     runtime,
+                )
+                _save_epoch_resume(
+                    phase="selection",
+                    epoch=epoch,
+                    total_epochs=config.max_epochs,
+                    model=selection_model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    loader=selection_loader,
+                    history=list(selection_history),
+                    seed_checkpoint_dir=seed_checkpoint_dir,
+                    signature=resume_signature,
+                    runtime=runtime,
                 )
                 if stale >= config.early_stopping_patience:
                     log(
@@ -2682,7 +2568,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     break
 
             del optimizer, scheduler, scaler
-            restore_adapter(selection_model, selection_adapter_dir)
+            restore_adapter(selection_model, best_adapter_load_dir)
             best_validation = score_candidates(
                 selection_model,
                 val_data,
@@ -2703,6 +2589,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 "full_retrain_rows": len(full_train_indices),
                 "downsampled_rows": len(downsampled_indices),
                 "downsampling_summary": downsampling_summary,
+                "resume_signature": resume_signature,
             }
             for key in ("per_class", "confusion_matrix"):
                 if key in best_validation:
@@ -2722,6 +2609,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 _write_json(seed_output_dir / "seed_summary.json", public_summary)
 
             on_main(export_seed_artifacts, runtime)
+            _clear_phase_resume(seed_checkpoint_dir, "selection", runtime)
             seed_results.append(
                 {
                     "summary": public_summary,
@@ -2767,6 +2655,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                 resolved_revision=resolved_revision,
                 parameter_counts=parameter_counts,
                 token_diagnostics=token_diagnostics,
+                resume_catalogs=resume_catalogs,
+                resume_signature=resume_signature,
+                prediction_sha256=prediction_sha256,
             )
             return
 
@@ -2789,7 +2680,11 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
         full_train_indices = winner["full_train_indices"]
         train_frame = winner["train_frame"]
         full_train_frame = frame.iloc[full_train_indices]
-        full_train_data = CompletionDataset.from_frame(full_train_frame, encoder)
+        full_train_data = CompletionDataset(
+            prompt_inputs(full_train_frame, task),
+            encoder,
+            full_train_frame["label_id"].tolist(),
+        )
 
         def export_winner_artifacts():
             write_split_manifest(
@@ -3011,6 +2906,9 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                     "training_config": asdict(config),
                     "parameters": parameter_counts,
                     "system_prompt": encoder.system_text,
+                    "input_mode": task.input_mode,
+                    "comment_columns": ["Comment", task.original_comment_column] if task.input_mode == "bilingual" else ["Comment"],
+                    "truncation_policy": "balanced_head_tail_per_view" if task.input_mode == "bilingual" else "comment_tail",
                     "label_order": list(task.labels),
                     "completion_token_ids": encoder.completions,
                     "completion_token_diagnostics": token_diagnostics,
@@ -3037,7 +2935,7 @@ def run_llm_task(task: TaskConfig, config: LLMTrainingConfig) -> None:
                         name: hashlib.sha256(
                             resolve_data_file(name).read_bytes()
                         ).hexdigest()
-                        for name in (*task.labeled_filenames(), task.prediction_filename)
+                        for name in (*labeled_input_filenames(task), task.prediction_filename)
                     },
                     "packages": {
                         name: version(name)
@@ -3091,11 +2989,48 @@ def run_llm_cli(
     )
     parser.add_argument("--single-gpu", action="store_true")
     parser.add_argument(
+        "--input-mode", choices=("english", "bilingual"), default=task.input_mode,
+        help="Use the English translation alone, or both original and translated versions.",
+    )
+    parser.add_argument(
+        "--prompt-order", choices=("english-first", "original-first"), default=None,
+        help="Change bilingual view order only; nondefault order uses separate outputs/checkpoints.",
+    )
+    parser.add_argument(
         "--prediction-file",
         default=task.prediction_filename,
         help="CSV input filename, or full path (e.g. official test inputs).",
     )
+    parser.add_argument(
+        "--resume-from",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Result directory or ZIP to reuse. Repeat for multiple Kaggle outputs. "
+            "Kaggle /kaggle/input is scanned automatically unless disabled."
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-resume",
+        action="store_true",
+        help="Do not automatically scan /kaggle/input for earlier result artifacts.",
+    )
+    if task.epoch_validation_filename is not None:
+        parser.add_argument(
+            "--epoch-validation-file", default=None,
+            help="Optional external gold CSV; an explicitly supplied path is required to exist.",
+        )
     args = parser.parse_args()
+    if getattr(args, "epoch_validation_file", None) is not None:
+        task = replace(task, epoch_validation_filename=args.epoch_validation_file,
+                       epoch_validation_required=True)
+    task = replace(task, prediction_filename=args.prediction_file, input_mode=args.input_mode)
+    if args.prompt_order is not None:
+        try:
+            task = with_prompt_order(task, args.prompt_order)
+        except ValueError as exc:
+            parser.error(str(exc))
     config = replace(
         defaults,
         model_name=args.model,
@@ -3109,4 +3044,9 @@ def run_llm_cli(
     )
     validate_config(config)
     relaunch_with_torchrun_if_needed(config)
-    run_llm_task(replace(task, prediction_filename=args.prediction_file), config)
+    run_llm_task(
+        task,
+        config,
+        tuple(Path(path) for path in args.resume_from),
+        auto_resume=not args.no_auto_resume,
+    )

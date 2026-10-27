@@ -1,4 +1,4 @@
-"""Real CUDA/LoRA smoke test with tiny random Qwen2 weights (no download).
+"""Real CUDA/LoRA smoke test with tiny random Qwen3 weights (no download).
 
 Run manually on a CUDA machine after installing requirements.txt. This exercises
 the production model loader, gradient checkpointing, FP16 backward, legal
@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from llm_config import LLMTrainingConfig, TASK_A, TASK_B
 from src.distributed import RuntimeContext
@@ -43,14 +43,15 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         backbone = root / "base"
-        Qwen2ForCausalLM(
-            Qwen2Config(
+        Qwen3ForCausalLM(
+            Qwen3Config(
                 vocab_size=256,
                 hidden_size=64,
                 intermediate_size=128,
                 num_hidden_layers=2,
                 num_attention_heads=4,
                 num_key_value_heads=2,
+                head_dim=16,
                 max_position_embeddings=1024,
                 pad_token_id=0,
                 eos_token_id=2,
@@ -71,11 +72,7 @@ def main():
             tokenizer = TestChatTokenizer()
             encoder = ChatEncoder(tokenizer, task, 512)
             collator = CompletionCollator(0)
-            data = CompletionDataset(
-                ["one", "two", "three"], encoder, [0, 1, 0],
-                translations=["English one", "English two", "English three"]
-                if task.translation_column else None,
-            )
+            data = CompletionDataset([("one", "raw one"), ("two", "raw two"), ("three", "raw three")], encoder, [0, 1, 0])
             loader = DataLoader(data, batch_size=1, collate_fn=collator)
             optimizer = torch.optim.AdamW(
                 [p for p in model.parameters() if p.requires_grad], lr=0.001

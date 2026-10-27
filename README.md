@@ -1,11 +1,13 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
-Trên `Khangtest2`, Task B train **original-only** và chỉ đưa bản dịch tiếng Anh
-`Comment_en` vào prompt plain text. Nhánh này lấy pipeline của `Khangtest`,
-giữ `Qwen/Qwen2.5-3B-Instruct`, full retrain cố định 5 epoch cho năm seed,
-class-weighted loss và soft ensemble. Task A giống `Khangtest`.
-Khác biệt thí nghiệm của Task B là `Khangtest` dùng raw + English, còn
-`Khangtest2` dùng English-only.
+Hai branch `Khangtest2` và `Khangtest3` đồng bộ source từ Nhotest để thử nghiệm Task B:
+`Khangtest2` chỉ đưa câu gốc code-mixed vào prompt; `Khangtest3` đưa cả tiếng Anh và
+câu gốc. Xem [TASK_B_TRANSLATION_EXPERIMENT.md](TASK_B_TRANSLATION_EXPERIMENT.md)
+để chạy và xác định thư mục output/checkpoint riêng. Task A giữ nguyên Nhotest.
+
+Cấu hình gốc Nhotest dùng **bản gốc code-mixed + bản dịch tiếng Anh** trong
+cùng một prompt. Xem [BILINGUAL.md](BILINGUAL.md) để chọn đúng thư mục dữ liệu,
+chạy huấn luyện và so sánh với English-only.
 
 Pipeline fine-tune causal LLM cho hai task HASTIKA:
 
@@ -13,87 +15,37 @@ Pipeline fine-tune causal LLM cho hai task HASTIKA:
 - Task B: phân loại `Gender`, `Political`, `Religion`, `Geo-political`,
   `Violence`, `Others`.
 
-Pipeline dùng **LoRA chuẩn, không lượng tử hóa**. Backbone được nạp bằng FP16
-trên T4 hoặc BF16 trên GPU hỗ trợ BF16 native. Trọng số backbone đóng băng;
-optimizer chỉ cập nhật các ma trận LoRA.
+Pipeline dùng **LoRA chuẩn, không lượng tử hóa**. Backbone được nạp bằng
+FP16 trên T4 hoặc BF16 trên GPU hỗ trợ native BF16; trọng số backbone đóng
+băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 ## Quy trình huấn luyện
 
-### Task A
+Task A giữ luồng holdout selection và full retrain của Nhotest:
 
-1. Mỗi seed `42, 52, 62, 72, 82` train trên
-   `binary_original_1..4 + binary_augment1..4` và validation trên
-   `binary_original_5`.
-2. Mỗi seed chọn epoch có Macro-F1 cao nhất; validation loss thấp hơn dùng để
-   phá hòa. Early stopping có patience 2.
-3. Mỗi seed khởi tạo lại backbone và LoRA, rồi retrain trên toàn bộ
-   `binary_original_1..5 + binary_augment1..5` theo best epoch riêng.
-4. Năm model dự đoán development độc lập. Nhãn cuối được chọn bằng hard
-   majority vote: ít nhất 3 phiếu `Hate` thì trả `Hate`.
+1. Dùng original song ngữ, không augmentation; train fold 1–4, validation fold 5.
+   Có thể đọc file compact `binary_original_1_4.csv` + `binary_original_5.csv`,
+   hoặc đủ năm file `binary_original_1.csv` tới `binary_original_5.csv`.
+2. Chạy 5 seed `42, 52, 62, 72, 82`, chọn best epoch bằng macro-F1 validation,
+   rồi dùng validation loss để phá hòa.
+3. Từng seed khởi tạo lại backbone/LoRA và retrain dữ liệu đầy đủ theo best epoch.
+4. Dự đoán từng seed và majority vote với trọng số ngang nhau.
+5. Xuất `predictions.csv` và ZIP nộp CodaBench.
 
-### Task B: thí nghiệm fixed epoch + năm full-data model
+Task B giữ prompt, class-weighted loss và soft ensemble từ Khangtest (`e27514b`).
+Chạy 5 seed trên fold 1–4, chọn best epoch bằng macro-F1 fold 5 (loss phá hòa),
+tối đa 5 epoch và patience 2. Sau đó khởi tạo lại từng seed để retrain cả 5 fold
+theo best epoch riêng, không cap Gender; ensemble bằng trung bình xác suất. Loader dùng `OriginalComment` (gốc) và
+`Comment` (tiếng Anh) từ dataset song ngữ. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md)
+để chạy, cung cấp gold validation và resume. Task B dùng 256 token, cố định tiếng Anh trước câu gốc.
 
-Task B không còn downsample Gender và không loại bất kỳ câu train nào.
-
-1. Tạm bỏ toàn bộ giai đoạn five-fold OOF và không chọn global best epoch.
-2. Đặt số epoch full-data cố định bằng `5` cho thí nghiệm phương sai.
-3. Khởi tạo mới năm model với seed `42, 52, 62, 72, 82`. Mỗi model train trên
-   toàn bộ `original_1..5` trong đúng năm epoch. Các file `augment1..5` không
-   được đọc, không audit và không tham gia tính class weight.
-4. Mỗi model trả xác suất cho sáu nhãn. Pipeline lấy trung bình xác suất của
-   năm model với trọng số bằng nhau rồi lấy nhãn có xác suất trung bình cao
-   nhất. Đây là soft ensemble, không phải hard voting.
-
-Class-weighted loss vẫn được áp dụng cho cả năm model. Mỗi model được khởi tạo
-mới để mọi hàng dữ liệu được học đúng năm epoch như nhau.
-Prompt English-only được áp dụng nhất quán ở train, validation mỗi epoch
-và development prediction. Nhãn gold chỉ dùng cho loss hoặc tính metric.
-
-## Class-weighted loss của Task B
-
-Với một câu thuộc class `c`, pipeline trước tiên tính mean negative
-log-likelihood trên các token của câu trả lời assistant:
-
-```text
-L_i = mean NLL của các answer token trong sample i
-```
-
-Trọng số class được tính từ riêng tập train của lượt hiện tại:
-
-```text
-raw_weight_c = clip(sqrt(N / (K * n_c)), 0.75, 1.50)
-weight_c = raw_weight_c / mean_sample(raw_weight)
-weighted_loss = mean(weight_label_i * L_i)
-```
-
-Trong đó `N` là tổng số mẫu train, `K=6`, và `n_c` là số mẫu của class
-`c`. Căn bậc hai làm mức bù nhẹ hơn inverse-frequency đầy đủ; khoảng clip
-ngăn class hiếm chi phối gradient. Bước chuẩn hóa giữ mean sample weight bằng
-1, nên độ lớn loss và learning rate gần với pipeline cũ.
-
-Trong thí nghiệm fixed epoch hiện tại, weights được tính từ năm file original
-trước khi train năm full-data model.
-
-Với dữ liệu Task B hiện tại:
-
-| Label | Số mẫu | Full-data weight |
-|---|---:|---:|
-| Gender | 1362 | 0.7623 |
-| Political | 558 | 0.9866 |
-| Religion | 382 | 1.1924 |
-| Geo-political | 184 | 1.5245 |
-| Violence | 221 | 1.5245 |
-| Others | 448 | 1.1011 |
-
-Tổng cộng có 3155 mẫu original. Gender vẫn xuất hiện đủ 1362 câu; không
-downsample. Công thức weighting giữ nguyên, chỉ tính lại trên original-only.
-Khoảng clip áp dụng trước chuẩn hóa nên weight cuối có thể lớn hơn 1.50.
+Việc khởi tạo lại ở bước full-retrain giúp tất cả mẫu được học số epoch như nhau. Nếu
+tiếp tục trực tiếp từ adapter 80%, nhóm 80% ban đầu sẽ được học nhiều lần hơn
+nhóm validation cũ.
 
 ## Light text normalization
 
-Pipeline chỉ sửa nhiễu kỹ thuật của comment. Task A đưa `Comment` vào chat
-tokenizer; Task B chỉ đưa `Comment_en`. Raw `Comment` vẫn được chuẩn hóa để
-kiểm tra dữ liệu và ghép gold validation, không được đưa vào prompt Task B:
+Pipeline chỉ sửa nhiễu kỹ thuật trước khi đưa cột `Comment` vào chat tokenizer:
 
 - Sửa lỗi encoding bằng `ftfy`, chuẩn hóa Unicode NFKC và giải mã HTML entity.
 - Thu gọn khoảng trắng; ô `Comment` thiếu được chuyển thành chuỗi rỗng.
@@ -101,32 +53,31 @@ kiểm tra dữ liệu và ghép gold validation, không được đưa vào pro
 - Không lowercase; giữ hashtag, emoji và dấu câu.
 - Không xóa stopword, không lemmatize và không chuẩn hóa ký tự/từ lặp.
 
-Khi comment quá dài, `ChatEncoder` chỉ cắt phần comment để system prompt và
-assistant label vẫn nằm trong `max_length`. Với Task B, toàn bộ token còn lại
-dành cho bản dịch tiếng Anh; độ dài raw không ảnh hưởng đến prompt hoặc việc
-truncate. Nếu phải cắt, giữ đầu bản dịch, tiêu đề và toàn bộ assistant label.
-`max_length` vẫn là 256.
+Khi prompt song ngữ quá dài, `ChatEncoder` chia ngân sách token cho cả hai
+phiên bản, giữ phần đầu/cuối và đánh dấu `[...]` ở phần bị lược. System prompt
+và assistant label vẫn nằm đầy đủ trong `max_length`. Chế độ English-only
+giữ quy tắc cắt phần cuối comment.
 
-## Cấu hình LoRA mặc định
+## LoRA
+
+Cấu hình mặc định trong `llm_config.py`:
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `Qwen/Qwen2.5-3B-Instruct` |
+| Backbone | `Qwen/Qwen3-4B-Instruct-2507` |
+| Model revision | `cdbee75f17c01a7cc42f958dc650907174af0554` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
 | Target modules | `all-linear` |
-| Max epochs | 5 cho Task A; Task B cố định 5 epoch |
-| Early-stopping patience | 2, chỉ áp dụng quy trình Task A |
-| Max chat length | 256 |
-| Learning rate | `1e-4` |
-| Weight decay | 0.01 |
-| Warmup ratio | 0.10 |
+| Max epochs để chọn | 5 |
+| Early-stopping patience | 4 |
+| Max chat length | Task A `256`; Task B `256` |
+| Learning rate | Task A `2e-4`; Task B `1e-4` |
 | Batch/GPU | 4 |
 | Gradient accumulation | 2 |
-| Effective batch trên T4 x2 | 16 |
 | Eval batch/GPU | 2 candidate completions |
-| Max gradient norm | 1.0 |
+| Progress log | Một dòng cố định mỗi 10% |
 
 LoRA áp dụng:
 
@@ -134,95 +85,71 @@ LoRA áp dụng:
 W = W0 + (alpha / r) BA
 ```
 
-Với `r=32`, `alpha=64`, hệ số scale là 2. Backbone `W0` không được
-optimizer cập nhật.
+Với `r=32`, `alpha=64`, hệ số scale là 2. Backbone `W0` không được optimizer
+cập nhật.
 
-Đây không phải QLoRA: code không dùng NF4, double quantization hay
-`BitsAndBytesConfig`. Qwen2.5-3B phù hợp với T4 16 GB hơn bản 7B khi dùng
-LoRA FP16. DDP dùng cả hai T4, nhưng mỗi GPU vẫn giữ một bản backbone đầy đủ.
+Đây không còn là QLoRA: code không dùng NF4, double quantization hay
+`BitsAndBytesConfig`. Vì vậy standard LoRA dùng VRAM nhiều hơn đáng kể.
+Pipeline dùng chat template chính thức của
+https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507. Đây là bản Instruct
+non-thinking; template không thêm phần suy luận `<think>`. DDP không cộng VRAM
+của hai GPU: mỗi GPU giữ một bản backbone. Revision model được pin để tránh
+thay đổi checkpoint giữa các lần chạy.
+Mức `2e-4` là thiết lập thí nghiệm, chưa được xác nhận là LR tối ưu trên dev.
+Nếu đặt `HASTIKA_LLM_MODEL` trong môi trường, giá trị đó sẽ ghi đè model mặc
+định; khi đổi sang model khác, cần truyền `--revision` phù hợp với model đó.
 
 ## Dữ liệu
 
-Mặc định pipeline tìm file trong `HASTIKA_DATA_DIR`, thư mục `data/`, hoặc
-một Kaggle Dataset dưới `/kaggle/input`.
+Mặc định pipeline tìm các file sau trong `HASTIKA_DATA_DIR`, thư mục `data/`,
+hoặc một Kaggle Dataset dưới `/kaggle/input`.
 
-Task A:
+Task A (mặc định):
 
 ```text
-binary_original_1.csv ... binary_original_5.csv
-binary_augment1.csv ... binary_augment5.csv
+binary_original_1_4.csv
+binary_original_5.csv
 binary_validation_inputs.csv
 ```
 
-Task B:
+Task B (mặc định):
 
 ```text
-original_1.csv ... original_5.csv
+original_1.csv
+original_2.csv
+original_3.csv
+original_4.csv
+original_5.csv
 multiclass_validation_inputs.csv
-hastika_multiclass_validation.csv
 ```
 
-Task A: train CSV cần `id`, `Comment`, `Label`; development cần `id`, `Comment`.
-Các file augment Task A cần thêm `source_id`,
-`source_group` và `fold`. Loader kiểm tra nguồn tồn tại, nguồn cùng fold,
-nhãn augment khớp nhãn nguồn và một `source_group` không vượt qua nhiều fold.
+Train CSV cần `id`, `Comment`, `OriginalComment` và cột nhãn tương ứng.
+Development CSV cần `id`, `Comment`, `OriginalComment`. Giải nén
+`hastika_bilingual_no_augments.zip` và trỏ `HASTIKA_DATA_DIR` vào đúng thư mục
+chứa CSV. Cả hai task giữ cột tiếng Anh và câu gốc trong cùng một mẫu.
 
-Task B: dùng năm original và development từ `enhanced_hastika_augment_translate.zip`.
-Original cần `id`, `Comment`, `Comment_en`, `Hate Category`; development cần
-`id`, `Comment`, `Comment_en`. Thiếu cột hoặc bản dịch trống sẽ báo lỗi,
-không tự dịch, không dùng raw thay thế khi thiếu English. Các file augment có thể vẫn nằm trong
-dataset nhưng Task B không đọc chúng.
-Không cần sửa hay bỏ cột `Comment` trong dataset đã dịch. Cột này được giữ
-để kiểm tra ID và đối chiếu gold validation; `english_only_prompt=True`
-bảo đảm chỉ `Comment_en` đi vào prompt.
+Script thử nghiệm augmentation Task A dưới đây chỉ dành cho bộ dữ liệu cũ;
+pipeline tiếng Anh mặc định không dùng output của script này:
 
-`hastika_multiclass_validation.csv` vẫn là file gold để báo cáo metric, không
-tham gia train. File này không bắt buộc có `Comment_en`: loader ghép bản dịch
-từ development theo ID và kiểm tra comment raw khớp sau chuẩn hóa nhẹ. ID
-thiếu, raw không khớp hoặc bản dịch có sẵn khác development sẽ báo lỗi.
-Thứ tự file gold được giữ nguyên khi ghép.
-
-`augmentation_audit.csv` của Task A đánh dấu câu quá ngắn, trùng lặp, quá khác câu
-nguồn hoặc gần giống original khác. Cấu hình
-`augmentation_audit_action="report"` chỉ báo cáo; các câu bị đánh dấu vẫn
-được train.
-
-Dữ liệu cuộc thi nằm trong `data/` và được `.gitignore` chặn, không được
-commit lên GitHub.
-
-## Tokenization, loss và dự đoán
-
-Task A dùng nhãn chính thức làm assistant response:
-
-```text
-System: Classify ... Allowed labels: Non-Hate; Hate.
-User: Comment:\n<normalized Comment>
-Assistant: Non-Hate hoặc Hate
+```bash
+python scripts/build_task_a_balanced_data.py \
+  --input-dir ../hastika_regenerated_augments \
+  --output-dir ../task_a_balanced
 ```
 
-Task B cũng dùng trực tiếp sáu tên nhãn chính thức làm assistant response:
-`Gender`, `Political`, `Religion`, `Geo-political`, `Violence`, `Others`.
-Prompt liệt kê các nhãn hợp lệ; file submission giữ nguyên tên nhãn chính thức.
+Script không sửa dữ liệu nguồn. Nó audit Hate augment, khôi phục các câu nguồn
+Task B còn thiếu trong binary data, gán fold có seed cố định, sinh Non-Hate
+variants bảo thủ, tạo hàng chờ human review và xuất các fold Task A. Đặt
+`HASTIKA_DATA_DIR` trỏ tới thư mục output trước khi train.
 
-User prompt Task B (plain text, không mã hóa A–F):
+Chạy sanity check nhẹ trước khi dùng GPU:
 
-```text
-English translation:
-<normalized Comment_en>
+```bash
+python scripts/evaluate_task_a_data_sanity.py --data-dir ../task_a_balanced
 ```
 
-System prompt Task B yêu cầu phân loại một hateful English comment; danh
-sách sáu nhãn và cách chấm likelihood giữ nguyên. Không
-đưa nhãn gold hoặc ghi chú trong `translation_audit.csv` vào user prompt.
-`run_summary.json` ghi `prompt_input.english_only_prompt=true`,
-`raw_column=null`, cột dịch, augmentation đã tắt và cách truncate.
-
-Code gọi `apply_chat_template`. Prompt và padding được mask bằng `-100`;
-loss chỉ áp dụng cho token của assistant label và token kết thúc chat. Khi dự
-đoán, pipeline tính mean token log-likelihood cho từng câu trả lời hợp lệ,
-softmax sáu candidate scores để lấy xác suất, rồi chọn nhãn theo quy tắc
-ensemble của từng task. Pipeline không sinh văn bản tự do và không regex sửa
-kết quả.
+Đây chỉ là kiểm tra hồi quy dữ liệu bằng character n-gram Naive Bayes. Quyết
+định cuối cùng vẫn dựa trên LoRA experiment với original-only fold 5.
 
 ## Chạy trên Kaggle
 
@@ -232,50 +159,86 @@ kết quả.
 !python Train_B_LLM.py
 ```
 
-Khi Kaggle có T4 x2, entry point tự relaunch bằng DDP với hai worker.
+Chạy tuần tự Task A và Task B. Khi Kaggle có T4 x2, entry point tự relaunch
+bằng DDP với hai worker; mỗi GPU giữ một bản backbone đầy đủ.
 
-Có thể đổi tham số qua CLI:
+### Tự tiếp tục sau timeout 12 giờ
+
+Cơ chế resume nằm trực tiếp trong cả hai entry point. Sau một version bị dừng:
+
+1. Lưu output của version đó thành Kaggle Dataset/Notebook Output.
+2. Gắn **tất cả** output của các version trước vào notebook tiếp theo bằng
+   `Add Input`.
+3. Chạy lại đúng các lệnh cũ:
 
 ```bash
-!python Train_B_LLM.py --model Qwen/Qwen2.5-3B-Instruct
-!python Train_B_LLM.py --batch-size 4 --gradient-accumulation 2
-!python Train_B_LLM.py --single-gpu
-!python Train_B_LLM.py --prediction-file /path/to/official_inputs.csv
+python Train_A_LLM.py
+python Train_B_LLM.py
 ```
 
-Số epoch của thí nghiệm Task B hiện được khóa bằng
-`TASK_B.fixed_full_retrain_epochs=5`; tùy chọn `--max-epochs` không thay đổi
-giá trị cố định này.
+Pipeline tự quét `/kaggle/input`, kể cả các cây thư mục đã giải nén và file
+`.zip` như `result-7.zip`. Nó chỉ đọc artifact thuộc đúng task đang chạy. Có
+thể chỉ định nguồn rõ ràng (lặp cờ nhiều lần) hoặc tắt auto-scan:
 
-### Log validation sau mỗi epoch của Task B
+```bash
+python Train_A_LLM.py \
+  --resume-from /kaggle/input/run-01 \
+  --resume-from /kaggle/input/run-02/result-7.zip
 
-Thêm file gold `hastika_multiclass_validation.csv` của BTC vào Kaggle Dataset
-hoặc `data/`. File cần các cột `id`, `Comment`, `Hate Category` và có 395 câu.
-Pipeline đọc file này độc lập với input dùng để tạo submission, nên vẫn có
-thể dùng `--prediction-file` để dự đoán test không nhãn.
+python Train_B_LLM.py --no-auto-resume
+```
 
-Sau mỗi epoch của từng seed, Task B đánh giá trên gold validation và in:
+Thứ tự tận dụng artifact cho từng seed:
 
-- Seed, epoch, validation loss, Macro-F1 và accuracy.
-- Confusion matrix dạng text: hàng là nhãn thật, cột là nhãn dự đoán.
-- Precision, recall, F1, support và số câu nhầm vào/ra từng class.
+- Nếu phase 1 có `seed_summary.json`, split manifest và validation prediction
+  hợp lệ, pipeline bỏ qua toàn bộ holdout selection của seed đó.
+- Nếu phase 2 đã có `prediction_scores.npz`, pipeline dùng ngay prediction và
+  không nạp model. Nếu chỉ có final adapter, pipeline chỉ chạy inference lại,
+  không train lại.
+- Trong các run tạo bởi phiên bản code mới này, cuối **mỗi epoch** pipeline lưu
+  adapter hiện tại, optimizer, scheduler, GradScaler, RNG của từng DDP rank và
+  DataLoader generator. Lần sau tiếp tục chính xác từ epoch kế tiếp. Nếu timeout
+  giữa một epoch thì chỉ epoch đang dở phải chạy lại.
+- Với output cũ chưa có training state, các seed đã hoàn tất vẫn được bỏ qua.
+  Nếu phase 1 còn dở nhưng có history và `best_holdout_adapter`, pipeline tiếp
+  tục từ adapter đó với optimizer/scheduler mới và ghi cảnh báo trong log. Đây
+  là phần tốt nhất có thể khôi phục vì optimizer state cũ không tồn tại.
+- Với Task A, output chỉ còn `predictions.csv` được dùng làm one-hot vote khi
+  metadata xác nhận hash prediction hiện tại; ID giống nhau chưa đủ nếu nội
+  dung comment đã đổi.
 
-Các metric chỉ để theo dõi. Pipeline vẫn train đủ 5 epoch, không early stop
-hoặc chọn checkpoint bằng gold validation. Validation không được ghép vào
-train; ID trùng với train sẽ gây lỗi. Trạng thái RNG được giữ lại khi chấm
-để bước đánh giá không làm thay đổi random của epoch train tiếp theo.
+Adapter full-data được kiểm tra bằng hash dữ liệu train, model revision, cấu
+hình LoRA/training, seed và số epoch. Cache prediction được kiểm tra riêng bằng
+ID/thứ tự và hash file prediction. Đổi test (kể cả đổi comment nhưng giữ ID)
+chỉ làm chạy inference lại từ adapter đã hoàn tất, không làm train full data
+lại. Pipeline tìm trong mọi input đã gắn để mỗi seed có thể lấy adapter từ một
+run khác nhau. Nếu metadata báo seed đã train xong nhưng mọi input đều thiếu
+weights và cache hiện tại không dùng được, code báo lỗi rõ thay vì tự train lại.
+Adapter được xuất lại vào checkpoint của run mới để có thể tiếp tục dùng
+Notebook Output đó khi đổi test lần sau.
 
-Khi cả năm model hoàn tất, code cũng in metric của soft ensemble trên cùng
-gold validation. Metric này dùng để so sánh hai nhánh raw + English và
-English-only; cả hai đều không dùng augment cho Task B.
-Task A giữ nguyên pipeline và cách log hiện tại.
+Artifact kiểu cũ không có hash được kiểm tra bằng toàn bộ ID,
+split assignment, số dòng, seed và số epoch có sẵn. Để exact-resume, lần chạy
+sau phải giữ cùng tham số CLI và cùng số GPU; nếu không khớp, checkpoint state
+sẽ bị từ chối an toàn và log nêu lý do.
 
-Metric mỗi epoch được lưu trong `seed_<seed>/full_data_training_history.json`.
-Thư mục `seed_<seed>/official_validation/` chứa predictions, metric JSON và
-confusion matrix CSV theo epoch. Kết quả ensemble cuối nằm trong
-`official_validation_metrics.json` và `official_validation_predictions.csv`.
+Nên giữ `outputs/` và `checkpoints/` trong `/kaggle/working` (hoặc bên dưới thư
+mục repo đã clone vào đó), vì cả báo cáo nhỏ lẫn adapter/training state đều cần
+có trong Notebook Output. Checkpoint tạm của một phase được dọn sau khi phase
+đã xuất artifact hoàn chỉnh, nên dung lượng tăng thêm chủ yếu chỉ tồn tại cho
+seed đang chạy dở.
 
-Có thể đặt thư mục bằng biến môi trường:
+Đổi backbone hoặc giới hạn tài nguyên:
+
+```bash
+!python Train_A_LLM.py --model Qwen/Qwen3-4B-Instruct-2507 \
+  --revision cdbee75f17c01a7cc42f958dc650907174af0554
+!python Train_A_LLM.py --max-epochs 3 --batch-size 1 --max-length 256
+!python Train_B_LLM.py --single-gpu --gradient-accumulation 16
+!python Train_A_LLM.py --prediction-file /path/to/official_inputs.csv
+```
+
+Có thể đặt thư mục bằng biến môi trường trước khi chạy:
 
 ```bash
 %env HASTIKA_DATA_DIR=/kaggle/input/hastika-data
@@ -283,35 +246,82 @@ Có thể đặt thư mục bằng biến môi trường:
 %env HASTIKA_CHECKPOINT_DIR=/kaggle/working/checkpoints
 ```
 
-Task B hiện bỏ qua OOF và chỉ train năm full-data model, mỗi model đúng 5 epoch.
+## Tokenization, loss và dự đoán
+
+Task A dùng trực tiếp nhãn chính thức trong assistant response:
+
+```text
+System: Classify ... Allowed labels: Non-Hate; Hate.
+User: Comment:\n<normalized Comment>
+Assistant: Non-Hate hoặc Hate
+```
+
+Task B cũng dùng trực tiếp các nhãn chính thức `Gender`, `Political`, `Religion`,
+`Geo-political`, `Violence` và `Others`; pipeline không dùng mã nội bộ `A`–`F`.
+
+Code gọi `apply_chat_template` của tokenizer. Prompt và padding được mask bằng
+`-100`; loss chỉ áp dụng cho các token của assistant label và phần kết thúc
+chat. Khi dự đoán, pipeline tính mean token log-likelihood cho từng câu trả lời
+hợp lệ và chọn nhãn có điểm lớn nhất. Phép chuẩn hóa theo số token tránh thiên
+vị câu trả lời ngắn khi `Non-Hate` và `Hate` có độ dài token khác nhau. Pipeline
+không sinh văn bản tự do và không regex sửa kết quả.
+
+Tiến trình train, validation và prediction được ghi thành dòng cố định mỗi 10%
+với số batch/candidate, elapsed time, ETA, tốc độ và mean loss khi train. Cách
+này tránh progress bar động bị Kaggle nối thành một khối log dài khó đọc.
+Sau mỗi epoch của Task B, log còn ghi precision, recall, F1 và support của từng
+nhãn, kèm số lỗi theo cả hai chiều: các nhãn thật bị dự đoán nhầm vào nhãn đang
+xét và các mẫu thật của nhãn đang xét bị dự đoán sang từng nhãn khác. Ma trận
+nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện, CSV và metrics JSON.
 
 ## Artifacts
 
-Task B tạo các artifact chính:
+Task A:
 
 ```text
-outputs/task_b_lora/seed_42/full_data_training_history.json
-outputs/task_b_lora/seed_42/predictions.csv
-outputs/task_b_lora/seed_52/...
-outputs/task_b_lora/ensemble_predictions.csv
-outputs/task_b_lora/predictions.csv
-outputs/task_b_lora/task_b_submission.zip
-outputs/task_b_lora/run_summary.json
-checkpoints/task_b_lora/seed_42/final_full_data_adapter/
-checkpoints/task_b_lora/seed_52/...
-checkpoints/task_b_lora/metrics.json
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_42/best_holdout_adapter/
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_42/final_full_data_adapter/
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_52/...
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_62/...
+checkpoints/task_a_qwen3_4b_2507_lora_bilingual/metrics.json
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/validation_predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/prediction_scores.npz
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_52/...
+outputs/task_a_qwen3_4b_2507_lora_bilingual/selection_training_history.json
+outputs/task_a_qwen3_4b_2507_lora_bilingual/split_manifest.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/validation_predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_selection_results.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/voting_predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/predictions.csv
+outputs/task_a_qwen3_4b_2507_lora_bilingual/task_a_submission.zip
+outputs/task_a_qwen3_4b_2507_lora_bilingual/run_summary.json
 ```
 
-`ensemble_predictions.csv` chứa nhãn từng seed, xác suất trung bình, số phiếu
-chẩn đoán và nhãn cuối. File để nộp là
-`outputs/task_b_lora/task_b_submission.zip`.
+Trong lúc một epoch vừa hoàn tất nhưng phase chưa xong, checkpoint có thêm:
 
-Một lượt chạy mới không tạo artifact OOF. Pipeline không tự động xóa artifact
-OOF cũ nếu cùng thư mục output từng được dùng cho phiên bản trước.
+```text
+checkpoints/<task>/seed_<seed>/resume_state/selection/epoch_<N>/
+checkpoints/<task>/seed_<seed>/resume_state/full_retrain/epoch_<N>/
+```
 
-Task A tiếp tục tạo per-seed holdout history, full-data adapters,
-`voting_predictions.csv`, `predictions.csv` và
-`task_a_submission.zip`.
+Mỗi phase chỉ giữ checkpoint epoch hoàn chỉnh mới nhất. `latest.json` chỉ được
+cập nhật sau khi adapter và `training_state.pt` đã ghi xong, tránh nhận nhầm
+checkpoint bị cắt giữa lúc Kaggle timeout.
+
+`validation_predictions.csv` ở thư mục gốc là kết quả của seed có holdout tốt
+nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoán của cả 5 seed Task A,
+số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
+kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
+
+Task B dùng thư mục `task_b_qwen3_4b_2507_lora_bilingual_selection_soft`.
+`ensemble_predictions.csv` lưu nhãn từng seed và xác suất trung bình dùng cho
+nhãn cuối. Mỗi seed có best holdout adapter và summary best epoch, final adapter sau retrain,
+lịch sử cả hai giai đoạn và cache prediction. Chi tiết trong [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
+
+Macro-F1 holdout của 5 seed chỉ dùng để chọn epoch riêng cho từng seed. File
+tổng hợp lưu cả điểm trung bình và độ lệch chuẩn; test/development chính thức
+vẫn là đánh giá cuối cùng.
 
 ## Kiểm thử
 
