@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
-import numpy as np
 import pandas as pd
+import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -13,13 +14,23 @@ from llm_config import DATA_DIR, OUTPUT_ROOT, TaskConfig
 from src.preprocessing import normalize_text
 
 
+class MissingDataFileError(FileNotFoundError):
+    """An input is absent, rather than ambiguous among attached datasets."""
+
+
 def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
     """Find an input locally or in an attached Kaggle Dataset."""
 
-    candidates = [
-        configured_dir / filename,
-        Path(__file__).resolve().parents[1] / "data" / filename,
-    ]
+    selected = configured_dir / filename
+    if selected.is_file():
+        return selected.resolve()
+    if "HASTIKA_DATA_DIR" in os.environ:
+        # An explicitly selected release must not borrow a missing compact
+        # file (or any other input) from an older attached dataset.
+        raise MissingDataFileError(
+            f"Could not find {filename} in the selected HASTIKA_DATA_DIR: {configured_dir}"
+        )
+    candidates = [Path(__file__).resolve().parents[1] / "data" / filename]
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
@@ -36,7 +47,7 @@ def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
                 f"the intended directory:\n  - {rendered}"
             )
 
-    raise FileNotFoundError(
+    raise MissingDataFileError(
         f"Could not find {filename}. Attach the private HASTIKA dataset on "
         "Kaggle or set the HASTIKA_DATA_DIR environment variable."
     )
@@ -46,6 +57,7 @@ def _read_csv(path: Path) -> pd.DataFrame:
     return pd.read_csv(
         path,
         encoding="utf-8-sig",
+        keep_default_na=False,
         dtype={"id": str, "source_id": str, "source_group": str},
     )
 
@@ -68,13 +80,18 @@ def _validate_and_encode_frames(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     required_train = {"id", "Comment", task.label_column}
     required_prediction = {"id", "Comment"}
+    if task.input_mode not in {"english", "bilingual"}:
+        raise ValueError("input_mode must be english or bilingual")
+    if task.input_mode == "bilingual":
+        required_train.add(task.original_comment_column)
+        required_prediction.add(task.original_comment_column)
     _validate_columns(train_df, Path(train_description), required_train)
     _validate_columns(
         prediction_df,
         Path(task.prediction_filename),
         required_prediction,
     )
-    if train_df["id"].isna().any() or prediction_df["id"].isna().any():
+    if any(frame["id"].isna().any() or frame["id"].eq("").any() for frame in (train_df, prediction_df)):
         raise ValueError("Missing IDs were found; every row needs an ID.")
     if train_df["id"].duplicated().any():
         duplicates = train_df.loc[train_df["id"].duplicated(False), "id"].unique()
@@ -97,23 +114,26 @@ def _validate_and_encode_frames(
     prediction_df = prediction_df.copy()
     train_df["text"] = train_df["Comment"].map(normalize_text)
     prediction_df["text"] = prediction_df["Comment"].map(normalize_text)
-    if task.translation_column:
-        for frame, description in (
-            (train_df, train_description),
-            (prediction_df, task.prediction_filename),
-        ):
-            _validate_columns(frame, Path(description), {task.translation_column})
-            frame["text_en"] = frame[task.translation_column].map(normalize_text)
-            missing = frame["text_en"].eq("")
-            if missing.any():
+    if task.input_mode == "bilingual":
+        for frame in (train_df, prediction_df):
+            frame["original_text"] = frame[task.original_comment_column].map(normalize_text)
+            missing_original = frame["original_text"].eq("") & frame["text"].ne("")
+            if missing_original.any():
                 raise ValueError(
-                    f"{description} contains missing English translations for IDs: "
-                    f"{frame.loc[missing, 'id'].head(10).tolist()}. "
-                    "Use the translated dataset with a nonempty Comment_en column."
+                    "Bilingual input has missing original comments for IDs: "
+                    f"{frame.loc[missing_original, 'id'].head(10).tolist()}"
                 )
     label_to_id = {label: index for index, label in enumerate(task.labels)}
     train_df["label_id"] = train_df[task.label_column].map(label_to_id).astype(int)
     return train_df, prediction_df
+
+
+def prompt_inputs(frame: pd.DataFrame, task: TaskConfig) -> list:
+    """Return explicit English/original pairs for every pipeline phase."""
+
+    if task.input_mode == "bilingual":
+        return list(zip(frame["text"].tolist(), frame["original_text"].tolist(), strict=True))
+    return frame["text"].tolist()
 
 
 def _normalise_for_audit(values: pd.Series) -> pd.Series:
@@ -247,14 +267,10 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
         )
     if not task.original_fold_filenames:
         raise ValueError("At least one predefined fold is required.")
-    configured_folds = set(range(1, len(task.original_fold_filenames) + 1))
-    validation_folds = (
-        set(task.oof_validation_folds)
-        if task.oof_validation_folds
-        else {task.selection_validation_fold}
-    )
-    if not validation_folds or not validation_folds.issubset(configured_folds):
-        raise ValueError("Validation folds do not identify configured folds.")
+    if task.fixed_full_retrain_epochs is None and task.selection_validation_fold not in range(
+        1, len(task.original_fold_filenames) + 1
+    ):
+        raise ValueError("selection_validation_fold does not identify a configured fold.")
 
     fold_frames: list[pd.DataFrame] = []
     original_by_fold: dict[int, pd.DataFrame] = {}
@@ -265,8 +281,7 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
         _validate_columns(
             original,
             original_path,
-            {"id", "Comment", task.label_column}
-            | ({task.translation_column} if task.translation_column else set()),
+            {"id", "Comment", task.label_column},
         )
         original = original.copy()
         original["fold"] = fold
@@ -353,12 +368,88 @@ def _load_predefined_folds(task: TaskConfig) -> pd.DataFrame:
     return pd.concat([originals, all_augments], ignore_index=True, sort=False)
 
 
+def _optional_data_file(name: str) -> Path | None:
+    try:
+        path = resolve_data_file(name)
+    except MissingDataFileError:
+        # A missing optional compact file permits the original-fold fallback.
+        # Ambiguous dataset paths and other resolution errors still propagate.
+        return None
+    return path if path.is_file() else None
+
+
+def _compact_original_paths(task: TaskConfig) -> tuple[Path, Path] | None:
+    """Select the compact originals only when both files are available."""
+
+    if task.use_augmentation or task.fixed_full_retrain_epochs is not None:
+        return None
+    names = (task.compact_train_filename, task.compact_validation_filename)
+    if not any(names):
+        return None
+    if not all(names):
+        raise ValueError("Both compact original filenames must be configured.")
+    paths = [_optional_data_file(name) for name in names]
+    if all(path is None for path in paths):
+        return None
+    if any(path is None for path in paths):
+        # The compact holdout name is also the final legacy fold name. A full
+        # legacy fold set is safe to use when the merged 1–4 file is absent.
+        if paths[0] is None and task.original_fold_filenames:
+            if all(
+                _optional_data_file(name) is not None
+                for name in task.original_fold_filenames
+            ):
+                return None
+        missing = [name for name, path in zip(names, paths) if path is None]
+        raise FileNotFoundError(
+            "The compact original dataset is incomplete; missing: "
+            + ", ".join(missing)
+        )
+    train_path, validation_path = paths
+    assert train_path is not None and validation_path is not None
+    return train_path, validation_path
+
+
+def labeled_input_filenames(task: TaskConfig) -> tuple[str, ...]:
+    """Return the labeled CSVs actually selected for loading and fingerprints."""
+
+    if _compact_original_paths(task) is not None:
+        assert task.compact_train_filename and task.compact_validation_filename
+        return (task.compact_train_filename, task.compact_validation_filename)
+    if task.original_fold_filenames:
+        augmentation_files = (
+            task.augmentation_fold_filenames if task.use_augmentation else ()
+        )
+        return task.original_fold_filenames + augmentation_files
+    return (task.train_filename,)
+
+
+def _load_compact_originals(
+    task: TaskConfig, paths: tuple[Path, Path]
+) -> pd.DataFrame:
+    if task.selection_validation_fold != 5:
+        raise ValueError("Compact original files require validation fold 5.")
+    frames = []
+    for fold, path in zip((1, 5), paths):
+        frame = _read_csv(path)
+        _validate_columns(frame, path, {"id", "Comment", task.label_column})
+        frame = frame.copy()
+        frame["fold"] = fold
+        frame["data_origin"] = "original"
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
 def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load, validate, and normalize train/development CSVs consistently."""
 
     prediction_path = resolve_data_file(task.prediction_filename)
     prediction_df = _read_csv(prediction_path)
-    if task.original_fold_filenames:
+    compact_paths = _compact_original_paths(task)
+    if compact_paths is not None:
+        train_df = _load_compact_originals(task, compact_paths)
+        train_description = "compact original train and validation files"
+    elif task.original_fold_filenames:
         train_df = _load_predefined_folds(task)
         train_description = (
             "predefined original and augmentation folds"
@@ -377,51 +468,51 @@ def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     )
 
 
-def load_epoch_validation_frame(
-    task: TaskConfig, prediction_frame: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """Read external gold labels for reporting, independently of prediction input."""
+def load_epoch_validation_frame(task: TaskConfig) -> pd.DataFrame | None:
+    """Align external gold by ID to the bilingual development inputs.
 
+    Gold comments may be raw code-mixed, while this release stores English in
+    Comment. Keep gold row order, use the paired input text, and check the raw
+    source when present. Never use prediction-file overrides as this reference.
+    """
     if task.epoch_validation_filename is None:
-        raise ValueError("Per-epoch monitoring requires a labeled validation filename.")
-    path = resolve_data_file(task.epoch_validation_filename)
-    frame = _read_csv(path)
-    _validate_columns(frame, path, {"id", "Comment", task.label_column})
-    if frame.empty:
-        raise ValueError(f"Labeled validation must not be empty: {path}")
-    column = task.translation_column
-    if column and (prediction_frame is not None or column not in frame.columns):
-        # Gold files need not duplicate translations: reuse the prediction input
-        # by ID, checking raw text as well so English never gets paired wrongly.
-        if prediction_frame is None:
-            prediction_frame = _read_csv(resolve_data_file(task.prediction_filename))
-        _validate_columns(
-            prediction_frame, Path(task.prediction_filename), {"id", "Comment", column}
-        )
-        if prediction_frame["id"].isna().any() or prediction_frame["id"].duplicated().any():
-            raise ValueError("Translation reference requires unique, nonmissing IDs.")
-        reference = prediction_frame.set_index("id")
-        missing_ids = ~frame["id"].isin(reference.index)
-        if missing_ids.any():
-            raise ValueError(
-                "Official validation IDs are missing from translated development: "
-                f"{frame.loc[missing_ids, 'id'].head(10).tolist()}"
-            )
-        raw = frame["id"].map(reference["Comment"]).map(normalize_text)
-        mismatch = frame["Comment"].map(normalize_text).ne(raw)
-        if mismatch.any():
-            raise ValueError(
-                "Official validation raw comments differ from development for IDs: "
-                f"{frame.loc[mismatch, 'id'].head(10).tolist()}"
-            )
-        english = frame["id"].map(reference[column])
-        if column in frame.columns and frame[column].map(normalize_text).ne(
-            english.map(normalize_text)
-        ).any():
-            raise ValueError("Official validation translations differ from development.")
-        frame[column] = english
-    prediction_columns = ["id", "Comment"] + ([column] if column else [])
-    validated, _ = _validate_and_encode_frames(
-        frame, frame[prediction_columns], task, str(path)
-    )
+        return None
+    if task.epoch_validation_required:
+        path = resolve_data_file(task.epoch_validation_filename)
+    else:
+        path = _optional_data_file(task.epoch_validation_filename)
+        if path is None:
+            return None
+    gold = _read_csv(path)
+    _validate_columns(gold, path, {"id", task.label_column})
+    if gold.empty or gold['id'].eq('').any() or gold['id'].duplicated().any():
+        raise ValueError("Official validation requires nonempty data and unique, nonmissing IDs.")
+    if not set(gold[task.label_column]).issubset(task.labels):
+        raise ValueError("Official validation has missing or unknown labels.")
+    name = task.epoch_validation_input_filename or task.prediction_filename
+    input_path = resolve_data_file(name)
+    inputs = _read_csv(input_path)
+    required = {'id', 'Comment'}
+    if task.input_mode == 'bilingual':
+        required.add(task.original_comment_column)
+    _validate_columns(inputs, input_path, required)
+    if inputs['id'].eq('').any() or inputs['id'].duplicated().any():
+        raise ValueError("Validation input requires unique, nonmissing IDs.")
+    reference = inputs.set_index('id')
+    missing = ~gold['id'].isin(reference.index)
+    if missing.any():
+        raise ValueError(f"Official validation IDs are missing from development: {gold.loc[missing, 'id'].head(10).tolist()}")
+    aligned = reference.loc[gold['id']].reset_index()
+    if task.input_mode == 'bilingual' and 'Comment' in gold:
+        raw = aligned[task.original_comment_column].map(normalize_text)
+        translated = aligned['Comment'].map(normalize_text)
+        authored = gold['Comment'].map(normalize_text)
+        if (~(authored.eq(raw) | authored.eq(translated))).any():
+            raise ValueError("Official validation comments differ from paired development inputs.")
+    aligned[task.label_column] = gold[task.label_column].to_numpy()
+    validated, _ = _validate_and_encode_frames(aligned, inputs, task, str(path))
+    if validated['text'].eq('').any() or (
+        task.input_mode == 'bilingual' and validated['original_text'].eq('').any()
+    ):
+        raise ValueError("Official validation inputs contain empty comments.")
     return validated
