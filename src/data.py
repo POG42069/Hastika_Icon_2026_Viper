@@ -10,7 +10,7 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from llm_config import DATA_DIR, OUTPUT_ROOT, TaskConfig
+from llm_config import DATA_DIR, OUTPUT_ROOT, PROJECT_ROOT, TASK_B_OPEN_VALIDATION_FILENAME, TaskConfig
 from src.preprocessing import normalize_text
 
 
@@ -20,6 +20,18 @@ class MissingDataFileError(FileNotFoundError):
 
 def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
     """Find an input locally or in an attached Kaggle Dataset."""
+
+    if filename == TASK_B_OPEN_VALIDATION_FILENAME:
+        # This named evaluation set ships with the experiment branches. Keep
+        # training in HASTIKA_DATA_DIR, while inference and gold use this exact
+        # paired 395-row file rather than the legacy raw-only 396-row test.
+        bundled = PROJECT_ROOT / "data" / "open_validation" / filename
+        if not bundled.is_file():
+            raise MissingDataFileError(
+                f"Bundled Task B open validation is missing: {bundled}. "
+                "Update or re-clone Khangtest2/Khangtest3 including data/open_validation/."
+            )
+        return bundled.resolve()
 
     selected = configured_dir / filename
     if selected.is_file():

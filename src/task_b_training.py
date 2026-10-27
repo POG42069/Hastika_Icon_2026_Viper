@@ -613,6 +613,7 @@ def run_task_b(task, config, resume_sources=(), auto_resume=True):
         frame, prediction_frame = load_task_frames(task)
         if frame.empty or prediction_frame.empty:
             raise ValueError('Training and prediction inputs must not be empty.')
+        log(f'Task B inference input | rows={len(prediction_frame)} | file={resolve_data_file(task.prediction_filename)}', runtime)
         tokenizer = AutoTokenizer.from_pretrained(config.model_name, revision=config.model_revision, trust_remote_code=False)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -764,6 +765,8 @@ def run_task_b(task, config, resume_sources=(), auto_resume=True):
                        'ensemble': {'method': 'equal-weight mean of per-seed candidate probabilities', 'seeds': list(seeds)},
                        'full_data_retrains': [result['summary'] for result in results],
                        'official_validation': {'dataset': monitor.summary, 'ensemble_metrics': validation_summary},
+                       'prediction_dataset': {'filename': str(resolve_data_file(task.prediction_filename)),
+                                              'sha256': prediction_hash, 'rows': len(prediction_frame)},
                        'prompt_input': {'input_mode': task.input_mode, 'prompt_style': task.prompt_style,
                                         'prompt_order': effective_prompt_order(task) if task.include_english_translation else None,
                                         'include_english_translation': task.include_english_translation,

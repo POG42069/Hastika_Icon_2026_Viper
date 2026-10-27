@@ -57,28 +57,31 @@ Thứ tự cố định áp dụng nhất quán khi train, validation và predic
 !python Train_B_LLM.py
 ```
 
-Loader đọc `original_1.csv` tới `original_5.csv` và
-`multiclass_validation_inputs.csv` trực tiếp trong thư mục trên. Không cần
-file train gộp. Code tự dùng hai GPU nếu có, như Task A.
+Loader đọc `original_1.csv` tới `original_5.csv` trong thư mục trên.
+Inference và gold mặc định dùng
+`data/open_validation/task_b_open_test_translated_labeled.csv` có sẵn trong repo.
+Không cần file train gộp hay gắn thêm dataset. Code tự dùng hai GPU nếu có, như Task A.
 
 ## Nhãn validation để báo cáo
 
-Nếu có `hastika_multiclass_validation.csv` trong thư mục dữ liệu, code ghép
-nhãn theo ID với `multiclass_validation_inputs.csv`, báo loss, macro-F1,
+File open validation mặc định có đủ 395 câu gốc, bản dịch và nhãn. Code ghép
+nhãn theo ID trong cùng file, báo loss, macro-F1,
 precision/recall/F1 từng lớp và confusion matrix sau mỗi epoch full retrain và sau ensemble.
 Các mẫu này không nằm trong train, không dùng để chọn epoch hay cập nhật model.
 Gold có thể chứa câu code-mixed; prompt lấy đúng hai cột từ dataset song ngữ.
 `--prediction-file` đổi sang test vẫn giữ nguồn input development để báo điểm.
 
-ZIP song ngữ đã giao không có file gold này. Nếu gold nằm ở dataset riêng:
+File `multiclass_validation_inputs.csv` 396 câu raw-only trong ZIP bilingual cũ
+không còn là đầu vào mặc định. Nếu cần dùng gold khác cùng các ID open validation:
 
 ```python
 !python Train_B_LLM.py --epoch-validation-file /kaggle/input/your-gold-dataset/hastika_multiclass_validation.csv
 ```
 
-Khi không có gold mặc định, code báo rõ và vẫn train/xuất prediction; không
-tính metric development; vẫn tính metric fold 5 để chọn best epoch. Nếu chỉ định
-file bằng cờ trên thì file phải tồn tại và nhãn/ID phải hợp lệ. Không tự tạo nhãn hay dùng nhãn dự đoán làm nhãn thật.
+Open validation đi kèm repo là bắt buộc ở cấu hình mặc định; nếu checkout thiếu
+file này thì cần cập nhật hoặc clone lại branch. Nếu chỉ định gold bằng cờ trên,
+file phải tồn tại và nhãn/ID phải hợp lệ. Không tự tạo nhãn hay dùng nhãn dự đoán
+làm nhãn thật. Nhãn trong file inference không được đưa vào prompt.
 
 ## Checkpoint và kết quả
 

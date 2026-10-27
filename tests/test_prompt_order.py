@@ -17,7 +17,11 @@ from tests import test_task_b_khangtest as fixtures
 
 
 # Keep testing optional order experiments independently of the fixed Task B policy.
-FIXED_TASK_B = replace(FIXED_TASK_B, include_english_translation=True)
+FIXED_TASK_B = replace(FIXED_TASK_B, include_english_translation=True,
+                       prediction_filename='multiclass_validation_inputs.csv',
+                       epoch_validation_filename='hastika_multiclass_validation.csv',
+                       epoch_validation_input_filename='multiclass_validation_inputs.csv',
+                       epoch_validation_required=False)
 TASK_B = replace(FIXED_TASK_B, fixed_prompt_order=None)
 LLM_TRAINING_B = replace(LLM_TRAINING_B, max_length=512)
 

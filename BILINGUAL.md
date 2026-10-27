@@ -19,22 +19,27 @@ theo best epoch riêng. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
 ## Dữ liệu
 
 Dùng `hastika_bilingual_no_augments.zip`, được tạo trực tiếp từ ZIP English
-original-only bạn chọn. Cả 16 CSV giữ nguyên thứ tự dòng, ID, nhãn, bản dịch
-và mọi ô dữ liệu cũ. Chỉ thêm `OriginalComment` từ câu code-mixed nguyên văn
-của cùng ID; không áp dụng cách ly, chỉnh bản dịch hay augmentation của lần sửa
-Task A trước.
+original-only bạn chọn. Các CSV train giữ nguyên ID, nhãn và bản dịch, có thêm
+`OriginalComment` từ câu code-mixed nguyên văn của cùng ID. Hai file đầu vào
+dự đoán trong ZIP vẫn là raw-only; Task B dùng bộ open validation đi kèm repo
+như mô tả bên dưới. Không áp dụng cách ly hay augmentation của lần sửa Task A trước.
 
 - `Comment`: bản dịch tiếng Anh đã có.
 - `OriginalComment`: câu code-mixed ban đầu, giữ nguyên trong CSV.
 
-Cả training, validation và đầu vào dự đoán đều có hai cột này. Khi nạp, cả hai
+Các CSV train có hai cột này. Hai file `*_validation_inputs.csv` trong ZIP được
+kiểm tra lại có `id,Comment` chứa câu gốc, chưa có cột song ngữ. Trên hai branch
+thí nghiệm, riêng Task B dùng file open validation 395 câu có sẵn trong repo:
+`data/open_validation/task_b_open_test_translated_labeled.csv`, đủ cả hai cột và gold.
+Khi nạp dữ liệu song ngữ, cả hai
 cột được chuẩn hóa nhẹ bằng quy tắc hiện có: ftfy, NFKC, HTML unescape và khoảng
 trắng. Không chuẩn hóa lại các ô trong CSV. Bản dịch và câu gốc là một mẫu với
 một nhãn, không phải hai mẫu riêng.
 
 Loader yêu cầu đủ hai cột ở chế độ bilingual; không âm thầm bỏ qua bản gốc.
-Một `HASTIKA_DATA_DIR` được chỉ định sẽ giới hạn việc tìm file trong đúng thư
-mục đó, tránh ghép nhầm file của bộ dữ liệu cũ. ZIP này không có file compact
+Một `HASTIKA_DATA_DIR` được chỉ định sẽ giới hạn việc tìm file train trong đúng thư
+mục đó, tránh ghép nhầm file của bộ dữ liệu cũ. File open validation Task B được
+đọc riêng từ repo. ZIP này không có file compact
 1–4, nên code đọc đúng năm file original của mỗi task. Augmentation đã tắt.
 
 ## Chạy
@@ -97,7 +102,7 @@ python Train_A_LLM.py --input-mode bilingual --no-auto-resume
 
 Task A dùng đầy đủ 1.317 câu fold 5. Task B chọn epoch trên 2.524 câu
 fold 1–4 và 631 câu validation fold 5, rồi retrain cả 3.155 câu của 5 fold;
-395 câu development chỉ được báo điểm riêng nếu có file nhãn gold. Không dùng quy tắc
+395 câu development đi kèm repo được báo điểm riêng. Không dùng quy tắc
 lọc xuống 1.302 câu của bản Task A repair trước. Các kiểm tra CPU và tokenizer
 xác nhận pipeline đúng dữ liệu, không xác nhận macro-F1 tốt hơn; cần chạy lại
 backbone trên GPU để đánh giá chất lượng.
