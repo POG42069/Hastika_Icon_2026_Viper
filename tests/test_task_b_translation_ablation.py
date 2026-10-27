@@ -96,7 +96,11 @@ class TaskBTranslationAblationTests(unittest.TestCase):
         for include in (False, True):
             with self.subTest(include=include), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
                 root = Path(directory)
-                task = replace(self.task(include), selection_seeds=(42, 52))
+                task = replace(self.task(include), selection_seeds=(42, 52),
+                               prediction_filename='multiclass_validation_inputs.csv',
+                               epoch_validation_filename='hastika_multiclass_validation.csv',
+                               epoch_validation_input_filename='multiclass_validation_inputs.csv',
+                               epoch_validation_required=False)
                 config = replace(LLM_TRAINING_B, max_length=512, max_epochs=1)
                 helper = fixtures.TaskBKhangtestTests()
                 helper.write_data(root, task, gold=True)

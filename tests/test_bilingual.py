@@ -19,8 +19,10 @@ from src.llm_training import _resume_signature
 from tests.test_llm_pipeline import TestChatTokenizer, cpu_runtime
 
 
-# Paired-prompt regressions explicitly enable the translation in either branch.
-TASK_B = replace(TASK_B, include_english_translation=True)
+# Generic directory fixtures use an explicit input override. The bundled open
+# set and its default selection are covered by test_task_b_open_validation.
+TASK_B = replace(TASK_B, include_english_translation=True,
+                 prediction_filename='fixture_multiclass_validation_inputs.csv')
 
 
 class BilingualTests(unittest.TestCase):

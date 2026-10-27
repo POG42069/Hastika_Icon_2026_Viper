@@ -17,6 +17,13 @@ from src.task_b_training import score_candidates, train_weighted_epoch
 from tests import test_task_b_khangtest as fixtures
 
 
+TASK_B = replace(TASK_B,
+                 prediction_filename='multiclass_validation_inputs.csv',
+                 epoch_validation_filename='hastika_multiclass_validation.csv',
+                 epoch_validation_input_filename='multiclass_validation_inputs.csv',
+                 epoch_validation_required=False)
+
+
 class TaskBSelectionTests(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.TaskBKhangtestTests()

@@ -26,7 +26,13 @@ from tests.test_llm_pipeline import TestChatTokenizer, cpu_runtime, tiny_model
 
 # The character-level fixture needs more space than the real Qwen tokenizer.
 LLM_TRAINING_B = replace(LLM_TRAINING_B, max_length=512)
-TASK_B = replace(TASK_B, include_english_translation=True)
+# Exercise the optional external-gold compatibility path separately from the
+# bundled default, which has its own regressions in test_task_b_open_validation.
+TASK_B = replace(TASK_B, include_english_translation=True,
+                 prediction_filename='multiclass_validation_inputs.csv',
+                 epoch_validation_filename='hastika_multiclass_validation.csv',
+                 epoch_validation_input_filename='multiclass_validation_inputs.csv',
+                 epoch_validation_required=False)
 
 
 class TaskBKhangtestTests(unittest.TestCase):
@@ -38,12 +44,16 @@ class TaskBKhangtestTests(unittest.TestCase):
                 'OriginalComment': [f'raw {fold}-{i}!' for i in range(6)],
                 task.label_column: list(task.labels),
             }).to_csv(root / filename, index=False)
-        pd.DataFrame({
+        prediction = pd.DataFrame({
             'id': [f'dev-{i}' for i in range(6)],
             'Comment': [f'English dev {i}!' for i in range(6)],
             'OriginalComment': [f'raw dev {i}!' for i in range(6)],
-        }).to_csv(root / task.prediction_filename, index=False)
-        if gold:
+        })
+        same_gold_file = task.epoch_validation_filename == task.prediction_filename
+        if gold and same_gold_file:
+            prediction[task.label_column] = list(task.labels)
+        prediction.to_csv(root / task.prediction_filename, index=False)
+        if gold and not same_gold_file:
             pd.DataFrame({
                 'id': [f'dev-{i}' for i in reversed(range(6))],
                 'Comment': [f'raw dev {i}!' for i in reversed(range(6))],

@@ -65,6 +65,24 @@ Clone branch tương ứng vào một notebook riêng, cài `requirements.txt`, 
 !python Train_B_LLM.py
 ```
 
+`HASTIKA_DATA_DIR` chỉ tới thư mục train hiện có (`original_1.csv` tới
+`original_5.csv`). Inference và nhãn đánh giá mặc định lấy từ file có sẵn trong
+repo: `data/open_validation/task_b_open_test_translated_labeled.csv`.
+Đây là đúng **395 câu open validation** từ ZIP `open_test_translated_labeled.zip`
+bạn cung cấp, có `id`, `OriginalComment`, `Comment` và `Hate Category`.
+Không cần gắn thêm dataset, đổi tên hay chép lại CSV trong notebook.
+
+File `multiclass_validation_inputs.csv` trong ZIP bilingual cũ thực tế là tập
+396 câu chỉ có câu gốc; Task B không còn tự đọc file đó. Log đầu chương trình
+ghi đường dẫn và số dòng inference. `run_summary.json` ghi `prediction_dataset`
+và `official_validation` để kiểm tra đúng tập đang được dự đoán/chấm điểm.
+Nhãn gold chỉ dùng báo điểm sau mỗi epoch full retrain và sau ensemble;
+fold 5 vẫn là nguồn duy nhất để chọn best epoch.
+
+Nếu chủ động truyền `--prediction-file /path/to/paired_test.csv`, code dự đoán
+file đó nhưng vẫn dùng open validation 395 câu để báo metric. File test riêng
+cần có đủ `Comment` và `OriginalComment` theo schema song ngữ.
+
 Không truyền `--input-mode english`: đó là chế độ chỉ tiếng Anh cũ, không phải
 thí nghiệm câu gốc. Hai branch đã có mặc định phù hợp, không cần cờ bổ sung.
 Dùng cùng dataset và cùng các tùy chọn CLI cho hai lần chạy.

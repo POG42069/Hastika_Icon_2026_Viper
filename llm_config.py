@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+TASK_B_OPEN_VALIDATION_FILENAME = "task_b_open_test_translated_labeled.csv"
 DATA_DIR = Path(os.getenv("HASTIKA_DATA_DIR", str(PROJECT_ROOT / "data")))
 CHECKPOINT_ROOT = Path(
     os.getenv("HASTIKA_CHECKPOINT_DIR", str(PROJECT_ROOT / "checkpoints"))
@@ -153,7 +154,7 @@ TASK_B_EXPERIMENT_SUBDIR = (
 TASK_B = TaskConfig(
     task_name="Task B - Fine-Grained Hate Speech Classification",
     train_filename="multiclass_train.csv",
-    prediction_filename="multiclass_validation_inputs.csv",
+    prediction_filename=TASK_B_OPEN_VALIDATION_FILENAME,
     label_column="Hate Category",
     labels=(
         "Gender",
@@ -194,8 +195,9 @@ TASK_B = TaskConfig(
     class_weight_min=0.75,
     class_weight_max=1.50,
     report_per_class_metrics=True,
-    epoch_validation_filename="hastika_multiclass_validation.csv",
-    epoch_validation_input_filename="multiclass_validation_inputs.csv",
+    epoch_validation_filename=TASK_B_OPEN_VALIDATION_FILENAME,
+    epoch_validation_input_filename=TASK_B_OPEN_VALIDATION_FILENAME,
+    epoch_validation_required=True,
     enable_augmentation_audit=True,
     augmentation_audit_action="report",
 )

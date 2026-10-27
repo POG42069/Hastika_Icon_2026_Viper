@@ -5,6 +5,13 @@ Hai branch `Khangtest2` và `Khangtest3` đồng bộ source từ Nhotest để 
 câu gốc. Xem [TASK_B_TRANSLATION_EXPERIMENT.md](TASK_B_TRANSLATION_EXPERIMENT.md)
 để chạy và xác định thư mục output/checkpoint riêng. Task A giữ nguyên Nhotest.
 
+Task B mặc định inference và tính metric trên **395 câu open validation** trong
+`data/open_validation/task_b_open_test_translated_labeled.csv`, được chép từ
+`open_test_translated_labeled.zip` bạn cung cấp. File này có sẵn trong hai branch;
+không cần upload thêm dataset hay sửa CSV. `HASTIKA_DATA_DIR` vẫn chọn dữ liệu train.
+File `multiclass_validation_inputs.csv` raw-only 396 câu trong ZIP bilingual cũ
+không được dùng làm đầu vào mặc định của Task B nữa.
+
 Cấu hình gốc Nhotest dùng **bản gốc code-mixed + bản dịch tiếng Anh** trong
 cùng một prompt. Xem [BILINGUAL.md](BILINGUAL.md) để chọn đúng thư mục dữ liệu,
 chạy huấn luyện và so sánh với English-only.
@@ -120,8 +127,11 @@ original_2.csv
 original_3.csv
 original_4.csv
 original_5.csv
-multiclass_validation_inputs.csv
 ```
+
+Riêng inference và gold Task B lấy từ file 395 câu có sẵn trong repo:
+`data/open_validation/task_b_open_test_translated_labeled.csv`. Cột nhãn chỉ dùng
+để chấm điểm, không được đưa vào prompt hay dữ liệu train.
 
 Train CSV cần `id`, `Comment`, `OriginalComment` và cột nhãn tương ứng.
 Development CSV cần `id`, `Comment`, `OriginalComment`. Giải nén
