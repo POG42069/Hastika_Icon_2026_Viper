@@ -10,7 +10,10 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from llm_config import DATA_DIR, OUTPUT_ROOT, PROJECT_ROOT, TASK_B_OPEN_VALIDATION_FILENAME, TaskConfig
+from llm_config import (
+    DATA_DIR, OUTPUT_ROOT, PROJECT_ROOT, TASK_A_OPEN_VALIDATION_FILENAME,
+    TASK_B_OPEN_VALIDATION_FILENAME, TaskConfig,
+)
 from src.preprocessing import normalize_text
 
 
@@ -21,14 +24,15 @@ class MissingDataFileError(FileNotFoundError):
 def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
     """Find an input locally or in an attached Kaggle Dataset."""
 
-    if filename == TASK_B_OPEN_VALIDATION_FILENAME:
+    if filename in {TASK_A_OPEN_VALIDATION_FILENAME, TASK_B_OPEN_VALIDATION_FILENAME}:
         # This named evaluation set ships with the experiment branches. Keep
         # training in HASTIKA_DATA_DIR, while inference and gold use this exact
-        # paired 395-row file rather than the legacy raw-only 396-row test.
+        # paired open set rather than a legacy raw-only inference file.
         bundled = PROJECT_ROOT / "data" / "open_validation" / filename
         if not bundled.is_file():
+            letter = "A" if filename == TASK_A_OPEN_VALIDATION_FILENAME else "B"
             raise MissingDataFileError(
-                f"Bundled Task B open validation is missing: {bundled}. "
+                f"Bundled Task {letter} open validation is missing: {bundled}. "
                 "Update or re-clone Khangtest2/Khangtest3 including data/open_validation/."
             )
         return bundled.resolve()
@@ -121,6 +125,10 @@ def _validate_and_encode_frames(
         raise ValueError(f"Unexpected labels in {train_description}: {unknown_labels}")
     if train_df[task.label_column].isna().any():
         raise ValueError(f"Missing labels were found in {train_description}.")
+    if task.evaluate_prediction_labels and task.label_column in prediction_df:
+        invalid = ~prediction_df[task.label_column].isin(task.labels)
+        if invalid.any():
+            raise ValueError("Open-validation prediction inputs have missing or unknown gold labels.")
 
     train_df = train_df.copy()
     prediction_df = prediction_df.copy()
@@ -472,12 +480,33 @@ def load_task_frames(task: TaskConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
         train_path = resolve_data_file(task.train_filename)
         train_df = _read_csv(train_path)
         train_description = str(train_path)
-    return _validate_and_encode_frames(
+    train_df, prediction_df = _validate_and_encode_frames(
         train_df,
         prediction_df,
         task,
         train_description,
     )
+    if task.training_exclusion_filename is not None:
+        reference_path = resolve_data_file(task.training_exclusion_filename)
+        reference = _read_csv(reference_path)
+        _validate_columns(reference, reference_path, {"id"})
+        if reference['id'].eq('').any() or reference['id'].duplicated().any():
+            raise ValueError("Training exclusion reference requires unique, nonempty IDs.")
+        excluded = train_df['id'].isin(reference['id'])
+        audit_columns = [column for column in ('id', 'fold', task.label_column) if column in train_df]
+        audit = {
+            'policy': 'exclude-reference-ids-v1',
+            'reference': task.training_exclusion_filename,
+            'loaded_rows': len(train_df),
+            'excluded_rows': int(excluded.sum()),
+            'remaining_rows': int((~excluded).sum()),
+            'excluded_records': train_df.loc[excluded, audit_columns].to_dict(orient='records'),
+        }
+        train_df = train_df.loc[~excluded].reset_index(drop=True)
+        if train_df.empty:
+            raise ValueError("No training rows remain after excluding open-validation IDs.")
+        train_df.attrs['training_exclusions'] = audit
+    return train_df, prediction_df
 
 
 def load_epoch_validation_frame(task: TaskConfig) -> pd.DataFrame | None:

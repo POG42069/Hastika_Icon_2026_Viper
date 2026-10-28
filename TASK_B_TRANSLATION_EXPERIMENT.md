@@ -10,7 +10,8 @@ Hai branch được đồng bộ source từ `Nhotest` commit
 
 Hai branch dùng chung code; chỉ giá trị mặc định
 `TASK_B_INCLUDE_ENGLISH_TRANSLATION` trong `llm_config.py` khác nhau.
-Task A giữ nguyên cấu hình và prompt của Nhotest trên cả hai branch.
+Task A cũng có hai phiên bản tương ứng; xem
+[TASK_A_TRANSLATION_EXPERIMENT.md](TASK_A_TRANSLATION_EXPERIMENT.md).
 
 ## Cấu hình chung
 

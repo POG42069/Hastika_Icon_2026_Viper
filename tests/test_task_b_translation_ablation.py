@@ -31,7 +31,6 @@ class TaskBTranslationAblationTests(unittest.TestCase):
         self.assertEqual(raw.system_text, paired.system_text)
         self.assertEqual(raw.completions, paired.completions)
         self.assertEqual(raw.encode_prompt(pair), raw.encode_prompt(('changed ' * 1000, pair[1])))
-        self.assertTrue(TASK_A.include_english_translation)
 
     def test_original_only_truncation_ignores_english_and_preserves_raw_head_tail_and_label_loss(self):
         encoder = ChatEncoder(TestChatTokenizer(), self.task(False), 512)

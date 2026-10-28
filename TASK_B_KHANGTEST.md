@@ -23,7 +23,8 @@ Qwen3-4B-Instruct-2507, LoRA rank 32/alpha 64, learning rate `1e-4` giữ nguyê
 Loss nhãn nhân class weight `clip((N / (6 * n_class)) ** 0.5, 0.75, 1.50)`,
 rồi chuẩn hóa để trọng số trung bình của mẫu bằng 1. Class weight ở bước chọn
 epoch chỉ tính trên fold 1–4; bước retrain tính lại trên cả 5 fold.
-Task A giữ nguyên cấu hình và luồng huấn luyện hiện tại.
+Task A có thí nghiệm riêng trong `TASK_A_TRANSLATION_EXPERIMENT.md`; Task B
+không thay đổi cấu hình bởi thí nghiệm Task A.
 
 Các điều chỉnh để dùng dataset đã giao: `Comment` chứa tiếng Anh,
 `OriginalComment` chứa câu gốc. Không yêu cầu đổi cột sang `Comment_en` như

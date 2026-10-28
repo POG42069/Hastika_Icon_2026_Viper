@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+TASK_A_OPEN_VALIDATION_FILENAME = "task_a_open_test_translated_labeled.csv"
 TASK_B_OPEN_VALIDATION_FILENAME = "task_b_open_test_translated_labeled.csv"
 DATA_DIR = Path(os.getenv("HASTIKA_DATA_DIR", str(PROJECT_ROOT / "data")))
 CHECKPOINT_ROOT = Path(
@@ -37,6 +38,8 @@ class TaskConfig:
     use_augmentation: bool = True
     input_mode: str = "english"
     include_english_translation: bool = True
+    evaluate_prediction_labels: bool = False
+    training_exclusion_filename: str | None = None
     original_comment_column: str = "OriginalComment"
     prompt_style: str = "paired"
     prompt_order: str | None = None
@@ -115,15 +118,23 @@ class LLMTrainingConfig:
     max_gpus: int = 2
 
 
+TASK_A_INCLUDE_ENGLISH_TRANSLATION = True
+TASK_A_EXPERIMENT_SUBDIR = (
+    "task_a_qwen3_4b_2507_lora_khangtest3_bilingual_english_first_256"
+    if TASK_A_INCLUDE_ENGLISH_TRANSLATION else
+    "task_a_qwen3_4b_2507_lora_khangtest2_original_only_256"
+)
+
+
 TASK_A = TaskConfig(
     task_name="Task A - Binary Hate Speech Detection",
     train_filename="binary_train.csv",
-    prediction_filename="binary_validation_inputs.csv",
+    prediction_filename=TASK_A_OPEN_VALIDATION_FILENAME,
     label_column="Label",
     labels=("Non-Hate", "Hate"),
     label_codes=("Non-Hate", "Hate"),
-    checkpoint_subdir="task_a_qwen3_4b_2507_lora_bilingual",
-    output_subdir="task_a_qwen3_4b_2507_lora_bilingual",
+    checkpoint_subdir=TASK_A_EXPERIMENT_SUBDIR,
+    output_subdir=TASK_A_EXPERIMENT_SUBDIR,
     submission_zip_name="task_a_submission.zip",
     original_fold_filenames=tuple(
         f"binary_original_{fold}.csv" for fold in range(1, 6)
@@ -135,6 +146,11 @@ TASK_A = TaskConfig(
     compact_validation_filename="binary_original_5.csv",
     use_augmentation=False,
     input_mode="bilingual",
+    include_english_translation=TASK_A_INCLUDE_ENGLISH_TRANSLATION,
+    prompt_style="task_a_ablation",
+    fixed_prompt_order="english-first",
+    evaluate_prediction_labels=True,
+    training_exclusion_filename=TASK_A_OPEN_VALIDATION_FILENAME,
     selection_validation_fold=5,
     selection_validation_data_origins=("original",),
     selection_seeds=(42, 52, 62, 72, 82),
@@ -142,7 +158,7 @@ TASK_A = TaskConfig(
     report_per_class_metrics=True,
 )
 
-# The two experiment branches differ only in this default.
+# Task B retains its own translation preset alongside the Task A experiment.
 TASK_B_INCLUDE_ENGLISH_TRANSLATION = True
 TASK_B_EXPERIMENT_SUBDIR = (
     "task_b_qwen3_4b_2507_lora_khangtest3_bilingual_english_first_256"

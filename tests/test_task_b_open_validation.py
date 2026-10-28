@@ -30,7 +30,6 @@ class TaskBOpenValidationTests(unittest.TestCase):
                       'epoch_validation_input_filename'):
             self.assertEqual(getattr(TASK_B, field), TASK_B_OPEN_VALIDATION_FILENAME)
         self.assertTrue(TASK_B.epoch_validation_required)
-        self.assertEqual(TASK_A.prediction_filename, 'binary_validation_inputs.csv')
 
     def test_bundled_open_set_has_395_unique_complete_labeled_pairs(self):
         path = resolve_data_file(TASK_B_OPEN_VALIDATION_FILENAME)

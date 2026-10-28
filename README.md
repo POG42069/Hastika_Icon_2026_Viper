@@ -1,9 +1,14 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
-Hai branch `Khangtest2` và `Khangtest3` đồng bộ source từ Nhotest để thử nghiệm Task B:
+Hai branch `Khangtest2` và `Khangtest3` dùng nền Nhotest để thử nghiệm Task A và B:
 `Khangtest2` chỉ đưa câu gốc code-mixed vào prompt; `Khangtest3` đưa cả tiếng Anh và
-câu gốc. Xem [TASK_B_TRANSLATION_EXPERIMENT.md](TASK_B_TRANSLATION_EXPERIMENT.md)
-để chạy và xác định thư mục output/checkpoint riêng. Task A giữ nguyên Nhotest.
+câu gốc. Xem [TASK_A_TRANSLATION_EXPERIMENT.md](TASK_A_TRANSLATION_EXPERIMENT.md)
+và [TASK_B_TRANSLATION_EXPERIMENT.md](TASK_B_TRANSLATION_EXPERIMENT.md)
+để chạy và xác định thư mục output/checkpoint riêng.
+
+Task A dùng open validation **806 câu** đi kèm repo. Các ID trùng open validation
+được loại khỏi train ở cả hai branch trước khi chọn epoch và retrain; ZIP đã
+kiểm tra có 71 ID trùng. Kết quả cuối vẫn là majority vote của 5 seed.
 
 Task B mặc định inference và tính metric trên **395 câu open validation** trong
 `data/open_validation/task_b_open_test_translated_labeled.csv`, được chép từ
@@ -30,7 +35,8 @@ băng và chỉ các ma trận LoRA được optimizer cập nhật.
 
 Task A giữ luồng holdout selection và full retrain của Nhotest:
 
-1. Dùng original song ngữ, không augmentation; train fold 1–4, validation fold 5.
+1. Dùng original, không augmentation; prompt theo branch. Loại ID open khỏi các
+   fold trước khi train fold 1–4 và validation fold 5.
    Có thể đọc file compact `binary_original_1_4.csv` + `binary_original_5.csv`,
    hoặc đủ năm file `binary_original_1.csv` tới `binary_original_5.csv`.
 2. Chạy 5 seed `42, 52, 62, 72, 82`, chọn best epoch bằng macro-F1 validation,
@@ -116,8 +122,10 @@ Task A (mặc định):
 ```text
 binary_original_1_4.csv
 binary_original_5.csv
-binary_validation_inputs.csv
 ```
+
+Inference Task A và nhãn đánh giá lấy từ
+`data/open_validation/task_a_open_test_translated_labeled.csv` có sẵn trong repo.
 
 Task B (mặc định):
 
@@ -288,24 +296,27 @@ nhầm lẫn tương ứng cũng được lưu trong lịch sử huấn luyện,
 
 Task A:
 
+`<task_a_experiment>` dưới đây là thư mục preset của branch, liệt kê trong
+[TASK_A_TRANSLATION_EXPERIMENT.md](TASK_A_TRANSLATION_EXPERIMENT.md).
+
 ```text
-checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_42/best_holdout_adapter/
-checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_42/final_full_data_adapter/
-checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_52/...
-checkpoints/task_a_qwen3_4b_2507_lora_bilingual/seed_62/...
-checkpoints/task_a_qwen3_4b_2507_lora_bilingual/metrics.json
-outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/validation_predictions.csv
-outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/predictions.csv
-outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_42/prediction_scores.npz
-outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_52/...
-outputs/task_a_qwen3_4b_2507_lora_bilingual/selection_training_history.json
-outputs/task_a_qwen3_4b_2507_lora_bilingual/split_manifest.csv
-outputs/task_a_qwen3_4b_2507_lora_bilingual/validation_predictions.csv
-outputs/task_a_qwen3_4b_2507_lora_bilingual/seed_selection_results.csv
-outputs/task_a_qwen3_4b_2507_lora_bilingual/voting_predictions.csv
-outputs/task_a_qwen3_4b_2507_lora_bilingual/predictions.csv
-outputs/task_a_qwen3_4b_2507_lora_bilingual/task_a_submission.zip
-outputs/task_a_qwen3_4b_2507_lora_bilingual/run_summary.json
+checkpoints/<task_a_experiment>/seed_42/best_holdout_adapter/
+checkpoints/<task_a_experiment>/seed_42/final_full_data_adapter/
+checkpoints/<task_a_experiment>/seed_52/...
+checkpoints/<task_a_experiment>/seed_62/...
+checkpoints/<task_a_experiment>/metrics.json
+outputs/<task_a_experiment>/seed_42/validation_predictions.csv
+outputs/<task_a_experiment>/seed_42/predictions.csv
+outputs/<task_a_experiment>/seed_42/prediction_scores.npz
+outputs/<task_a_experiment>/seed_52/...
+outputs/<task_a_experiment>/selection_training_history.json
+outputs/<task_a_experiment>/split_manifest.csv
+outputs/<task_a_experiment>/validation_predictions.csv
+outputs/<task_a_experiment>/seed_selection_results.csv
+outputs/<task_a_experiment>/voting_predictions.csv
+outputs/<task_a_experiment>/predictions.csv
+outputs/<task_a_experiment>/task_a_submission.zip
+outputs/<task_a_experiment>/run_summary.json
 ```
 
 Trong lúc một epoch vừa hoàn tất nhưng phase chưa xong, checkpoint có thêm:

@@ -64,6 +64,10 @@ def system_prompt(task: TaskConfig) -> str:
         instruction += " Both versions represent the same comment; assign one answer."
         if task.prompt_style == "khangtest":
             instruction = "Classify the target category of a hateful Kannada-English code-mixed comment."
+        elif task.prompt_style == "task_a_ablation":
+            # Identical instructions in both branches; only the English user
+            # block is toggled, so the ablation compares the supplied views.
+            instruction = "Detect hate speech in the provided code-mixed comment."
         elif not task.include_english_translation:
             instruction = (
                 "Detect hate speech using the original code-mixed comment."

@@ -1,9 +1,10 @@
 # Keep training and private-test data local or in a private Kaggle Dataset.
-# The supplied labeled Task B open set is bundled for reproducible evaluation.
+# The supplied labeled open sets are bundled for reproducible evaluation.
 /data/*
 !/data/open_validation/
 /data/open_validation/*
 !/data/open_validation/task_b_open_test_translated_labeled.csv
+!/data/open_validation/task_a_open_test_translated_labeled.csv
 /kaggle_data/
 
 # Training artifacts are large and can contain competition predictions.
