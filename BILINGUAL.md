@@ -9,12 +9,16 @@ Code được sửa từ checkout Nhotest, không dùng code Sarvam. Backbone đ
 `Qwen/Qwen3-4B-Instruct-2507`, revision
 `cdbee75f17c01a7cc42f958dc650907174af0554`. Đây là bản Instruct non-thinking,
 dùng chat template chính thức và chỉ chấm điểm các nhãn hợp lệ. Giới hạn toàn bộ
-chat mặc định là 256 token cho cả Task A và Task B. Task A giữ cấu hình
-và luồng huấn luyện của Nhotest, 5 seed
+chat mặc định là 256 token cho cả Task A và Task B. Task A giữ optimization
+và hai giai đoạn huấn luyện của Nhotest, 5 seed
 `42, 52, 62, 72, 82`. Task B giữ learning rate `1e-4`, class-weighted loss và soft ensemble từ Khangtest;
 bỏ cap Gender. Chọn best epoch cho từng seed trên fold 1–4/validation fold 5
 (tối đa 5 epoch, patience 2), rồi khởi tạo model mới để retrain cả 5 fold
 theo best epoch riêng. Xem [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).
+
+Task A hiện chọn chỉ câu gốc trên Khangtest2 hoặc song ngữ trên Khangtest3;
+inference trên 806 câu open đi kèm repo và loại ID open khỏi train. Xem
+[TASK_A_TRANSLATION_EXPERIMENT.md](TASK_A_TRANSLATION_EXPERIMENT.md).
 
 ## Dữ liệu
 
@@ -80,8 +84,8 @@ bản. Việc lược vẫn có thể mất chi tiết ở giữa câu. Mặc đ
 có thể truyền `--max-length` để đổi độ dài. Checkpoint huấn luyện ở 256
 không khớp chữ ký resume của cấu hình 512, nên cần huấn luyện lại ở độ dài mới.
 
-Output/checkpoint dùng thư mục `task_a_qwen3_4b_2507_lora_bilingual` và
-`task_b_qwen3_4b_2507_lora_bilingual_selection_soft_english_first_256` để giữ lại kết quả cũ. Resume kiểm tra
+Output/checkpoint của cả hai task tách theo branch như hai tài liệu thí nghiệm
+Task A và Task B; kết quả cũ được giữ lại. Resume kiểm tra
 model, revision, input mode, cột nguồn, phiên bản prompt và dữ liệu; checkpoint English-only
 hoặc legacy thiếu thông tin tương thích không được dùng lại cho bilingual.
 
@@ -100,7 +104,7 @@ HASTIKA_CHECKPOINT_DIR=/absolute/path/checkpoints/bilingual \
 python Train_A_LLM.py --input-mode bilingual --no-auto-resume
 ```
 
-Task A dùng đầy đủ 1.317 câu fold 5. Task B chọn epoch trên 2.524 câu
+Task A dùng fold 5 sau khi loại các ID open validation khỏi các fold. Task B chọn epoch trên 2.524 câu
 fold 1–4 và 631 câu validation fold 5, rồi retrain cả 3.155 câu của 5 fold;
 395 câu development đi kèm repo được báo điểm riêng. Không dùng quy tắc
 lọc xuống 1.302 câu của bản Task A repair trước. Các kiểm tra CPU và tokenizer

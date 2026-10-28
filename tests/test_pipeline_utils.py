@@ -16,7 +16,8 @@ from src.data import labeled_input_filenames, load_task_frames
 from src.submission import write_submission
 
 # These legacy fixtures exercise the English-only compatibility path.
-TASK_A = replace(TASK_A, input_mode="english")
+TASK_A = replace(TASK_A, input_mode="english", prediction_filename="binary_validation_inputs.csv",
+                 training_exclusion_filename=None, evaluate_prediction_labels=False)
 TASK_B = replace(TASK_B, input_mode="english", fixed_full_retrain_epochs=None,
                  selection_validation_fold=5)
 

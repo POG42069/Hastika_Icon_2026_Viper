@@ -21,6 +21,9 @@ from tests.test_llm_pipeline import TestChatTokenizer, cpu_runtime
 
 # Generic directory fixtures use an explicit input override. The bundled open
 # set and its default selection are covered by test_task_b_open_validation.
+TASK_A = replace(TASK_A, include_english_translation=True, prompt_style='paired',
+                 fixed_prompt_order=None, prediction_filename='fixture_binary_validation_inputs.csv',
+                 training_exclusion_filename=None, evaluate_prediction_labels=False)
 TASK_B = replace(TASK_B, include_english_translation=True,
                  prediction_filename='fixture_multiclass_validation_inputs.csv')
 

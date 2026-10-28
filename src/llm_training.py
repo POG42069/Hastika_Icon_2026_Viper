@@ -55,7 +55,7 @@ from src.distributed import (
     relaunch_with_torchrun_if_needed,
     synchronize,
 )
-from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset, effective_prompt_order
+from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset, effective_prompt_order, system_prompt
 from src.submission import write_submission
 from src.resume import (
     ResumeCatalog,
@@ -611,6 +611,36 @@ def format_per_class_diagnostics(metrics: dict) -> list[str]:
     return lines
 
 
+def prediction_label_metrics(prediction_frame, task, prediction_ids):
+    """Evaluate final voted labels without using gold in training or prompts."""
+    if not task.evaluate_prediction_labels or task.label_column not in prediction_frame:
+        return None
+    gold = prediction_frame[task.label_column].map({label: index for index, label in enumerate(task.labels)})
+    predictions = np.asarray(prediction_ids, dtype=np.int64)
+    if gold.isna().any() or predictions.shape != (len(gold),):
+        raise ValueError("Final prediction metrics require valid gold labels and one prediction per ID.")
+    labels = list(range(len(task.labels)))
+    if not np.isin(predictions, labels).all():
+        raise ValueError("Final prediction metrics received an invalid predicted label.")
+    precision, recall, f1, support = precision_recall_fscore_support(
+        gold.to_numpy(), predictions, labels=labels, zero_division=0,
+    )
+    matrix = confusion_matrix(gold.to_numpy(), predictions, labels=labels)
+    return {
+        "rows": len(gold),
+        "macro_f1": float(f1.mean()),
+        "accuracy": float(accuracy_score(gold, predictions)),
+        "per_class_f1": dict(zip(task.labels, f1.tolist(), strict=True)),
+        "per_class": {
+            label: {"precision": float(precision[index]), "recall": float(recall[index]),
+                    "f1": float(f1[index]), "support": int(support[index])}
+            for index, label in enumerate(task.labels)
+        },
+        "confusion_matrix": {"rows": "actual labels", "columns": "predicted labels",
+                             "label_order": list(task.labels), "values": matrix.tolist()},
+    }
+
+
 def save_adapter(model, tokenizer, path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     unwrap_model(model).save_pretrained(path, safe_serialization=True)
@@ -641,6 +671,11 @@ def _input_hashes(task: TaskConfig) -> tuple[str, str]:
     for name in labeled_input_filenames(task):
         training.update(name.encode())
         training.update(resolve_data_file(name).read_bytes())
+    if task.training_exclusion_filename is not None:
+        reference = pd.read_csv(resolve_data_file(task.training_exclusion_filename),
+                                dtype={"id": str}, keep_default_na=False)
+        training.update(b"exclude-reference-ids-v1")
+        training.update(json.dumps(sorted(set(reference['id']))).encode())
     prediction = hashlib.sha256(
         resolve_data_file(task.prediction_filename).read_bytes()
     )
@@ -691,6 +726,11 @@ def _resume_signature(
     if task.input_mode == "bilingual" and not task.include_english_translation:
         signature["include_english_translation"] = False
         signature["prompt_policy"] = "original-only-head-tail-v1"
+    if task.prompt_style == "task_a_ablation":
+        signature["prompt_style"] = task.prompt_style
+        signature["system_prompt_sha256"] = hashlib.sha256(system_prompt(task).encode()).hexdigest()
+    if task.training_exclusion_filename is not None:
+        signature["training_exclusion_filename"] = task.training_exclusion_filename
     default_order = "original-first" if task.prompt_style == "khangtest" else "english-first"
     if task.input_mode == "bilingual" and effective_prompt_order(task) != default_order:
         signature["prompt_order"] = effective_prompt_order(task)
@@ -1848,6 +1888,13 @@ def _run_seed_ensemble(
         stacked_label_ids, stacked_scores, task.labels
     )
     final_labels = [task.labels[index] for index in final_ids]
+    official_metrics = prediction_label_metrics(prediction_frame, task, final_ids)
+    official_evaluation = None if official_metrics is None else {
+        "dataset": {"filename": str(resolve_data_file(task.prediction_filename)),
+                    "sha256": prediction_sha256, "rows": len(prediction_frame)},
+        "method": "equal-weight majority vote of per-seed labels",
+        **official_metrics,
+    }
     mean_probabilities = np.mean(
         np.stack(
             [result["probabilities"] for result in retrained_results], axis=0
@@ -1906,6 +1953,18 @@ def _run_seed_ensemble(
             output_dir,
             task.submission_zip_name,
         )
+        if official_evaluation is not None:
+            _write_json(output_dir / "official_validation_metrics.json", official_evaluation)
+            diagnostics = voting_frame.copy()
+            diagnostics["gold_label"] = prediction_frame[task.label_column].to_numpy()
+            diagnostics.to_csv(output_dir / "official_validation_predictions.csv", index=False)
+            log(
+                f"Official validation | FINAL MAJORITY VOTE | rows={len(prediction_frame)} "
+                f"| Macro-F1={official_metrics['macro_f1']:.5f} "
+                f"| Accuracy={official_metrics['accuracy']:.5f}", runtime,
+            )
+            for line in format_per_class_diagnostics(official_metrics):
+                log(line, runtime)
         method_counts = {
             method: int(np.sum(tie_break_methods == method))
             for method in (
@@ -1945,6 +2004,8 @@ def _run_seed_ensemble(
                 "reporting_best_selection": reporting_summary,
                 "full_data_retrains": retrain_summaries,
                 "ensemble": ensemble_summary,
+                "official_validation": official_evaluation,
+                "training_exclusions": frame.attrs.get("training_exclusions"),
             },
         )
         reporting_train_frame = frame.iloc[reporting_best["train_indices"]]
@@ -2014,12 +2075,17 @@ def _run_seed_ensemble(
                 "full_data_retrains": retrain_summaries,
                 "ensemble": ensemble_summary,
                 "development_rows": len(prediction_data),
+                "official_validation": official_evaluation,
+                "training_exclusions": frame.attrs.get("training_exclusions"),
+                "prediction_dataset": {"filename": str(resolve_data_file(task.prediction_filename)),
+                                       "sha256": prediction_sha256, "rows": len(prediction_frame)},
                 "training_config": asdict(config),
                 "parameters": parameter_counts,
                 "system_prompt": encoder.system_text,
                 "input_mode": task.input_mode,
-                "comment_columns": ["Comment", task.original_comment_column] if task.input_mode == "bilingual" else ["Comment"],
-                "truncation_policy": "balanced_head_tail_per_view" if task.input_mode == "bilingual" else "comment_tail",
+                "include_english_translation": task.include_english_translation,
+                "comment_columns": (["Comment", task.original_comment_column] if task.include_english_translation else [task.original_comment_column]) if task.input_mode == "bilingual" else ["Comment"],
+                "truncation_policy": ("balanced_head_tail_per_view" if task.include_english_translation else "original_head_tail") if task.input_mode == "bilingual" else "comment_tail",
                 "label_order": list(task.labels),
                 "completion_token_ids": encoder.completions,
                 "completion_token_diagnostics": token_diagnostics,
@@ -2125,6 +2191,16 @@ def run_llm_task(
         for name, data in (("train", frame), ("development", prediction_frame)):
             if data.empty:
                 raise ValueError(f"{name} input must contain at least one row.")
+        if task.evaluate_prediction_labels:
+            if task.label_column in prediction_frame and set(frame['id']) & set(prediction_frame['id']):
+                raise ValueError("Open-validation IDs must not occur in Task A training data.")
+            log(f"Task A inference input | rows={len(prediction_frame)} | file={resolve_data_file(task.prediction_filename)}", runtime)
+            if task.label_column not in prediction_frame:
+                log("Prediction override has no gold labels; final predictions will be exported without open-set metrics.", runtime)
+        exclusions = frame.attrs.get('training_exclusions')
+        if exclusions is not None:
+            log(f"Training ID exclusion | removed={exclusions['excluded_rows']} "
+                f"| before={exclusions['loaded_rows']} | after={exclusions['remaining_rows']}", runtime)
         if task.selection_validation_fold is None:
             base_train_indices, val_indices = stratified_holdout_indices(
                 frame["label_id"].to_numpy(), config.validation_size, config.seed
@@ -2173,6 +2249,9 @@ def run_llm_task(
         final_adapter_dir = checkpoint_dir / "final_full_data_adapter"
         on_main(lambda: output_dir.mkdir(parents=True, exist_ok=True), runtime)
         on_main(lambda: checkpoint_dir.mkdir(parents=True, exist_ok=True), runtime)
+
+        if exclusions is not None:
+            on_main(partial(_write_json, output_dir / "training_exclusions.json", exclusions), runtime)
 
         training_sha256, prediction_sha256 = _input_hashes(task)
         resume_signature = _resume_signature(
