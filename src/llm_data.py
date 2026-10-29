@@ -187,7 +187,14 @@ class ChatEncoder:
         and the explicit omission markers; never truncate the answer.
         """
 
-        tokens = [self.tokenizer.encode(text, add_special_tokens=False) for text in texts]
+        offsets = None
+        if getattr(self.tokenizer, "is_fast", False):
+            encoded = [self.tokenizer(text, add_special_tokens=False,
+                                      return_offsets_mapping=True) for text in texts]
+            tokens = [list(view["input_ids"]) for view in encoded]
+            offsets = [view["offset_mapping"] for view in encoded]
+        else:
+            tokens = [self.tokenizer.encode(text, add_special_tokens=False) for text in texts]
         lengths = [len(ids) for ids in tokens]
         minimum = [int(length > 0) for length in lengths]
         scaffold = self._template(self.messages(self.empty_input), generation=True)
@@ -206,8 +213,20 @@ class ChatEncoder:
             count = budgets[index]
             head = (count + 1) // 2
             tail = count // 2
-            first = self.tokenizer.decode(tokens[index][:head], skip_special_tokens=False)
-            last = self.tokenizer.decode(tokens[index][-tail:], skip_special_tokens=False) if tail else ""
+            if offsets is not None:
+                # A token boundary can split UTF-8 bytes within one emoji.
+                # Slice the original Unicode string at whole-character offsets,
+                # avoiding replacement-character inflation on decode/re-encode.
+                head_end = max((end for _, end in offsets[index][:head]), default=0)
+                tail_start = min((start for start, _ in offsets[index][-tail:]),
+                                 default=len(texts[index])) if tail else len(texts[index])
+                if tail and head_end >= tail_start:
+                    return texts[index]
+                first = texts[index][:head_end]
+                last = texts[index][tail_start:] if tail else ""
+            else:
+                first = self.tokenizer.decode(tokens[index][:head], skip_special_tokens=False)
+                last = self.tokenizer.decode(tokens[index][-tail:], skip_special_tokens=False) if tail else ""
             return first + " [...] " + last
 
         while True:
@@ -218,7 +237,12 @@ class ChatEncoder:
             overflow = len(prompt) + self.response_reserve - self.max_length
             if overflow <= 0:
                 return prompt
-            remaining = max(1, overflow)
+            reducible = sum(budget - needed for budget, needed in zip(budgets, minimum, strict=True))
+            if reducible <= 0:
+                raise ValueError("max_length is too small to retain both comment versions; increase --max-length.")
+            # Re-render even when the observed overflow exceeds the remaining
+            # content budget; the minimum-sized views may already fit.
+            remaining = min(max(1, overflow), reducible)
             while remaining:
                 candidates = [i for i in range(2) if budgets[i] > minimum[i]]
                 if not candidates:

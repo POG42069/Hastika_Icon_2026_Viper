@@ -1,5 +1,13 @@
 # HASTIKA @ ICON-2026 — LLM LoRA
 
+**Khangtest4** đổi backbone của cả Task A và B sang `sarvamai/sarvam-1`,
+revision `e9607337286ddf496d4a2562b194e489dcf3feea`, từ nền Khangtest3
+`5308fee`. Prompt song ngữ English-first, 256 token, dữ liệu, chọn epoch,
+fresh retrain và ensemble giữ nguyên. Xem [SARVAM_EXPERIMENT.md](SARVAM_EXPERIMENT.md)
+để chạy Kaggle và kiểm tra tokenizer trước khi train. Output/checkpoint dùng
+thư mục `task_{a,b}_sarvam_1_lora_khangtest4_bilingual_english_first_256` riêng.
+
+Các đối chứng trước đó:
 Hai branch `Khangtest2` và `Khangtest3` dùng nền Nhotest để thử nghiệm Task A và B:
 `Khangtest2` chỉ đưa câu gốc code-mixed vào prompt; `Khangtest3` đưa cả tiếng Anh và
 câu gốc. Xem [TASK_A_TRANSLATION_EXPERIMENT.md](TASK_A_TRANSLATION_EXPERIMENT.md)
@@ -77,8 +85,8 @@ Cấu hình mặc định trong `llm_config.py`:
 
 | Tham số | Giá trị |
 |---|---:|
-| Backbone | `Qwen/Qwen3-4B-Instruct-2507` |
-| Model revision | `cdbee75f17c01a7cc42f958dc650907174af0554` |
+| Backbone | `sarvamai/sarvam-1` |
+| Model revision | `e9607337286ddf496d4a2562b194e489dcf3feea` |
 | LoRA rank `r` | 32 |
 | LoRA alpha | 64 |
 | LoRA dropout | 0.05 |
@@ -103,9 +111,10 @@ cập nhật.
 
 Đây không còn là QLoRA: code không dùng NF4, double quantization hay
 `BitsAndBytesConfig`. Vì vậy standard LoRA dùng VRAM nhiều hơn đáng kể.
-Pipeline dùng chat template chính thức của
-https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507. Đây là bản Instruct
-non-thinking; template không thêm phần suy luận `<think>`. DDP không cộng VRAM
+Pipeline dùng chat template đi kèm tokenizer của
+https://huggingface.co/sarvamai/sarvam-1. Sarvam-1 là model text-completion,
+không phải model đã instruction-tune; template định nghĩa format supervised
+prompt/label cho thí nghiệm này. DDP không cộng VRAM
 của hai GPU: mỗi GPU giữ một bản backbone. Revision model được pin để tránh
 thay đổi checkpoint giữa các lần chạy.
 Mức `2e-4` là thiết lập thí nghiệm, chưa được xác nhận là LR tối ưu trên dev.
@@ -249,8 +258,8 @@ seed đang chạy dở.
 Đổi backbone hoặc giới hạn tài nguyên:
 
 ```bash
-!python Train_A_LLM.py --model Qwen/Qwen3-4B-Instruct-2507 \
-  --revision cdbee75f17c01a7cc42f958dc650907174af0554
+!python Train_A_LLM.py --model sarvamai/sarvam-1 \
+  --revision e9607337286ddf496d4a2562b194e489dcf3feea
 !python Train_A_LLM.py --max-epochs 3 --batch-size 1 --max-length 256
 !python Train_B_LLM.py --single-gpu --gradient-accumulation 16
 !python Train_A_LLM.py --prediction-file /path/to/official_inputs.csv
@@ -335,7 +344,7 @@ nhất và chỉ dùng để báo cáo. `voting_predictions.csv` lưu dự đoá
 số phiếu từng nhãn và nhãn cuối. `predictions.csv` cùng ZIP ở thư mục gốc là
 kết quả majority vote; prediction của từng adapter nằm trong thư mục seed.
 
-Task B dùng thư mục `task_b_qwen3_4b_2507_lora_bilingual_selection_soft`.
+Task B dùng thư mục `task_b_sarvam_1_lora_khangtest4_bilingual_english_first_256`.
 `ensemble_predictions.csv` lưu nhãn từng seed và xác suất trung bình dùng cho
 nhãn cuối. Mỗi seed có best holdout adapter và summary best epoch, final adapter sau retrain,
 lịch sử cả hai giai đoạn và cache prediction. Chi tiết trong [TASK_B_KHANGTEST.md](TASK_B_KHANGTEST.md).

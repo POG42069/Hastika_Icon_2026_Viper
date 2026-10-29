@@ -78,7 +78,7 @@ class TaskBTranslationAblationTests(unittest.TestCase):
     def test_branch_default_and_cli_keep_the_nhotest_training_configuration(self):
         include = TASK_B_INCLUDE_ENGLISH_TRANSLATION
         self.assertEqual(TASK_B.include_english_translation, include)
-        expected = 'khangtest3_bilingual_english_first_256' if include else 'khangtest2_original_only_256'
+        expected = 'khangtest4_bilingual_english_first_256' if include else 'khangtest4_original_only_256'
         self.assertTrue(TASK_B.output_subdir.endswith(expected))
         self.assertEqual(TASK_B.output_subdir, TASK_B.checkpoint_subdir)
         with patch('sys.argv', ['Train_B_LLM.py']), patch(

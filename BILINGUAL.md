@@ -1,14 +1,18 @@
-# Nhotest — original code-mixed + English translation
+# Khangtest4 — Sarvam-1, original code-mixed + English translation
+
+Nhánh này bắt đầu từ Khangtest3 `5308fee` và đổi cả hai task sang Sarvam-1.
+Xem [SARVAM_EXPERIMENT.md](SARVAM_EXPERIMENT.md) cho lệnh chạy và kiểm tra tương thích.
 
 Trên hai branch thí nghiệm, Task B dùng câu gốc trên `Khangtest2`, hoặc tiếng Anh
 cùng câu gốc trên `Khangtest3`. Cả hai vẫn đọc cùng CSV song ngữ. Xem
 [TASK_B_TRANSLATION_EXPERIMENT.md](TASK_B_TRANSLATION_EXPERIMENT.md) cho mặc định,
 prompt và thư mục kết quả của từng branch. Nội dung dưới đây mô tả nền Nhotest.
 
-Code được sửa từ checkout Nhotest, không dùng code Sarvam. Backbone được chuyển sang
-`Qwen/Qwen3-4B-Instruct-2507`, revision
-`cdbee75f17c01a7cc42f958dc650907174af0554`. Đây là bản Instruct non-thinking,
-dùng chat template chính thức và chỉ chấm điểm các nhãn hợp lệ. Giới hạn toàn bộ
+Code giữ pipeline Nhotest/Khangtest3. Backbone dùng
+`sarvamai/sarvam-1`, revision
+`e9607337286ddf496d4a2562b194e489dcf3feea`. Đây là model text-completion;
+chat template đi kèm tokenizer được dùng làm format supervised và chỉ chấm
+điểm các nhãn hợp lệ. Giới hạn toàn bộ
 chat mặc định là 256 token cho cả Task A và Task B. Task A giữ optimization
 và hai giai đoạn huấn luyện của Nhotest, 5 seed
 `42, 52, 62, 72, 82`. Task B giữ learning rate `1e-4`, class-weighted loss và soft ensemble từ Khangtest;

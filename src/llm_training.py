@@ -726,6 +726,8 @@ def _resume_signature(
     if task.input_mode == "bilingual" and not task.include_english_translation:
         signature["include_english_translation"] = False
         signature["prompt_policy"] = "original-only-head-tail-v1"
+    if task.input_mode == "bilingual":
+        signature["truncation_serialization"] = "unicode-safe-offsets-v1"
     if task.prompt_style == "task_a_ablation":
         signature["prompt_style"] = task.prompt_style
         signature["system_prompt_sha256"] = hashlib.sha256(system_prompt(task).encode()).hexdigest()

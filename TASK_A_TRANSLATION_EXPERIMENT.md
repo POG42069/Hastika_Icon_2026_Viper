@@ -1,5 +1,9 @@
 # Task A: câu gốc và câu gốc kèm bản dịch tiếng Anh
 
+Trên `Khangtest4`, Task A dùng Sarvam-1 và giữ chế độ song ngữ của Khangtest3.
+Xem [SARVAM_EXPERIMENT.md](SARVAM_EXPERIMENT.md) cho preset/thư mục kết quả hiện tại.
+Phần dưới mô tả các đối chứng Qwen3 trên Khangtest2/Khangtest3 trước đó.
+
 | Branch | Prompt Task A |
 |---|---|
 | `Khangtest2` | Chỉ `OriginalComment`: câu gốc code-mixed |

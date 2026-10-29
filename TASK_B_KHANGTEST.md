@@ -1,5 +1,9 @@
 # Task B trên Nhotest theo Khangtest
 
+Trên `Khangtest4`, backbone đã đổi sang Sarvam-1; xem
+[SARVAM_EXPERIMENT.md](SARVAM_EXPERIMENT.md). Các mô tả Qwen3 bên dưới là
+nguồn gốc pipeline Khangtest3, không phải backbone mặc định của nhánh này.
+
 Với thí nghiệm mới, `Khangtest2` bỏ khối bản dịch tiếng Anh khỏi prompt Task B;
 `Khangtest3` giữ cả bản dịch và câu gốc. Phần huấn luyện bên dưới giữ nguyên.
 Xem [TASK_B_TRANSLATION_EXPERIMENT.md](TASK_B_TRANSLATION_EXPERIMENT.md) để dùng

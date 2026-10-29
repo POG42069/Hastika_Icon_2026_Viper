@@ -33,7 +33,7 @@ def resolve_data_file(filename: str, configured_dir: Path = DATA_DIR) -> Path:
             letter = "A" if filename == TASK_A_OPEN_VALIDATION_FILENAME else "B"
             raise MissingDataFileError(
                 f"Bundled Task {letter} open validation is missing: {bundled}. "
-                "Update or re-clone Khangtest2/Khangtest3 including data/open_validation/."
+                "Update or re-clone this branch including data/open_validation/."
             )
         return bundled.resolve()
 

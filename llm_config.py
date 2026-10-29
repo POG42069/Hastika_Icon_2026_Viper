@@ -87,11 +87,11 @@ class LLMTrainingConfig:
 
     model_name: str = field(
         default_factory=lambda: os.getenv(
-            "HASTIKA_LLM_MODEL", "Qwen/Qwen3-4B-Instruct-2507"
+            "HASTIKA_LLM_MODEL", "sarvamai/sarvam-1"
         )
     )
-    # Exact Hugging Face revision for the non-thinking Qwen3 Instruct release.
-    model_revision: str = "cdbee75f17c01a7cc42f958dc650907174af0554"
+    # Pin the Sarvam text-completion backbone and its bundled tokenizer/template.
+    model_revision: str = "e9607337286ddf496d4a2562b194e489dcf3feea"
     validation_size: float = 0.20
     seed: int = 42
     max_length: int = 256  # Full chat, including instructions, answer and EOS.
@@ -120,9 +120,9 @@ class LLMTrainingConfig:
 
 TASK_A_INCLUDE_ENGLISH_TRANSLATION = True
 TASK_A_EXPERIMENT_SUBDIR = (
-    "task_a_qwen3_4b_2507_lora_khangtest3_bilingual_english_first_256"
+    "task_a_sarvam_1_lora_khangtest4_bilingual_english_first_256"
     if TASK_A_INCLUDE_ENGLISH_TRANSLATION else
-    "task_a_qwen3_4b_2507_lora_khangtest2_original_only_256"
+    "task_a_sarvam_1_lora_khangtest4_original_only_256"
 )
 
 
@@ -161,9 +161,9 @@ TASK_A = TaskConfig(
 # Task B retains its own translation preset alongside the Task A experiment.
 TASK_B_INCLUDE_ENGLISH_TRANSLATION = True
 TASK_B_EXPERIMENT_SUBDIR = (
-    "task_b_qwen3_4b_2507_lora_khangtest3_bilingual_english_first_256"
+    "task_b_sarvam_1_lora_khangtest4_bilingual_english_first_256"
     if TASK_B_INCLUDE_ENGLISH_TRANSLATION else
-    "task_b_qwen3_4b_2507_lora_khangtest2_original_only_256"
+    "task_b_sarvam_1_lora_khangtest4_original_only_256"
 )
 
 
@@ -243,7 +243,7 @@ def with_prompt_order(task: TaskConfig, order: str) -> TaskConfig:
 
 
 LLM_TRAINING = LLMTrainingConfig()
-# Match Khangtest Task B optimization, retaining the pinned Qwen3 and 256 tokens.
+# Retain Khangtest3 optimization and 256 tokens for the Sarvam comparison.
 LLM_TRAINING_B = replace(LLM_TRAINING, max_length=256, learning_rate=1e-4, early_stopping_patience=2)
 TASK_A_LLM = TASK_A
 TASK_B_LLM = TASK_B
