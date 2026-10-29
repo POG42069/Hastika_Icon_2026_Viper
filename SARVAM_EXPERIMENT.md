@@ -1,5 +1,9 @@
 # Khangtest4: Sarvam-1 trên cả Task A và B
 
+Tài liệu này lưu cấu hình của **nhánh Khangtest4**. Nhánh hiện tại Khangtest5
+dùng Qwen2.5-3B-Instruct; xem [QWEN25_EXPERIMENT.md](QWEN25_EXPERIMENT.md).
+Các lệnh và kết quả bên dưới áp dụng khi checkout Khangtest4.
+
 Nhánh được tạo từ **Khangtest3 `5308fee2027c07ee7b5b6e0ee1f8ab06ba0bc070`**.
 Thay backbone/tokenizer bằng `sarvamai/sarvam-1`, pin revision
 `e9607337286ddf496d4a2562b194e489dcf3feea` cho cả hai task.

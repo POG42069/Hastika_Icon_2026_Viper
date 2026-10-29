@@ -1,11 +1,11 @@
-"""Sarvam preset isolation and completion-loss compatibility with Llama models."""
+"""Qwen2.5 preset isolation and native completion-loss/LoRA compatibility."""
 from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from llm_config import LLM_TRAINING, LLM_TRAINING_B, TASK_A, TASK_B
 from src.llm_data import ChatEncoder, CompletionCollator, CompletionDataset
@@ -40,7 +40,7 @@ class UTF8OffsetTokenizer(TestChatTokenizer):
         return ''.join(parts)
 
 
-class SarvamTests(unittest.TestCase):
+class Qwen25Tests(unittest.TestCase):
     def test_byte_fallback_truncation_preserves_unicode_and_complete_answers(self):
         for task in (TASK_A, TASK_B):
             encoder = ChatEncoder(UTF8OffsetTokenizer(), task, 700)
@@ -57,14 +57,14 @@ class SarvamTests(unittest.TestCase):
                 self.assertLessEqual(len(feature['input_ids']), 700)
                 self.assertEqual(feature['input_ids'][len(prompt):], encoder.completions[label])
 
-    def test_preset_changes_backbone_and_isolates_qwen_adapters(self):
+    def test_preset_changes_backbone_and_isolates_previous_adapters(self):
         for task, config, learning_rate, patience in [
             (TASK_A, LLM_TRAINING, 2e-4, 4),
             (TASK_B, LLM_TRAINING_B, 1e-4, 2),
         ]:
-            self.assertEqual(config.model_name, 'sarvamai/sarvam-1')
-            self.assertEqual(config.model_revision, 'e9607337286ddf496d4a2562b194e489dcf3feea')
-            self.assertIn('sarvam_1_lora_khangtest4', task.output_subdir)
+            self.assertEqual(config.model_name, 'Qwen/Qwen2.5-3B-Instruct')
+            self.assertEqual(config.model_revision, 'aa8e72537993ba99e69dfaafa59ed015b17504d1')
+            self.assertIn('qwen2_5_3b_instruct_lora_khangtest5', task.output_subdir)
             self.assertEqual(task.output_subdir, task.checkpoint_subdir)
             self.assertTrue(task.include_english_translation)
             self.assertEqual(task.fixed_prompt_order, 'english-first')
@@ -74,23 +74,26 @@ class SarvamTests(unittest.TestCase):
             self.assertEqual(config.early_stopping_patience, patience)
             self.assertEqual(task.selection_seeds, (42, 52, 62, 72, 82))
             with patch('src.llm_training.labeled_input_filenames', return_value=task.original_fold_filenames):
-                sarvam = _resume_signature(task, config, 'same-data', cpu_runtime())
-                qwen = _resume_signature(task, replace(
-                    config, model_name='Qwen/Qwen3-4B-Instruct-2507',
-                    model_revision='cdbee75f17c01a7cc42f958dc650907174af0554'),
-                    'same-data', cpu_runtime())
-            self.assertNotEqual(sarvam, qwen)
-            self.assertEqual(sarvam['truncation_serialization'], 'unicode-safe-offsets-v1')
+                current = _resume_signature(task, config, 'same-data', cpu_runtime())
+                for model, revision in [
+                    ('sarvamai/sarvam-1', 'e9607337286ddf496d4a2562b194e489dcf3feea'),
+                    ('Qwen/Qwen3-4B-Instruct-2507', 'cdbee75f17c01a7cc42f958dc650907174af0554'),
+                ]:
+                    previous = _resume_signature(task, replace(
+                        config, model_name=model, model_revision=revision),
+                        'same-data', cpu_runtime())
+                    self.assertNotEqual(current, previous)
+            self.assertEqual(current['truncation_serialization'], 'unicode-safe-offsets-v1')
 
-    def test_llama_completion_loss_matches_native_loss_and_trains_only_lora(self):
+    def test_qwen2_completion_loss_matches_native_loss_and_trains_only_lora(self):
         torch.manual_seed(42)
         model = get_peft_model(
-            LlamaForCausalLM(LlamaConfig(
+            Qwen2ForCausalLM(Qwen2Config(
                 vocab_size=256, hidden_size=16, intermediate_size=32,
                 num_hidden_layers=1, num_attention_heads=2,
                 num_key_value_heads=1, max_position_embeddings=1024,
                 pad_token_id=0, eos_token_id=2, use_cache=False,
-                attention_dropout=0.0,
+                attention_dropout=0.0, tie_word_embeddings=True,
             )),
             LoraConfig(task_type='CAUSAL_LM', r=2, lora_alpha=4,
                        lora_dropout=0.0, target_modules='all-linear', bias='none'),

@@ -1,4 +1,4 @@
-"""Check real Sarvam tokenization on every input without downloading model weights."""
+"""Check real Qwen2.5 tokenization on every input without downloading model weights."""
 from pathlib import Path
 import argparse
 import json
@@ -23,8 +23,8 @@ def main():
         LLM_TRAINING.model_name, revision=LLM_TRAINING.model_revision,
         trust_remote_code=False,
     )
-    if config.model_type != 'llama':
-        raise ValueError('This preflight expects the Sarvam-1 Llama backbone.')
+    if config.model_type != 'qwen2':
+        raise ValueError('This preflight expects the Qwen2.5 Qwen2 backbone.')
     tokenizer = AutoTokenizer.from_pretrained(
         LLM_TRAINING.model_name, revision=LLM_TRAINING.model_revision,
         trust_remote_code=False,

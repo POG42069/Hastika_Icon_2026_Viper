@@ -55,7 +55,7 @@ class TaskATranslationAblationTests(unittest.TestCase):
     def test_branch_defaults_and_cli_preserve_binary_training_and_isolate_artifacts(self):
         include = TASK_A_INCLUDE_ENGLISH_TRANSLATION
         self.assertEqual(TASK_A.include_english_translation, include)
-        expected = 'khangtest4_bilingual_english_first_256' if include else 'khangtest4_original_only_256'
+        expected = 'khangtest5_bilingual_english_first_256' if include else 'khangtest5_original_only_256'
         self.assertTrue(TASK_A.output_subdir.endswith(expected))
         self.assertEqual(TASK_A.output_subdir, TASK_A.checkpoint_subdir)
         self.assertEqual(TASK_A.prediction_filename, TASK_A_OPEN_VALIDATION_FILENAME)

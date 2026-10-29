@@ -1,7 +1,7 @@
 # Task B: có và không có bản dịch tiếng Anh
 
-Trên `Khangtest4`, Task B dùng Sarvam-1 và giữ chế độ song ngữ của Khangtest3.
-Xem [SARVAM_EXPERIMENT.md](SARVAM_EXPERIMENT.md) cho preset/thư mục kết quả hiện tại.
+Trên `Khangtest5`, Task B dùng Qwen2.5-3B-Instruct và giữ chế độ song ngữ của Khangtest3.
+Xem [QWEN25_EXPERIMENT.md](QWEN25_EXPERIMENT.md) cho preset/thư mục kết quả hiện tại.
 Phần dưới mô tả các đối chứng Qwen3 trên Khangtest2/Khangtest3 trước đó.
 
 Hai branch được đồng bộ source từ `Nhotest` commit
